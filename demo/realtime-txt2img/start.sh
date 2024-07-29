@@ -1,7 +1,7 @@
 #!/bin/bash
 cd frontend
-pnpm install
-pnpm run build
+npm install
+npm run build
 if [ $? -eq 0 ]; then
     echo -e "\033[1;32m\nfrontend build success \033[0m"
 else
