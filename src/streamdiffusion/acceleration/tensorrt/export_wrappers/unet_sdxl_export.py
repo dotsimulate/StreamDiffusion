@@ -53,6 +53,46 @@ class SDXLExportWrapper(torch.nn.Module):
                     if hasattr(attr, 'config') and hasattr(attr.config, 'addition_embed_type'):
                         return attr
             return unet
+
+    def _resolve_num_ip_layers(self) -> Optional[int]:
+        """Resolve IP-Adapter layer count from known wrapper layouts."""
+        direct_layers = getattr(self.unet, "num_ip_layers", None)
+        if isinstance(direct_layers, int) and direct_layers > 0:
+            return direct_layers
+
+        ip_wrap = getattr(self.unet, "ipadapter_wrapper", None)
+        wrapped_layers = getattr(ip_wrap, "num_ip_layers", None)
+        if isinstance(wrapped_layers, int) and wrapped_layers > 0:
+            return wrapped_layers
+
+        return None
+
+    def _build_probe_args(
+        self,
+        sample: torch.Tensor,
+        timestep: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+    ) -> Optional[List[torch.Tensor]]:
+        """Build positional args for SDXL support probing."""
+        probe_args: List[torch.Tensor] = [sample, timestep, encoder_hidden_states]
+        if not getattr(self.unet, "use_ipadapter", False):
+            return probe_args
+
+        num_ip_layers = self._resolve_num_ip_layers()
+        if num_ip_layers is None:
+            direct_layers = getattr(self.unet, "num_ip_layers", None)
+            wrapped_layers = getattr(getattr(self.unet, "ipadapter_wrapper", None), "num_ip_layers", None)
+            logger.error(
+                "SDXL probe: use_ipadapter=True but num_ip_layers is invalid: direct=%s wrapped=%s",
+                direct_layers,
+                wrapped_layers,
+            )
+            return None
+
+        probe_args.append(
+            torch.ones(num_ip_layers, device=sample.device, dtype=torch.float32)
+        )
+        return probe_args
         
     def _test_added_cond_support(self):
         """Test if this SDXL model supports added_cond_kwargs"""
@@ -67,9 +107,17 @@ class SDXLExportWrapper(torch.nn.Module):
                 'text_embeds': torch.randn(1, 1280, device='cuda', dtype=torch.float16),
                 'time_ids': torch.randn(1, 6, device='cuda', dtype=torch.float16)
             }
+
+            # UnifiedExportWrapper with IP-Adapter enabled requires a positional
+            # ipadapter_scale tensor before kwargs. During this capability probe
+            # we provide a sample vector only for call-shape validation; real
+            # per-step values are supplied at runtime by IP-Adapter hooks.
+            probe_args = self._build_probe_args(sample, timestep, encoder_hidden_states)
+            if probe_args is None:
+                return False
             
             with torch.no_grad():
-                _ = self.unet(sample, timestep, encoder_hidden_states, added_cond_kwargs=test_added_cond)
+                _ = self.unet(*probe_args, added_cond_kwargs=test_added_cond)
             
             logger.info("SDXL model supports added_cond_kwargs")
             return True
