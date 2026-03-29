@@ -539,6 +539,24 @@ def build_engine(
 
 
 
+def _find_external_data_files(directory: str) -> list:
+    """Find external data files in a directory by checking common extensions.
+
+    torch.onnx.export may create .data files, while our pipeline uses .pb.
+    This detects both to ensure proper handling of >2GB ONNX models.
+    """
+    import os
+    external_exts = ('.pb', '.data', '.onnx.data', '.onnx_data')
+    result = []
+    try:
+        for f in os.listdir(directory):
+            if any(f.endswith(ext) for ext in external_exts):
+                result.append(f)
+    except OSError:
+        pass
+    return result
+
+
 def export_onnx(
     model,
     onnx_path: str,
@@ -628,14 +646,31 @@ def export_onnx(
         if is_large_model:
             import os
 
-            # Check file size on disk (avoids protobuf 2GB serialization limit in ByteSize())
-            if os.path.getsize(onnx_path) > 2147483648:  # 2GB
-                # Load the exported model for re-saving
-                onnx_model = onnx.load(onnx_path)
-                # Create directory for external data
-                onnx_dir = os.path.dirname(onnx_path)
-                
-                # Re-save with external data format
+            onnx_dir = os.path.dirname(onnx_path)
+            onnx_file_size = os.path.getsize(onnx_path)
+
+            # Check if torch.onnx.export already created external data files
+            # PyTorch may auto-save with .data extension for >2GB models
+            existing_external = _find_external_data_files(onnx_dir)
+
+            if onnx_file_size > 2147483648:  # >2GB single file
+                logger.info(f"ONNX file is {onnx_file_size / (1024**3):.2f} GB, converting to external data format...")
+                # Load the >2GB single-file model. The protobuf upb backend (used in protobuf 4.25.x)
+                # can handle >2GB messages. If this fails, it means protobuf can't parse it.
+                try:
+                    onnx_model = onnx.load(onnx_path)
+                except Exception as load_err:
+                    raise RuntimeError(
+                        f"Failed to load >2GB ONNX model ({onnx_file_size / (1024**3):.2f} GB): {load_err}\n"
+                        f"This may be a protobuf version issue. Ensure protobuf==4.25.3 is installed.\n"
+                        f"Run: pip install protobuf==4.25.3"
+                    ) from load_err
+                # Clean up any existing external data files before saving
+                for ef in existing_external:
+                    try:
+                        os.remove(os.path.join(onnx_dir, ef))
+                    except OSError:
+                        pass
                 onnx.save_model(
                     onnx_model,
                     onnx_path,
@@ -646,6 +681,29 @@ def export_onnx(
                 )
                 logger.info(f"Converted to external data format with weights in weights.pb")
                 del onnx_model
+            elif existing_external:
+                # torch.onnx.export already saved with external data (e.g., .data files)
+                # Normalize to weights.pb for consistent downstream detection
+                logger.info(f"Found existing external data files from torch export: {existing_external}")
+                onnx_model = onnx.load(onnx_path, load_external_data=True)
+                # Clean up old external data files
+                for ef in existing_external:
+                    try:
+                        os.remove(os.path.join(onnx_dir, ef))
+                    except OSError:
+                        pass
+                onnx.save_model(
+                    onnx_model,
+                    onnx_path,
+                    save_as_external_data=True,
+                    all_tensors_to_one_file=True,
+                    location="weights.pb",
+                    convert_attribute=False,
+                )
+                logger.info(f"Normalized external data to weights.pb")
+                del onnx_model
+            else:
+                logger.info(f"ONNX file is {onnx_file_size / (1024**3):.2f} GB (under 2GB), no external data conversion needed")
     del wrapped_model
     gc.collect()
     torch.cuda.empty_cache()
@@ -658,27 +716,35 @@ def optimize_onnx(
 ):
     import os
     import shutil
-    
-    # Check if external data files exist (indicating external data format was used)
+
     onnx_dir = os.path.dirname(onnx_path)
-    external_data_files = [f for f in os.listdir(onnx_dir) if f.endswith('.pb')]
+
+    # Detect external data files using comprehensive extension check
+    external_data_files = _find_external_data_files(onnx_dir)
     uses_external_data = len(external_data_files) > 0
-    
+
+    # Also check ONNX file size — if the main file is small but no external data detected,
+    # something may be wrong (torch may have saved external data with an unexpected name)
+    onnx_file_size = os.path.getsize(onnx_path)
+
     if uses_external_data:
+        logger.info(f"Optimizing ONNX with external data (found: {external_data_files})")
         # Load model with external data
         onnx_model = onnx.load(onnx_path, load_external_data=True)
         onnx_opt_graph = model_data.optimize(onnx_model)
-        
+        del onnx_model
+
         # Create output directory
         opt_dir = os.path.dirname(onnx_opt_path)
         os.makedirs(opt_dir, exist_ok=True)
-        
-        # Clean up existing files in output directory
+
+        # Clean up existing ONNX/external data files in output directory
         if os.path.exists(opt_dir):
+            cleanup_exts = ('.pb', '.onnx', '.data', '.onnx.data', '.onnx_data')
             for f in os.listdir(opt_dir):
-                if f.endswith('.pb') or f.endswith('.onnx'):
+                if any(f.endswith(ext) for ext in cleanup_exts):
                     os.remove(os.path.join(opt_dir, f))
-        
+
         # Save optimized model with external data format
         onnx.save_model(
             onnx_opt_graph,
@@ -689,12 +755,40 @@ def optimize_onnx(
             convert_attribute=False,
         )
         logger.info(f"ONNX optimization complete with external data")
-        
+
     else:
         # Standard optimization for smaller models
+        logger.info(f"Optimizing ONNX (single file, {onnx_file_size / (1024**2):.1f} MB)")
         onnx_opt_graph = model_data.optimize(onnx.load(onnx_path))
-        onnx.save(onnx_opt_graph, onnx_opt_path)
-    
+
+        # Check if the optimized graph is too large for single-file serialization
+        try:
+            opt_size = onnx_opt_graph.ByteSize()
+        except Exception:
+            opt_size = 0
+
+        if opt_size > 2000000000:  # ~2GB with margin
+            logger.info(f"Optimized model is {opt_size / (1024**3):.2f} GB, saving with external data")
+            onnx.save_model(
+                onnx_opt_graph,
+                onnx_opt_path,
+                save_as_external_data=True,
+                all_tensors_to_one_file=True,
+                location="weights.pb",
+                convert_attribute=False,
+            )
+        else:
+            onnx.save(onnx_opt_graph, onnx_opt_path)
+
+    # Verify the output file was created
+    if not os.path.exists(onnx_opt_path):
+        raise RuntimeError(f"ONNX optimization failed: output file was not created at {onnx_opt_path}")
+    opt_file_size = os.path.getsize(onnx_opt_path)
+    if opt_file_size == 0:
+        os.remove(onnx_opt_path)
+        raise RuntimeError(f"ONNX optimization failed: output file is empty (0 bytes) at {onnx_opt_path}")
+    logger.info(f"Optimized ONNX saved: {onnx_opt_path} ({opt_file_size / (1024**2):.1f} MB)")
+
     del onnx_opt_graph
     gc.collect()
     torch.cuda.empty_cache()

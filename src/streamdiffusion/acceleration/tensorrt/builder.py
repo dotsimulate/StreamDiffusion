@@ -128,6 +128,23 @@ class EngineBuilder:
         self.model.min_latent_shape = min_image_resolution // 8
         self.model.max_latent_shape = max_image_resolution // 8
 
+        # --- Verify ONNX artifacts exist before TRT build ---
+        if not os.path.exists(onnx_opt_path):
+            raise RuntimeError(
+                f"Optimized ONNX file missing: {onnx_opt_path}\n"
+                f"This usually means the ONNX optimization step failed silently.\n"
+                f"Try deleting the engine directory and rebuilding."
+            )
+        opt_file_size = os.path.getsize(onnx_opt_path)
+        if opt_file_size == 0:
+            os.remove(onnx_opt_path)
+            raise RuntimeError(
+                f"Optimized ONNX file is empty (0 bytes): {onnx_opt_path}\n"
+                f"This usually indicates a protobuf serialization failure for >2GB models.\n"
+                f"Try deleting the engine directory and rebuilding."
+            )
+        _build_logger.info(f"Verified ONNX opt file: {onnx_opt_path} ({opt_file_size / (1024**2):.1f} MB)")
+
         # --- TRT Engine Build ---
         if not force_engine_build and os.path.exists(engine_path):
             print(f"Found cached engine: {engine_path}")
@@ -150,11 +167,14 @@ class EngineBuilder:
             stats["stages"]["trt_build"] = {"status": "built", "elapsed_s": round(elapsed, 2)}
             _build_logger.warning(f"[BUILD] TRT engine build ({engine_filename}): {elapsed:.1f}s")
 
-        # Cleanup ONNX artifacts
+        # Cleanup ONNX artifacts — tolerate Windows file-lock failures (Issue #4)
         for file in os.listdir(os.path.dirname(engine_path)):
             if file.endswith('.engine'):
                 continue
-            os.remove(os.path.join(os.path.dirname(engine_path), file))
+            try:
+                os.remove(os.path.join(os.path.dirname(engine_path), file))
+            except OSError as cleanup_err:
+                _build_logger.warning(f"[BUILD] Could not delete temp file {file}: {cleanup_err}")
 
         # Record totals
         total_elapsed = time.perf_counter() - build_total_start
