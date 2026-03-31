@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any
 from enum import Enum
 import torch
 
@@ -38,6 +38,156 @@ class IPAdapterConfig:
 
     type: IPAdapterType = IPAdapterType.REGULAR
     insightface_model_name: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# IP-Adapter model path mapping by base model architecture and adapter type
+# ---------------------------------------------------------------------------
+# None means the variant is unavailable for that architecture — callers fall
+# back to REGULAR automatically.
+IPADAPTER_MODEL_MAP: Dict[tuple, Optional[Dict[str, str]]] = {
+    ("SD1.5", IPAdapterType.REGULAR): {
+        "model_path": "h94/IP-Adapter/models/ip-adapter_sd15.bin",
+        "image_encoder_path": "h94/IP-Adapter/models/image_encoder",
+    },
+    ("SD1.5", IPAdapterType.PLUS): {
+        "model_path": "h94/IP-Adapter/models/ip-adapter-plus_sd15.safetensors",
+        "image_encoder_path": "h94/IP-Adapter/models/image_encoder",
+    },
+    ("SD1.5", IPAdapterType.FACEID): {
+        "model_path": "h94/IP-Adapter-FaceID/ip-adapter-faceid_sd15.bin",
+        "image_encoder_path": "h94/IP-Adapter/models/image_encoder",
+    },
+    ("SD2.1", IPAdapterType.REGULAR): {
+        "model_path": "h94/IP-Adapter/models/ip-adapter_sd21.bin",
+        "image_encoder_path": "h94/IP-Adapter/models/image_encoder",
+    },
+    ("SD2.1", IPAdapterType.PLUS): None,    # not available from h94
+    ("SD2.1", IPAdapterType.FACEID): None,  # not available from h94
+    ("SDXL", IPAdapterType.REGULAR): {
+        "model_path": "h94/IP-Adapter/sdxl_models/ip-adapter_sdxl.bin",
+        "image_encoder_path": "h94/IP-Adapter/sdxl_models/image_encoder",
+    },
+    ("SDXL", IPAdapterType.PLUS): {
+        "model_path": "h94/IP-Adapter/sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors",
+        "image_encoder_path": "h94/IP-Adapter/sdxl_models/image_encoder",
+    },
+    ("SDXL", IPAdapterType.FACEID): {
+        "model_path": "h94/IP-Adapter-FaceID/ip-adapter-faceid_sdxl.bin",
+        "image_encoder_path": "h94/IP-Adapter/sdxl_models/image_encoder",
+    },
+}
+
+# Set of all known HF model paths — used to distinguish known vs custom paths.
+# Custom/local paths are never overridden.
+_KNOWN_IPADAPTER_PATHS: frozenset = frozenset(
+    entry["model_path"]
+    for entry in IPADAPTER_MODEL_MAP.values()
+    if entry is not None
+)
+
+_KNOWN_ENCODER_PATHS: frozenset = frozenset({
+    "h94/IP-Adapter/models/image_encoder",
+    "h94/IP-Adapter/sdxl_models/image_encoder",
+})
+
+
+def _normalize_model_type(detected_model_type: str, is_sdxl: bool) -> Optional[str]:
+    """Map model detection strings to IPADAPTER_MODEL_MAP keys."""
+    if is_sdxl:
+        return "SDXL"
+    return {
+        "SD1.5": "SD1.5",
+        "SD15": "SD1.5",
+        "SD2.1": "SD2.1",
+        "SD21": "SD2.1",
+        "SDXL": "SDXL",
+    }.get(detected_model_type)
+
+
+def resolve_ipadapter_paths(
+    cfg: Dict[str, Any],
+    detected_model_type: str,
+    is_sdxl: bool,
+) -> Dict[str, Any]:
+    """Validate and auto-resolve IP-Adapter model/encoder paths for the detected base model.
+
+    Mutates *cfg* in-place and returns it. Custom/local paths are never overridden.
+
+    Args:
+        cfg: Single IP-Adapter config dict (keys: ipadapter_model_path, image_encoder_path, type, ...).
+        detected_model_type: Value from detect_model() e.g. "SD1.5", "SD2.1", "SDXL".
+        is_sdxl: Whether the base model is SDXL-family (takes precedence over detected_model_type).
+
+    Returns:
+        The (potentially mutated) cfg dict.
+    """
+    current_model_path = cfg.get("ipadapter_model_path") or ""
+    current_encoder_path = cfg.get("image_encoder_path") or ""
+
+    # Parse adapter type, default to REGULAR
+    try:
+        adapter_type = IPAdapterType(cfg.get("type", "regular"))
+    except ValueError:
+        adapter_type = IPAdapterType.REGULAR
+
+    # Normalize to map key; unknown types are left unchanged
+    norm_type = _normalize_model_type(detected_model_type, is_sdxl)
+    if norm_type is None:
+        logger.warning(
+            f"IP-Adapter auto-resolution: unknown model type '{detected_model_type}' — "
+            f"cannot validate compatibility. Ensure ipadapter_model_path is correct for this model."
+        )
+        return cfg
+
+    # Custom/local path — respect it, only log info
+    if current_model_path and current_model_path not in _KNOWN_IPADAPTER_PATHS:
+        logger.info(
+            f"IP-Adapter: custom model path '{current_model_path}' — "
+            f"skipping auto-resolution (manual compatibility check required for {detected_model_type})."
+        )
+        return cfg
+
+    # Look up the correct entry for this architecture + type
+    target_entry = IPADAPTER_MODEL_MAP.get((norm_type, adapter_type))
+
+    # Variant unavailable for this architecture — fall back to REGULAR with warning
+    if target_entry is None:
+        logger.warning(
+            f"IP-Adapter type '{adapter_type.value}' is not available for {detected_model_type}. "
+            f"Falling back to 'regular' adapter type."
+        )
+        adapter_type = IPAdapterType.REGULAR
+        cfg["type"] = adapter_type.value
+        target_entry = IPADAPTER_MODEL_MAP.get((norm_type, adapter_type))
+
+    if target_entry is None:
+        logger.error(f"IP-Adapter: no mapping found for ({norm_type}, {adapter_type}) — leaving config unchanged.")
+        return cfg
+
+    correct_model_path = target_entry["model_path"]
+    correct_encoder_path = target_entry["image_encoder_path"]
+
+    # Resolve model path
+    if current_model_path != correct_model_path:
+        logger.warning(
+            f"IP-Adapter auto-resolution: '{current_model_path}' is incompatible with "
+            f"{detected_model_type} (cross_attention_dim mismatch). "
+            f"Resolving to '{correct_model_path}'."
+        )
+        cfg["ipadapter_model_path"] = correct_model_path
+    else:
+        logger.info(f"IP-Adapter: '{current_model_path}' is compatible with {detected_model_type}.")
+
+    # Resolve encoder path (only if it's a known HF encoder — custom encoders untouched)
+    if current_encoder_path in _KNOWN_ENCODER_PATHS and current_encoder_path != correct_encoder_path:
+        logger.info(
+            f"IP-Adapter: resolving image encoder "
+            f"'{current_encoder_path}' → '{correct_encoder_path}'."
+        )
+        cfg["image_encoder_path"] = correct_encoder_path
+
+    return cfg
 
 
 class IPAdapterModule(OrchestratorUser):
