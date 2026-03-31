@@ -19,9 +19,11 @@
 #
 
 import gc
+
+# Set up logger for this module
+import logging
 from collections import OrderedDict
-from pathlib import Path
-from typing import Any, List, Optional, Tuple, Union
+from typing import Optional, Union
 
 import numpy as np
 import onnx
@@ -40,17 +42,16 @@ from polygraphy.backend.trt import (
     network_from_onnx_path,
     save_engine,
 )
-from polygraphy.backend.trt import util as trt_util
 
 from .models.models import CLIP, VAE, BaseModel, UNet, VAEEncoder
 
-# Set up logger for this module
-import logging
+
 logger = logging.getLogger(__name__)
 
 TRT_LOGGER = trt.Logger(trt.Logger.ERROR)
 
 from ...model_detection import detect_model
+
 
 # Map of numpy dtype -> torch dtype
 numpy_to_torch_dtype_dict = {
@@ -96,7 +97,7 @@ class Engine:
         self.buffers = OrderedDict()
         self.tensors = OrderedDict()
         self.cuda_graph_instance = None  # cuda graph
-        
+
         # Buffer reuse optimization tracking
         self._last_shape_dict = None
         self._last_device = None
@@ -105,21 +106,21 @@ class Engine:
 
     def __del__(self):
         # Check if AttributeError: 'Engine' object has no attribute 'buffers'
-        if not hasattr(self, 'buffers'):
+        if not hasattr(self, "buffers"):
             return
         [buf.free() for buf in self.buffers.values() if isinstance(buf, cuda.DeviceArray)]
-        
-        if hasattr(self, 'cuda_graph_instance') and self.cuda_graph_instance is not None:
+
+        if hasattr(self, "cuda_graph_instance") and self.cuda_graph_instance is not None:
             try:
                 CUASSERT(cudart.cudaGraphExecDestroy(self.cuda_graph_instance))
             except:
                 pass
-        if hasattr(self, 'graph') and self.graph is not None:
+        if hasattr(self, "graph") and self.graph is not None:
             try:
                 CUASSERT(cudart.cudaGraphDestroy(self.graph))
             except:
                 pass
-        
+
         del self.engine
         del self.context
         del self.buffers
@@ -257,7 +258,12 @@ class Engine:
         engine = engine_from_network(
             network_from_onnx_path(onnx_path, flags=[trt.OnnxParserFlag.NATIVE_INSTANCENORM]),
             config=CreateConfig(
-                fp16=fp16, tf32=True, refittable=enable_refit, profiles=[p], load_timing_cache=timing_cache, **config_kwargs
+                fp16=fp16,
+                tf32=True,
+                refittable=enable_refit,
+                profiles=[p],
+                load_timing_cache=timing_cache,
+                **config_kwargs,
             ),
             save_timing_cache=timing_cache,
         )
@@ -278,19 +284,19 @@ class Engine:
         # Check if we can reuse existing buffers (OPTIMIZATION)
         if self._can_reuse_buffers(shape_dict, device):
             return
-        
+
         # Clear existing buffers before reallocating
         self.tensors.clear()
-        
+
         # Reset CUDA graph when buffers are reallocated
         # The captured graph becomes invalid with new memory addresses
         if self.cuda_graph_instance is not None:
             CUASSERT(cudart.cudaGraphExecDestroy(self.cuda_graph_instance))
             self.cuda_graph_instance = None
-            if hasattr(self, 'graph') and self.graph is not None:
+            if hasattr(self, "graph") and self.graph is not None:
                 CUASSERT(cudart.cudaGraphDestroy(self.graph))
                 self.graph = None
-        
+
         for idx in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(idx)
 
@@ -305,65 +311,60 @@ class Engine:
             if mode == trt.TensorIOMode.INPUT:
                 self.context.set_input_shape(name, shape)
 
-            if any(s < 0 for s in shape):
-                import logging as _logging
-                _logging.getLogger(__name__).error(f"allocate_buffers: tensor '{name}' has negative shape {shape} — not in shape_dict. shape_dict keys: {list(shape_dict.keys()) if shape_dict else []}")
-            tensor = torch.empty(tuple(shape),
-                                 dtype=numpy_to_torch_dtype_dict[dtype_np]) \
-                          .to(device=device)
+            tensor = torch.empty(tuple(shape), dtype=numpy_to_torch_dtype_dict[dtype_np]).to(device=device)
             self.tensors[name] = tensor
-        
+
         # Cache allocation parameters for reuse check
         self._last_shape_dict = shape_dict.copy() if shape_dict else None
         self._last_device = device
-    
+
     def _can_reuse_buffers(self, shape_dict=None, device="cuda"):
         """
         Check if existing buffers can be reused (avoiding expensive reallocation)
-        
+
         Returns:
             bool: True if buffers can be reused, False if reallocation needed
         """
         # No existing tensors - need to allocate
         if not self.tensors:
             return False
-        
+
         # Device changed - need to reallocate
-        if not hasattr(self, '_last_device') or self._last_device != device:
+        if not hasattr(self, "_last_device") or self._last_device != device:
             return False
-        
+
         # No cached shape_dict - need to allocate
-        if not hasattr(self, '_last_shape_dict'):
+        if not hasattr(self, "_last_shape_dict"):
             return False
-            
+
         # Compare current vs cached shape_dict
         if shape_dict is None and self._last_shape_dict is None:
             return True
         elif shape_dict is None or self._last_shape_dict is None:
             return False
-        
+
         # Quick check: if tensor counts differ, can't reuse
         if len(shape_dict) != len(self._last_shape_dict):
             return False
-        
+
         # Compare shapes for all tensors in the new shape_dict
         for name, new_shape in shape_dict.items():
             # Check if tensor exists in cached shapes
             cached_shape = self._last_shape_dict.get(name)
             if cached_shape is None:
                 return False
-            
+
             # Compare shapes (handle different types consistently)
             if tuple(cached_shape) != tuple(new_shape):
                 return False
-        
+
         return True
 
     def reset_cuda_graph(self):
         if self.cuda_graph_instance is not None:
             CUASSERT(cudart.cudaGraphExecDestroy(self.cuda_graph_instance))
             self.cuda_graph_instance = None
-        if hasattr(self, 'graph') and self.graph is not None:
+        if hasattr(self, "graph") and self.graph is not None:
             CUASSERT(cudart.cudaGraphDestroy(self.graph))
             self.graph = None
 
@@ -388,10 +389,11 @@ class Engine:
                 if missing:
                     logger.debug(
                         "TensorRT Engine: filtering unsupported inputs %s (allowed=%s)",
-                        missing, sorted(list(self._allowed_inputs))
+                        missing,
+                        sorted(list(self._allowed_inputs)),
                     )
             feed_dict = filtered_feed_dict
-        
+
         for name, buf in feed_dict.items():
             self.tensors[name].copy_(buf)
 
@@ -401,7 +403,9 @@ class Engine:
         if use_cuda_graph:
             if self.cuda_graph_instance is not None:
                 CUASSERT(cudart.cudaGraphLaunch(self.cuda_graph_instance, stream.ptr))
-                CUASSERT(cudart.cudaStreamSynchronize(stream.ptr))
+                # No cudaStreamSynchronize — graph replay is async; stream ordering ensures
+                # downstream GPU ops (copy_, attention) wait for graph completion.
+                # CPU sync happens only via end.synchronize() in pipeline.__call__.
             else:
                 # do inference before CUDA graph capture
                 noerror = self.context.execute_async_v3(stream.ptr)
@@ -515,7 +519,7 @@ def build_engine(
         max_workspace_size = min(free_mem - activation_carveout, 8 * GiB)
     else:
         max_workspace_size = 0
-    logger.info(f"TRT workspace: free_mem={free_mem/GiB:.1f}GiB, max_workspace={max_workspace_size/GiB:.1f}GiB")
+    logger.info(f"TRT workspace: free_mem={free_mem / GiB:.1f}GiB, max_workspace={max_workspace_size / GiB:.1f}GiB")
     engine = Engine(engine_path)
     input_profile = model_data.get_input_profile(
         opt_batch_size,
@@ -536,27 +540,6 @@ def build_engine(
     return engine
 
 
-
-
-
-def _find_external_data_files(directory: str) -> list:
-    """Find external data files in a directory by checking common extensions.
-
-    torch.onnx.export may create .data files, while our pipeline uses .pb.
-    This detects both to ensure proper handling of >2GB ONNX models.
-    """
-    import os
-    external_exts = ('.pb', '.data', '.onnx.data', '.onnx_data')
-    result = []
-    try:
-        for f in os.listdir(directory):
-            if any(f.endswith(ext) for ext in external_exts):
-                result.append(f)
-    except OSError:
-        pass
-    return result
-
-
 def export_onnx(
     model,
     onnx_path: str,
@@ -567,67 +550,66 @@ def export_onnx(
     onnx_opset: int,
 ):
     # TODO: Not 100% happy about this function - needs refactoring
-    
+
     is_sdxl = False
     is_sdxl_controlnet = False
 
     # Detect if this is a ControlNet model (vs UNet model)
-    is_controlnet = (
-        hasattr(model, '__class__') and 'ControlNet' in model.__class__.__name__
-    ) or (
-        hasattr(model, 'config') and hasattr(model.config, '_class_name') and
-        'ControlNet' in model.config._class_name
+    is_controlnet = (hasattr(model, "__class__") and "ControlNet" in model.__class__.__name__) or (
+        hasattr(model, "config") and hasattr(model.config, "_class_name") and "ControlNet" in model.config._class_name
     )
 
     # Detect if this is an SDXL model via detect_model
-    if hasattr(model, 'unet'):
+    if hasattr(model, "unet"):
         detection_result = detect_model(model.unet)
         if detection_result is not None:
-            is_sdxl = detection_result.get('is_sdxl', False)
-    elif hasattr(model, 'config'):
+            is_sdxl = detection_result.get("is_sdxl", False)
+    elif hasattr(model, "config"):
         detection_result = detect_model(model)
         if detection_result is not None:
-            is_sdxl = detection_result.get('is_sdxl', False)
-    
+            is_sdxl = detection_result.get("is_sdxl", False)
+
     # Detect if this is an SDXL ControlNet
-    is_sdxl_controlnet = is_controlnet and (is_sdxl or (
-        hasattr(model, 'config') and
-        getattr(model.config, 'addition_embed_type', None) == 'text_time'
-    ))
-    
+    is_sdxl_controlnet = is_controlnet and (
+        is_sdxl or (hasattr(model, "config") and getattr(model.config, "addition_embed_type", None) == "text_time")
+    )
+
     wrapped_model = model  # Default: use model as-is
-    
+
     # Apply SDXL wrapper for SDXL models (in practice, always UnifiedExportWrapper)
     # Skip SDXLExportWrapper if model is already a UnifiedExportWrapper — it handles
     # SDXL conditioning internally and has strict positional arg requirements (e.g.
     # ipadapter_scale) that SDXLExportWrapper's forward-test probe would violate.
     from .export_wrappers.unet_unified_export import UnifiedExportWrapper
+
     if is_sdxl and not is_controlnet and not isinstance(model, UnifiedExportWrapper):
-        embedding_dim = getattr(model_data, 'embedding_dim', 'unknown')
+        embedding_dim = getattr(model_data, "embedding_dim", "unknown")
         logger.info(f"Detected SDXL model (embedding_dim={embedding_dim}), using wrapper for ONNX export...")
         from .export_wrappers.unet_sdxl_export import SDXLExportWrapper
+
         wrapped_model = SDXLExportWrapper(model)
     elif not is_controlnet:
-        embedding_dim = getattr(model_data, 'embedding_dim', 'unknown')
+        embedding_dim = getattr(model_data, "embedding_dim", "unknown")
         logger.info(f"Detected non-SDXL model (embedding_dim={embedding_dim}), using model as-is for ONNX export...")
-    
+
     # SDXL ControlNet models need special wrapper for added_cond_kwargs
     elif is_sdxl_controlnet:
         logger.info("Detected SDXL ControlNet model, using specialized wrapper...")
         from .export_wrappers.controlnet_export import SDXLControlNetExportWrapper
+
         wrapped_model = SDXLControlNetExportWrapper(model)
-    
+
     # Regular ControlNet models are exported directly
     elif is_controlnet:
         logger.info("Detected ControlNet model, exporting directly...")
         wrapped_model = model
-    
+
     with torch.inference_mode(), torch.autocast("cuda"):
         inputs = model_data.get_sample_input(opt_batch_size, opt_image_height, opt_image_width)
-        
+
         # Determine if we need external data format for large models (like SDXL)
-        is_large_model = is_sdxl or (hasattr(model, 'config') and getattr(model.config, 'sample_size', 32) >= 64)
-        
+        is_large_model = is_sdxl or (hasattr(model, "config") and getattr(model.config, "sample_size", 32) >= 64)
+
         # Export ONNX normally first
         torch.onnx.export(
             wrapped_model,
@@ -641,36 +623,20 @@ def export_onnx(
             dynamic_axes=model_data.get_dynamic_axes(),
             dynamo=False,
         )
-        
+
         # Convert to external data format for large models (SDXL)
         if is_large_model:
             import os
 
-            onnx_dir = os.path.dirname(onnx_path)
-            onnx_file_size = os.path.getsize(onnx_path)
+            # Load the exported model
+            onnx_model = onnx.load(onnx_path)
 
-            # Check if torch.onnx.export already created external data files
-            # PyTorch may auto-save with .data extension for >2GB models
-            existing_external = _find_external_data_files(onnx_dir)
+            # Check if model is large enough to need external data
+            if onnx_model.ByteSize() > 2147483648:  # 2GB
+                # Create directory for external data
+                onnx_dir = os.path.dirname(onnx_path)
 
-            if onnx_file_size > 2147483648:  # >2GB single file
-                logger.info(f"ONNX file is {onnx_file_size / (1024**3):.2f} GB, converting to external data format...")
-                # Load the >2GB single-file model. The protobuf upb backend (used in protobuf 4.25.x)
-                # can handle >2GB messages. If this fails, it means protobuf can't parse it.
-                try:
-                    onnx_model = onnx.load(onnx_path)
-                except Exception as load_err:
-                    raise RuntimeError(
-                        f"Failed to load >2GB ONNX model ({onnx_file_size / (1024**3):.2f} GB): {load_err}\n"
-                        f"This may be a protobuf version issue. Ensure protobuf==4.25.3 is installed.\n"
-                        f"Run: pip install protobuf==4.25.3"
-                    ) from load_err
-                # Clean up any existing external data files before saving
-                for ef in existing_external:
-                    try:
-                        os.remove(os.path.join(onnx_dir, ef))
-                    except OSError:
-                        pass
+                # Re-save with external data format
                 onnx.save_model(
                     onnx_model,
                     onnx_path,
@@ -679,31 +645,9 @@ def export_onnx(
                     location="weights.pb",
                     convert_attribute=False,
                 )
-                logger.info(f"Converted to external data format with weights in weights.pb")
-                del onnx_model
-            elif existing_external:
-                # torch.onnx.export already saved with external data (e.g., .data files)
-                # Normalize to weights.pb for consistent downstream detection
-                logger.info(f"Found existing external data files from torch export: {existing_external}")
-                onnx_model = onnx.load(onnx_path, load_external_data=True)
-                # Clean up old external data files
-                for ef in existing_external:
-                    try:
-                        os.remove(os.path.join(onnx_dir, ef))
-                    except OSError:
-                        pass
-                onnx.save_model(
-                    onnx_model,
-                    onnx_path,
-                    save_as_external_data=True,
-                    all_tensors_to_one_file=True,
-                    location="weights.pb",
-                    convert_attribute=False,
-                )
-                logger.info(f"Normalized external data to weights.pb")
-                del onnx_model
-            else:
-                logger.info(f"ONNX file is {onnx_file_size / (1024**3):.2f} GB (under 2GB), no external data conversion needed")
+                logger.info("Converted to external data format with weights in weights.pb")
+
+            del onnx_model
     del wrapped_model
     gc.collect()
     torch.cuda.empty_cache()
@@ -715,34 +659,26 @@ def optimize_onnx(
     model_data: BaseModel,
 ):
     import os
-    import shutil
 
+    # Check if external data files exist (indicating external data format was used)
     onnx_dir = os.path.dirname(onnx_path)
-
-    # Detect external data files using comprehensive extension check
-    external_data_files = _find_external_data_files(onnx_dir)
+    external_data_files = [f for f in os.listdir(onnx_dir) if f.endswith(".pb")]
     uses_external_data = len(external_data_files) > 0
-
-    # Also check ONNX file size — if the main file is small but no external data detected,
-    # something may be wrong (torch may have saved external data with an unexpected name)
-    onnx_file_size = os.path.getsize(onnx_path)
 
     if uses_external_data:
         logger.info(f"Optimizing ONNX with external data (found: {external_data_files})")
         # Load model with external data
         onnx_model = onnx.load(onnx_path, load_external_data=True)
         onnx_opt_graph = model_data.optimize(onnx_model)
-        del onnx_model
 
         # Create output directory
         opt_dir = os.path.dirname(onnx_opt_path)
         os.makedirs(opt_dir, exist_ok=True)
 
-        # Clean up existing ONNX/external data files in output directory
+        # Clean up existing files in output directory
         if os.path.exists(opt_dir):
-            cleanup_exts = ('.pb', '.onnx', '.data', '.onnx.data', '.onnx_data')
             for f in os.listdir(opt_dir):
-                if any(f.endswith(ext) for ext in cleanup_exts):
+                if f.endswith(".pb") or f.endswith(".onnx"):
                     os.remove(os.path.join(opt_dir, f))
 
         # Save optimized model with external data format
@@ -754,40 +690,12 @@ def optimize_onnx(
             location="weights.pb",
             convert_attribute=False,
         )
-        logger.info(f"ONNX optimization complete with external data")
+        logger.info("ONNX optimization complete with external data")
 
     else:
         # Standard optimization for smaller models
-        logger.info(f"Optimizing ONNX (single file, {onnx_file_size / (1024**2):.1f} MB)")
         onnx_opt_graph = model_data.optimize(onnx.load(onnx_path))
-
-        # Check if the optimized graph is too large for single-file serialization
-        try:
-            opt_size = onnx_opt_graph.ByteSize()
-        except Exception:
-            opt_size = 0
-
-        if opt_size > 2000000000:  # ~2GB with margin
-            logger.info(f"Optimized model is {opt_size / (1024**3):.2f} GB, saving with external data")
-            onnx.save_model(
-                onnx_opt_graph,
-                onnx_opt_path,
-                save_as_external_data=True,
-                all_tensors_to_one_file=True,
-                location="weights.pb",
-                convert_attribute=False,
-            )
-        else:
-            onnx.save(onnx_opt_graph, onnx_opt_path)
-
-    # Verify the output file was created
-    if not os.path.exists(onnx_opt_path):
-        raise RuntimeError(f"ONNX optimization failed: output file was not created at {onnx_opt_path}")
-    opt_file_size = os.path.getsize(onnx_opt_path)
-    if opt_file_size == 0:
-        os.remove(onnx_opt_path)
-        raise RuntimeError(f"ONNX optimization failed: output file is empty (0 bytes) at {onnx_opt_path}")
-    logger.info(f"Optimized ONNX saved: {onnx_opt_path} ({opt_file_size / (1024**2):.1f} MB)")
+        onnx.save(onnx_opt_graph, onnx_opt_path)
 
     del onnx_opt_graph
     gc.collect()
