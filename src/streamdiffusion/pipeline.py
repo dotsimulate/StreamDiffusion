@@ -1005,7 +1005,7 @@ class StreamDiffusion:
         self.prev_latent_result = x_0_pred_out.clone()
 
         
-        x_output = self.decode_image(x_0_pred_out)
+        x_output = self.decode_image(x_0_pred_out).clone()
 
         # IMAGE POSTPROCESSING HOOKS: After VAE decoding, before final output
         x_output = self._apply_image_postprocessing_hooks(x_output)
@@ -1098,7 +1098,7 @@ class StreamDiffusion:
         self.prev_latent_result = x_0_pred_out.clone()
 
         
-        x_output = self.decode_image(x_0_pred_out)
+        x_output = self.decode_image(x_0_pred_out).clone()
 
         # IMAGE POSTPROCESSING HOOKS: After VAE decoding, before final output
         x_output = self._apply_image_postprocessing_hooks(x_output)
