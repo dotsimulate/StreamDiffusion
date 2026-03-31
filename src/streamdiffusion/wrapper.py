@@ -1202,7 +1202,15 @@ class StreamDiffusionWrapper:
         self._is_sdxl = is_sdxl
         
         logger.info(f"_load_model: Detected model type: {model_type} (confidence: {confidence:.2f})")
-        
+
+        # Auto-resolve IP-Adapter model/encoder paths for detected architecture.
+        # Runs once here so both pre-TRT and post-TRT installation paths see the resolved cfg.
+        if use_ipadapter and ipadapter_config:
+            from streamdiffusion.modules.ipadapter_module import resolve_ipadapter_paths
+            _ip_cfgs = ipadapter_config if isinstance(ipadapter_config, list) else [ipadapter_config]
+            for _ip_cfg in _ip_cfgs:
+                resolve_ipadapter_paths(_ip_cfg, model_type, is_sdxl)
+
         # DEPRECATED: THIS WILL LOAD LCM_LORA IF USE_LCM_LORA IS TRUE
         # Validate backwards compatibility LCM LoRA selection using proper model detection
         if hasattr(self, 'use_lcm_lora') and self.use_lcm_lora is not None:
@@ -1578,9 +1586,9 @@ class StreamDiffusionWrapper:
                             logger.warning(
                                 f"IP-Adapter weights are incompatible with this model "
                                 f"(UNet cross_attention_dim={unet_cross_attn}). "
-                                f"Checkpoint dimension does not match. "
-                                f"SD-Turbo is SD2.1-based (dim=1024) — use h94/IP-Adapter/models/ip-adapter_sd21.bin "
-                                f"or disable IP-Adapter in td_config.yaml. "
+                                f"Checkpoint dimension does not match — this may be a custom model path "
+                                f"that could not be auto-resolved. "
+                                f"Check ipadapter_model_path in td_config.yaml. "
                                 f"Skipping IP-Adapter and continuing without it."
                             )
                             # Restore original processors — IPAdapter.set_ip_adapter() already replaced
