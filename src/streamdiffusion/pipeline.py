@@ -102,6 +102,8 @@ class StreamDiffusion:
         self.similar_filter = SimilarImageFilter()
         self.prev_image_result = None
         self.prev_latent_result = None
+        self._latent_cache = None   # pre-allocated buffer; avoids per-frame CUDA malloc for prev_latent_result
+        self._noise_buf = None      # pre-allocated buffer for per-step noise in TCD non-batched path
 
         self.pipe = pipe
         self.image_processor = VaeImageProcessor(pipe.vae_scale_factor)
@@ -949,12 +951,12 @@ class StreamDiffusion:
                     x_0_pred, model_pred = self.unet_step(sample, t, idx)
                     if idx < len(self.sub_timesteps_tensor) - 1:
                         if self.do_add_noise:
-                            sample = self.alpha_prod_t_sqrt[
-                                idx + 1
-                            ] * x_0_pred + self.beta_prod_t_sqrt[
-                                idx + 1
-                            ] * torch.randn_like(
-                                x_0_pred, device=self.device, dtype=self.dtype
+                            if self._noise_buf is None:
+                                self._noise_buf = torch.empty_like(x_0_pred)
+                            self._noise_buf.normal_()
+                            sample = (
+                                self.alpha_prod_t_sqrt[idx + 1] * x_0_pred
+                                + self.beta_prod_t_sqrt[idx + 1] * self._noise_buf
                             )
                         else:
                             sample = self.alpha_prod_t_sqrt[idx + 1] * x_0_pred
@@ -1001,10 +1003,12 @@ class StreamDiffusion:
         # LATENT POSTPROCESSING HOOKS: After diffusion, before VAE decoding
         x_0_pred_out = self._apply_latent_postprocessing_hooks(x_0_pred_out)
         
-        # Store latent result for latent feedback processors
-        self.prev_latent_result = x_0_pred_out.clone()
+        # Store latent result for latent feedback processors (reuse pre-allocated buffer)
+        if self._latent_cache is None:
+            self._latent_cache = torch.empty_like(x_0_pred_out)
+        self._latent_cache.copy_(x_0_pred_out)
+        self.prev_latent_result = self._latent_cache
 
-        
         x_output = self.decode_image(x_0_pred_out).clone()
 
         # IMAGE POSTPROCESSING HOOKS: After VAE decoding, before final output
@@ -1094,8 +1098,11 @@ class StreamDiffusion:
         # LATENT POSTPROCESSING HOOKS: After diffusion, before VAE decoding
         x_0_pred_out = self._apply_latent_postprocessing_hooks(x_0_pred_out)
         
-        # Store latent result for latent feedback processors
-        self.prev_latent_result = x_0_pred_out.clone()
+        # Store latent result for latent feedback processors (reuse pre-allocated buffer)
+        if self._latent_cache is None:
+            self._latent_cache = torch.empty_like(x_0_pred_out)
+        self._latent_cache.copy_(x_0_pred_out)
+        self.prev_latent_result = self._latent_cache
 
         
         x_output = self.decode_image(x_0_pred_out).clone()
@@ -1152,8 +1159,11 @@ class StreamDiffusion:
         # LATENT POSTPROCESSING HOOKS: After diffusion, before VAE decoding
         x_0_pred_out = self._apply_latent_postprocessing_hooks(x_0_pred_out)
         
-        # Store latent result for latent feedback processors
-        self.prev_latent_result = x_0_pred_out.clone()
+        # Store latent result for latent feedback processors (reuse pre-allocated buffer)
+        if self._latent_cache is None:
+            self._latent_cache = torch.empty_like(x_0_pred_out)
+        self._latent_cache.copy_(x_0_pred_out)
+        self.prev_latent_result = self._latent_cache
 
         
         x_output = self.decode_image(x_0_pred_out)

@@ -2070,6 +2070,15 @@ class StreamDiffusionWrapper:
             except Exception as e:
                 logger.error(f"Failed to install LatentPostprocessingModule: {e}")
 
+        # L2 cache persistence: pin hot UNet attention weights in GPU L2 cache.
+        # Gated by SDTD_L2_PERSIST=1 (default on). Silent fallback on unsupported GPUs.
+        # Requires Ampere+ (compute 8.0+). Expected gain: 2-5% end-to-end on SD1.5/SD-Turbo.
+        try:
+            from streamdiffusion.tools.cuda_l2_cache import setup_l2_persistence
+            setup_l2_persistence(stream.unet)
+        except Exception as e:
+            logger.debug(f"L2 cache persistence setup skipped: {e}")
+
         return stream
 
     def get_last_processed_image(self, index: int) -> Optional[Image.Image]:
