@@ -71,7 +71,7 @@ class StreamDiffusionWrapper:
         model_id_or_path: str,
         t_index_list: List[int],
         min_batch_size: int = 1,
-        max_batch_size: int = 2,
+        max_batch_size: int = 4,
         lora_dict: Optional[Dict[str, float]] = None,
         mode: Literal["img2img", "txt2img"] = "img2img",
         output_type: Literal["pil", "pt", "np", "latent"] = "pil",
