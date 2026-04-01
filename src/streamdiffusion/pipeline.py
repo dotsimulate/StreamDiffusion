@@ -625,14 +625,18 @@ class StreamDiffusion:
         idx: Optional[int] = None,
     ) -> torch.Tensor:
         if idx is None:
+            # Upcast division to fp32 — alpha_prod_t_sqrt can be small at early timesteps,
+            # causing fp16 rounding artifacts; cast result back to original dtype.
             F_theta = (
-                x_t_latent_batch - self.beta_prod_t_sqrt * model_pred_batch
-            ) / self.alpha_prod_t_sqrt
+                (x_t_latent_batch - self.beta_prod_t_sqrt * model_pred_batch).float()
+                / self.alpha_prod_t_sqrt.float()
+            ).to(x_t_latent_batch.dtype)
             denoised_batch = self.c_out * F_theta + self.c_skip * x_t_latent_batch
         else:
             F_theta = (
-                x_t_latent_batch - self.beta_prod_t_sqrt[idx] * model_pred_batch
-            ) / self.alpha_prod_t_sqrt[idx]
+                (x_t_latent_batch - self.beta_prod_t_sqrt[idx] * model_pred_batch).float()
+                / self.alpha_prod_t_sqrt[idx].float()
+            ).to(x_t_latent_batch.dtype)
             denoised_batch = (
                 self.c_out[idx] * F_theta + self.c_skip[idx] * x_t_latent_batch
             )
@@ -883,7 +887,7 @@ class StreamDiffusion:
             device=self.device,
             dtype=self.vae.dtype,
         )
-        with torch.autocast("cuda", dtype=torch.float16):
+        with torch.autocast("cuda", dtype=self.dtype):
             img_latent = retrieve_latents(self.vae.encode(image_tensors), self.generator)
         
         img_latent = img_latent * self.vae.config.scaling_factor
@@ -894,7 +898,7 @@ class StreamDiffusion:
 
     def decode_image(self, x_0_pred_out: torch.Tensor) -> torch.Tensor:
         scaled_latent = x_0_pred_out / self.vae.config.scaling_factor
-        with torch.autocast("cuda", dtype=torch.float16):
+        with torch.autocast("cuda", dtype=self.dtype):
             output_latent = self.vae.decode(scaled_latent, return_dict=False)[0]
         return output_latent
 
