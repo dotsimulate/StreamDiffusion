@@ -315,10 +315,11 @@ def pin_hot_unet_weights(
     if hot_prefixes is None:
         hot_prefixes = _DEFAULT_HOT_LAYER_PREFIXES
 
-    # Tier 1: Reserve L2 persisting region
-    tier1_ok = reserve_l2_persisting_cache(persist_mb)
-    if not tier1_ok:
-        return 0
+    # Tier 1: Reserve L2 persisting region (skip if persist_mb=0, caller already reserved)
+    if persist_mb > 0:
+        tier1_ok = reserve_l2_persisting_cache(persist_mb)
+        if not tier1_ok:
+            return 0
 
     # Tier 2: Set access policy on hot attention weights
     # Target: to_q, to_k, to_v, to_out weights in hot transformer blocks.
