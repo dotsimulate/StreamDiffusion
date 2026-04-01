@@ -58,10 +58,7 @@ IPADAPTER_MODEL_MAP: Dict[tuple, Optional[Dict[str, str]]] = {
         "model_path": "h94/IP-Adapter-FaceID/ip-adapter-faceid_sd15.bin",
         "image_encoder_path": "h94/IP-Adapter/models/image_encoder",
     },
-    ("SD2.1", IPAdapterType.REGULAR): {
-        "model_path": "h94/IP-Adapter/models/ip-adapter_sd21.bin",
-        "image_encoder_path": "h94/IP-Adapter/models/image_encoder",
-    },
+    ("SD2.1", IPAdapterType.REGULAR): None,  # not available from h94 (ip-adapter_sd21.bin was never released)
     ("SD2.1", IPAdapterType.PLUS): None,    # not available from h94
     ("SD2.1", IPAdapterType.FACEID): None,  # not available from h94
     ("SDXL", IPAdapterType.REGULAR): {
@@ -162,7 +159,12 @@ def resolve_ipadapter_paths(
         target_entry = IPADAPTER_MODEL_MAP.get((norm_type, adapter_type))
 
     if target_entry is None:
-        logger.error(f"IP-Adapter: no mapping found for ({norm_type}, {adapter_type}) — leaving config unchanged.")
+        logger.warning(
+            f"IP-Adapter: no compatible adapter exists for {detected_model_type} "
+            f"(type='{adapter_type.value}'). No IP-Adapter was released for this architecture. "
+            f"IP-Adapter will be disabled for this model."
+        )
+        cfg["enabled"] = False
         return cfg
 
     correct_model_path = target_entry["model_path"]
