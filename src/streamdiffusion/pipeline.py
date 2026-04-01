@@ -115,6 +115,7 @@ class StreamDiffusion:
 
         self.inference_time_ema = 0
         self.similar_filter_sleep_fraction = 0.025
+        self.last_frame_was_skipped = False  # True when similar filter skipped inference this frame
 
         # Initialize SDXL-specific attributes
         if self.is_sdxl:
@@ -989,9 +990,11 @@ class StreamDiffusion:
             if self.similar_image_filter:
                 x = self.similar_filter(x)
                 if x is None:
+                    self.last_frame_was_skipped = True
                     time.sleep(self.inference_time_ema * self.similar_filter_sleep_fraction)
                     return self.prev_image_result
-            
+
+            self.last_frame_was_skipped = False
             x_t_latent = self.encode_image(x)
             
             # LATENT PREPROCESSING HOOKS: After VAE encoding, before diffusion
