@@ -1542,74 +1542,90 @@ class StreamDiffusionWrapper:
                 
                 # CRITICAL: Install IPAdapter module BEFORE TensorRT compilation to ensure processors are baked into engines
                 if use_ipadapter and ipadapter_config and not hasattr(stream, '_ipadapter_module'):
-                    try:
-                        from streamdiffusion.modules.ipadapter_module import IPAdapterModule, IPAdapterConfig, IPAdapterType
-                        logger.info("Installing IPAdapter module before TensorRT compilation...")
-
-                        # Snapshot processors before install — IPAdapter.set_ip_adapter() replaces them
-                        # before load_state_dict(), so a failure leaves the UNet in corrupted state
-                        _saved_unet_processors = {name: proc for name, proc in stream.unet.attn_processors.items()}
-
-                        # Use first config if list provided
-                        cfg = ipadapter_config[0] if isinstance(ipadapter_config, list) else ipadapter_config
-                        ip_cfg = IPAdapterConfig(
-                            style_image_key=cfg.get('style_image_key') or 'ipadapter_main',
-                            num_image_tokens=cfg.get('num_image_tokens', 4),
-                            ipadapter_model_path=cfg['ipadapter_model_path'],
-                            image_encoder_path=cfg['image_encoder_path'],
-                            style_image=cfg.get('style_image'),
-                            scale=cfg.get('scale', 1.0),
-                            type=IPAdapterType(cfg.get('type', "regular")),
-                            insightface_model_name=cfg.get('insightface_model_name'),
+                    # Check if auto-resolution disabled IP-Adapter (e.g. no adapter released for this arch)
+                    _cfg_check = ipadapter_config[0] if isinstance(ipadapter_config, list) else ipadapter_config
+                    if _cfg_check.get('enabled', True) is False:
+                        logger.info(
+                            "IP-Adapter disabled by auto-resolution (no compatible adapter for this model). Skipping."
                         )
-                        ip_module = IPAdapterModule(ip_cfg)
-                        ip_module.install(stream)
-                        # Expose for later updates
-                        stream._ipadapter_module = ip_module
-                        logger.info("IPAdapter module installed successfully before TensorRT compilation")
-                        
-                        # Cleanup after IPAdapter installation
-                        import gc
-                        gc.collect()
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
-                        
-                    except torch.cuda.OutOfMemoryError as oom_error:
-                        logger.error(f"CUDA Out of Memory during early IPAdapter installation: {oom_error}")
-                        logger.error("Try reducing batch size, using smaller models, or increasing GPU memory")
-                        raise RuntimeError("Insufficient VRAM for IPAdapter installation. Consider using a GPU with more memory or reducing model complexity.")
+                        use_ipadapter_trt = False
+                    else:
+                        try:
+                            from streamdiffusion.modules.ipadapter_module import IPAdapterModule, IPAdapterConfig, IPAdapterType
+                            logger.info("Installing IPAdapter module before TensorRT compilation...")
 
-                    except RuntimeError as rt_error:
-                        if "size mismatch" in str(rt_error):
-                            unet_dim = getattr(getattr(stream, 'unet', None), 'config', None)
-                            unet_cross_attn = getattr(unet_dim, 'cross_attention_dim', 'unknown') if unet_dim else 'unknown'
-                            logger.warning(
-                                f"IP-Adapter weights are incompatible with this model "
-                                f"(UNet cross_attention_dim={unet_cross_attn}). "
-                                f"Checkpoint dimension does not match — this may be a custom model path "
-                                f"that could not be auto-resolved. "
-                                f"Check ipadapter_model_path in td_config.yaml. "
-                                f"Skipping IP-Adapter and continuing without it."
+                            # Snapshot processors before install — IPAdapter.set_ip_adapter() replaces them
+                            # before load_state_dict(), so a failure leaves the UNet in corrupted state
+                            _saved_unet_processors = {name: proc for name, proc in stream.unet.attn_processors.items()}
+
+                            # Use first config if list provided
+                            cfg = ipadapter_config[0] if isinstance(ipadapter_config, list) else ipadapter_config
+                            ip_cfg = IPAdapterConfig(
+                                style_image_key=cfg.get('style_image_key') or 'ipadapter_main',
+                                num_image_tokens=cfg.get('num_image_tokens', 4),
+                                ipadapter_model_path=cfg['ipadapter_model_path'],
+                                image_encoder_path=cfg['image_encoder_path'],
+                                style_image=cfg.get('style_image'),
+                                scale=cfg.get('scale', 1.0),
+                                type=IPAdapterType(cfg.get('type', "regular")),
+                                insightface_model_name=cfg.get('insightface_model_name'),
                             )
-                            # Restore original processors — IPAdapter.set_ip_adapter() already replaced
-                            # them before load_state_dict() failed, leaving the UNet in a corrupted state
+                            ip_module = IPAdapterModule(ip_cfg)
+                            ip_module.install(stream)
+                            # Expose for later updates
+                            stream._ipadapter_module = ip_module
+                            logger.info("IPAdapter module installed successfully before TensorRT compilation")
+
+                            # Cleanup after IPAdapter installation
+                            import gc
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+
+                        except torch.cuda.OutOfMemoryError as oom_error:
+                            logger.error(f"CUDA Out of Memory during early IPAdapter installation: {oom_error}")
+                            logger.error("Try reducing batch size, using smaller models, or increasing GPU memory")
+                            raise RuntimeError("Insufficient VRAM for IPAdapter installation. Consider using a GPU with more memory or reducing model complexity.")
+
+                        except RuntimeError as rt_error:
+                            if "size mismatch" in str(rt_error):
+                                unet_dim = getattr(getattr(stream, 'unet', None), 'config', None)
+                                unet_cross_attn = getattr(unet_dim, 'cross_attention_dim', 'unknown') if unet_dim else 'unknown'
+                                logger.warning(
+                                    f"IP-Adapter weights are incompatible with this model "
+                                    f"(UNet cross_attention_dim={unet_cross_attn}). "
+                                    f"Checkpoint dimension does not match — this may be a custom model path "
+                                    f"that could not be auto-resolved. "
+                                    f"Check ipadapter_model_path in td_config.yaml. "
+                                    f"Skipping IP-Adapter and continuing without it."
+                                )
+                                # Restore original processors — IPAdapter.set_ip_adapter() already replaced
+                                # them before load_state_dict() failed, leaving the UNet in a corrupted state
+                                try:
+                                    stream.unet.set_attn_processor(_saved_unet_processors)
+                                    logger.info("Restored original UNet attention processors after IP-Adapter failure.")
+                                except Exception as restore_err:
+                                    logger.warning(f"Could not restore UNet processors: {restore_err}")
+                                use_ipadapter_trt = False
+                            else:
+                                import traceback
+                                traceback.print_exc()
+                                logger.error("Failed to install IPAdapterModule before TensorRT compilation")
+                                raise
+
+                        except Exception as e:
+                            import traceback
+                            traceback.print_exc()
+                            logger.warning(
+                                f"Failed to install IPAdapterModule: {e}. "
+                                f"Continuing without IP-Adapter."
+                            )
                             try:
                                 stream.unet.set_attn_processor(_saved_unet_processors)
                                 logger.info("Restored original UNet attention processors after IP-Adapter failure.")
                             except Exception as restore_err:
                                 logger.warning(f"Could not restore UNet processors: {restore_err}")
                             use_ipadapter_trt = False
-                        else:
-                            import traceback
-                            traceback.print_exc()
-                            logger.error("Failed to install IPAdapterModule before TensorRT compilation")
-                            raise
-
-                    except Exception:
-                        import traceback
-                        traceback.print_exc()
-                        logger.error("Failed to install IPAdapterModule before TensorRT compilation")
-                        raise
 
                 # NOTE: When IPAdapter is enabled, we must pass num_ip_layers. We cannot know it until after
                 # installing processors in the export wrapper. We construct the wrapper first to discover it,
