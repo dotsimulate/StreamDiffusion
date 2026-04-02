@@ -26,7 +26,7 @@ def generate_unet_calibration_data(
     opt_batch_size: int,
     opt_image_height: int,
     opt_image_width: int,
-    num_batches: int = 128,
+    num_batches: int = 8,
 ) -> List[Dict[str, np.ndarray]]:
     """
     Generate calibration data for SDXL-Turbo UNet FP8 quantization.
@@ -42,7 +42,10 @@ def generate_unet_calibration_data(
                         because cond + uncond are batched together.
         opt_image_height: Optimal image height in pixels (e.g. 512).
         opt_image_width: Optimal image width in pixels (e.g. 512).
-        num_batches: Number of calibration batches. NVIDIA recommends 128.
+        num_batches: Number of calibration batches. Capped at 8 for SDXL-scale
+                     models: each batch contains 70 KVO cache tensors (~2.2 GB),
+                     so 128 batches would require ~281 GB RAM. FP8 is less
+                     sensitive to calibration size than INT8 (wider dynamic range).
 
     Returns:
         List of dicts: [{input_name: np.ndarray}, ...] — one dict per batch.
