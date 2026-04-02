@@ -212,14 +212,14 @@ def quantize_onnx_fp8(
             os.environ["PATH"] = os.pathsep.join(_bin_dirs) + os.pathsep + os.environ.get("PATH", "")
             logger.info(f"[FP8] Added {len(_bin_dirs)} NVIDIA DLL dirs to PATH")
 
-    # modelopt expects {name: ndarray} with calibration samples stacked along axis 0,
-    # not a list of dicts. Merge: [(name: shape)...] → {name: (N, *shape)}
+    # modelopt's CalibrationDataProvider expects a single dict {name: ndarray} where
+    # each value has exactly the model's input rank. np.stack would add an extra
+    # calibration-sample dimension (rank+1), causing ORT "Invalid rank" errors.
+    # Use first batch — one batch with effective_batch samples is sufficient for FP8
+    # (wider dynamic range than INT8, less sensitive to calibration volume).
     if isinstance(calibration_data, list) and calibration_data:
-        merged = {}
-        for name in calibration_data[0]:
-            merged[name] = np.stack([batch[name] for batch in calibration_data if name in batch])
-        calibration_data = merged
-        logger.info(f"[FP8] Merged calibration data: {len(merged)} inputs, {next(iter(merged.values())).shape[0]} samples")
+        logger.info(f"[FP8] Using first calibration batch of {len(calibration_data)} ({len(calibration_data[0])} inputs)")
+        calibration_data = calibration_data[0]
 
     quantize_kwargs = {
         "quantize_mode": "fp8",
@@ -243,11 +243,23 @@ def quantize_onnx_fp8(
         quantize_kwargs.pop("quantize_mha", None)
         modelopt_quantize(onnx_opt_path, **quantize_kwargs)
     except Exception as e:
-        # quantize_mha=True requires ORT CUDA/TRT EP to analyze MHA patterns.
-        # If CUDA EP is unavailable (e.g. cuDNN not on PATH), ORT falls back to CPU
-        # EP which is stricter about fp32/fp16 Cast type mismatches in the FP16 graph.
-        # Retry with quantize_mha disabled so the MHA analysis path is skipped.
+        # quantize_mha=True requires an ORT inference run to analyze MHA patterns.
+        # This can fail with rank mismatches (KVO caches have custom shapes) or
+        # when CUDA EP is unavailable. Retry with quantize_mha disabled.
         if quantize_kwargs.pop("quantize_mha", None):
+            # Delete intermediate files written during the failed attempt to free
+            # disk space before the retry (each set is ~23GB for SDXL-scale models).
+            _eng_dir = os.path.dirname(onnx_opt_path)
+            _base = os.path.splitext(onnx_opt_path)[0]  # strip .onnx
+            for _suffix in (
+                "_named.onnx", "_named.onnx_data",
+                "_named_extended.onnx", "_named_extended.onnx_data",
+                "_ir10.onnx", "_ir10.onnx_data",
+            ):
+                _f = _base + _suffix
+                if os.path.exists(_f):
+                    os.remove(_f)
+                    logger.info(f"[FP8] Cleaned up intermediate: {os.path.basename(_f)}")
             logger.warning(
                 f"[FP8] quantize_mha=True failed ({type(e).__name__}: {e}). "
                 "Retrying with quantize_mha disabled (MHA layers will use default precision)."
