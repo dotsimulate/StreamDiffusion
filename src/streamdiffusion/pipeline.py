@@ -1,27 +1,35 @@
+import logging
 import time
-from typing import List, Optional, Union, Any, Dict, Tuple, Literal
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import PIL.Image
 import torch
-from diffusers import LCMScheduler, TCDScheduler, StableDiffusionPipeline
+from diffusers import LCMScheduler, StableDiffusionPipeline, TCDScheduler
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import (
     retrieve_latents,
 )
 
-from streamdiffusion.model_detection import detect_model
 from streamdiffusion.hooks import (
-    EmbedsCtx, StepCtx, UnetKwargsDelta, ImageCtx, LatentCtx,
-    EmbeddingHook, UnetHook, ImageHook, LatentHook
+    EmbeddingHook,
+    EmbedsCtx,
+    ImageCtx,
+    ImageHook,
+    LatentCtx,
+    LatentHook,
+    StepCtx,
+    UnetHook,
+    UnetKwargsDelta,
 )
 from streamdiffusion.image_filter import SimilarImageFilter
+from streamdiffusion.model_detection import detect_model
 from streamdiffusion.stream_parameter_updater import StreamParameterUpdater
 
-import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 class StreamDiffusion:
     def __init__(
@@ -64,11 +72,11 @@ class StreamDiffusion:
 
         # Detect model type
         detection_result = detect_model(pipe.unet, pipe)
-        self.model_type = detection_result['model_type']
-        self.is_sdxl = detection_result['is_sdxl']
-        self.is_turbo = detection_result['is_turbo']
-        self.detection_confidence = detection_result['confidence']
-    
+        self.model_type = detection_result["model_type"]
+        self.is_sdxl = detection_result["is_sdxl"]
+        self.is_turbo = detection_result["is_turbo"]
+        self.detection_confidence = detection_result["confidence"]
+
         # TCD scheduler is incompatible with denoising batch optimization due to Strategic Stochastic Sampling
         # Force sequential processing for TCD
         if scheduler == "tcd":
@@ -81,13 +89,9 @@ class StreamDiffusion:
             self.use_denoising_batch = True
             self.batch_size = self.denoising_steps_num * frame_buffer_size
             if self.cfg_type == "initialize":
-                self.trt_unet_batch_size = (
-                    self.denoising_steps_num + 1
-                ) * self.frame_bff_size
+                self.trt_unet_batch_size = (self.denoising_steps_num + 1) * self.frame_bff_size
             elif self.cfg_type == "full":
-                self.trt_unet_batch_size = (
-                    2 * self.denoising_steps_num * self.frame_bff_size
-                )
+                self.trt_unet_batch_size = 2 * self.denoising_steps_num * self.frame_bff_size
             else:
                 self.trt_unet_batch_size = self.denoising_steps_num * frame_buffer_size
         else:
@@ -102,13 +106,15 @@ class StreamDiffusion:
         self.similar_filter = SimilarImageFilter()
         self.prev_image_result = None
         self.prev_latent_result = None
-        self._latent_cache = None   # pre-allocated buffer; avoids per-frame CUDA malloc for prev_latent_result
-        self._noise_buf = None      # pre-allocated buffer for per-step noise in TCD non-batched path
+        self._latent_cache = None  # pre-allocated buffer; avoids per-frame CUDA malloc for prev_latent_result
+        self._noise_buf = None  # pre-allocated buffer for per-step noise in TCD non-batched path
+        self._image_decode_buf = None  # pre-allocated buffer for VAE decode output (avoids .clone())
+        self._prev_image_buf = None  # pre-allocated buffer for skip-frame image cache
 
         self.pipe = pipe
         self.image_processor = VaeImageProcessor(pipe.vae_scale_factor)
         self.scheduler = self._initialize_scheduler(scheduler, sampler, pipe.scheduler.config)
-        
+
         self.text_encoder = pipe.text_encoder
         self.unet = pipe.unet
         self.vae = pipe.vae
@@ -128,19 +134,19 @@ class StreamDiffusion:
         # Hook containers (step 1: introduced but initially no-op)
         self.embedding_hooks: List[EmbeddingHook] = []
         self.unet_hooks: List[UnetHook] = []
-        
+
         # Phase 1: Core Pipeline Hooks (Immediate Priority)
         self.image_preprocessing_hooks: List[ImageHook] = []
         self.latent_preprocessing_hooks: List[LatentHook] = []
         self.latent_postprocessing_hooks: List[LatentHook] = []
-        
+
         # Phase 2: Quality & Performance Hooks
         self.image_postprocessing_hooks: List[ImageHook] = []
         self.image_filtering_hooks: List[ImageHook] = []
-        
+
         # Cache TensorRT detection to avoid repeated hasattr checks
         self._is_unet_tensorrt = None
-        
+
         # Cache SDXL conditioning tensors to avoid repeated torch.cat/repeat operations
         self._sdxl_conditioning_cache: Dict[str, torch.Tensor] = {}
         self._cached_batch_size: Optional[int] = None
@@ -165,15 +171,15 @@ class StreamDiffusion:
             "beta": {"beta_schedule": "scaled_linear"},
             "karras": {},  # Karras sigmas handled per scheduler
         }
-        
+
         # Get sampler-specific configuration
         sampler_params = sampler_config.get(sampler_type, {})
-        
+
         # Set original_inference_steps to 100 to allow flexible num_inference_steps updates
         # This prevents "original_steps x strength < num_inference_steps" errors when
         # dynamically changing num_inference_steps in production without pipeline restarts
-        sampler_params['original_inference_steps'] = 100
-        
+        sampler_params["original_inference_steps"] = 100
+
         if scheduler_type == "lcm":
             return LCMScheduler.from_config(config, **sampler_params)
         elif scheduler_type == "tcd":
@@ -185,29 +191,34 @@ class StreamDiffusion:
     def _check_unet_tensorrt(self) -> bool:
         """Cache TensorRT detection to avoid repeated hasattr calls"""
         if self._is_unet_tensorrt is None:
-            self._is_unet_tensorrt = hasattr(self.unet, 'engine') and hasattr(self.unet, 'stream')
+            self._is_unet_tensorrt = hasattr(self.unet, "engine") and hasattr(self.unet, "stream")
         return self._is_unet_tensorrt
 
-    def _get_cached_sdxl_conditioning(self, batch_size: int, cfg_type: str, guidance_scale: float) -> Optional[Dict[str, torch.Tensor]]:
+    def _get_cached_sdxl_conditioning(
+        self, batch_size: int, cfg_type: str, guidance_scale: float
+    ) -> Optional[Dict[str, torch.Tensor]]:
         """Retrieve cached SDXL conditioning tensors if configuration matches"""
-        if (self._cached_batch_size == batch_size and 
-            self._cached_cfg_type == cfg_type and 
-            self._cached_guidance_scale == guidance_scale and
-            len(self._sdxl_conditioning_cache) > 0):
+        if (
+            self._cached_batch_size == batch_size
+            and self._cached_cfg_type == cfg_type
+            and self._cached_guidance_scale == guidance_scale
+            and len(self._sdxl_conditioning_cache) > 0
+        ):
             return {
-                'text_embeds': self._sdxl_conditioning_cache.get('text_embeds'),
-                'time_ids': self._sdxl_conditioning_cache.get('time_ids')
+                "text_embeds": self._sdxl_conditioning_cache.get("text_embeds"),
+                "time_ids": self._sdxl_conditioning_cache.get("time_ids"),
             }
         return None
 
-    def _cache_sdxl_conditioning(self, batch_size: int, cfg_type: str, guidance_scale: float, 
-                                text_embeds: torch.Tensor, time_ids: torch.Tensor) -> None:
+    def _cache_sdxl_conditioning(
+        self, batch_size: int, cfg_type: str, guidance_scale: float, text_embeds: torch.Tensor, time_ids: torch.Tensor
+    ) -> None:
         """Cache SDXL conditioning tensors for reuse"""
         self._cached_batch_size = batch_size
         self._cached_cfg_type = cfg_type
         self._cached_guidance_scale = guidance_scale
-        self._sdxl_conditioning_cache['text_embeds'] = text_embeds.clone()
-        self._sdxl_conditioning_cache['time_ids'] = time_ids.clone()
+        self._sdxl_conditioning_cache["text_embeds"] = text_embeds.clone()
+        self._sdxl_conditioning_cache["time_ids"] = time_ids.clone()
 
     def _build_sdxl_conditioning(self, batch_size: int) -> Dict[str, torch.Tensor]:
         """Build SDXL conditioning tensors with optimized tensor operations"""
@@ -219,7 +230,7 @@ class StreamDiffusion:
             cond_text = self.add_text_embeds[1:2]
             uncond_time = self.add_time_ids[0:1]
             cond_time = self.add_time_ids[1:2]
-            
+
             if batch_size > 1:
                 cond_text_repeated = cond_text.expand(batch_size - 1, -1).contiguous()
                 cond_time_repeated = cond_time.expand(batch_size - 1, -1).contiguous()
@@ -228,7 +239,7 @@ class StreamDiffusion:
             else:
                 add_text_embeds = uncond_text
                 add_time_ids = uncond_time
-                
+
         elif self.guidance_scale > 1.0 and (self.cfg_type == "full"):
             # For full mode: repeat both uncond and cond for each latent
             repeat_factor = batch_size // 2
@@ -240,13 +251,7 @@ class StreamDiffusion:
             source_time = self.add_time_ids[1:2] if self.add_time_ids.shape[0] > 1 else self.add_time_ids
             add_text_embeds = source_text.expand(batch_size, -1).contiguous()
             add_time_ids = source_time.expand(batch_size, -1).contiguous()
-        return {
-            'text_embeds': add_text_embeds,
-            'time_ids': add_time_ids
-        }
-
-
-
+        return {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
 
     def load_lora(
         self,
@@ -254,9 +259,7 @@ class StreamDiffusion:
         adapter_name: Optional[Any] = None,
         **kwargs,
     ) -> None:
-        self._load_lora_with_offline_fallback(
-            pretrained_lora_model_name_or_path_or_dict, adapter_name, **kwargs
-        )
+        self._load_lora_with_offline_fallback(pretrained_lora_model_name_or_path_or_dict, adapter_name, **kwargs)
 
     def _load_lora_with_offline_fallback(
         self,
@@ -363,7 +366,7 @@ class StreamDiffusion:
 
         # Handle SDXL vs SD1.5/SD2.1 text encoding differently
         if self.is_sdxl:
-            # SDXL encode_prompt returns 4 values: 
+            # SDXL encode_prompt returns 4 values:
             # (prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds)
             encoder_output = self.pipe.encode_prompt(
                 prompt=prompt,
@@ -380,40 +383,38 @@ class StreamDiffusion:
                 lora_scale=None,
                 clip_skip=None,
             )
-            
+
             if len(encoder_output) >= 4:
-                prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = encoder_output[:4]
-                
+                prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = (
+                    encoder_output[:4]
+                )
+
                 # Set up prompt embeddings for the UNet (base before hooks)
                 base_prompt_embeds = prompt_embeds.repeat(self.batch_size, 1, 1)
-                
+
                 # Handle CFG for prompt embeddings
                 if self.use_denoising_batch and self.cfg_type == "full":
                     uncond_prompt_embeds = negative_prompt_embeds.repeat(self.batch_size, 1, 1)
                 elif self.cfg_type == "initialize":
                     uncond_prompt_embeds = negative_prompt_embeds.repeat(self.frame_bff_size, 1, 1)
 
-                if self.guidance_scale > 1.0 and (
-                    self.cfg_type == "initialize" or self.cfg_type == "full"
-                ):
-                    base_prompt_embeds = torch.cat(
-                        [uncond_prompt_embeds, base_prompt_embeds], dim=0
-                    )
-                
+                if self.guidance_scale > 1.0 and (self.cfg_type == "initialize" or self.cfg_type == "full"):
+                    base_prompt_embeds = torch.cat([uncond_prompt_embeds, base_prompt_embeds], dim=0)
+
                 # Set up SDXL-specific conditioning (added_cond_kwargs)
                 if do_classifier_free_guidance:
                     self.add_text_embeds = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
                 else:
                     self.add_text_embeds = pooled_prompt_embeds
-                
+
                 # Create time conditioning for SDXL micro-conditioning
                 original_size = (self.height, self.width)
                 target_size = (self.height, self.width)
                 crops_coords_top_left = (0, 0)
-                
+
                 add_time_ids = list(original_size + crops_coords_top_left + target_size)
                 add_time_ids = torch.tensor([add_time_ids], dtype=self.dtype, device=self.device)
-                
+
                 if do_classifier_free_guidance:
                     self.add_time_ids = torch.cat([add_time_ids, add_time_ids], dim=0)
                 else:
@@ -445,12 +446,8 @@ class StreamDiffusion:
             elif self.cfg_type == "initialize":
                 uncond_prompt_embeds = encoder_output[1].repeat(self.frame_bff_size, 1, 1)
 
-            if self.guidance_scale > 1.0 and (
-                self.cfg_type == "initialize" or self.cfg_type == "full"
-            ):
-                base_prompt_embeds = torch.cat(
-                    [uncond_prompt_embeds, base_prompt_embeds], dim=0
-                )
+            if self.guidance_scale > 1.0 and (self.cfg_type == "initialize" or self.cfg_type == "full"):
+                base_prompt_embeds = torch.cat([uncond_prompt_embeds, base_prompt_embeds], dim=0)
 
             # Run embedding hooks (no-op unless modules register)
             embeds_ctx = EmbedsCtx(prompt_embeds=base_prompt_embeds, negative_prompt_embeds=None)
@@ -470,9 +467,7 @@ class StreamDiffusion:
         for t in self.t_list:
             self.sub_timesteps.append(self.timesteps[t])
 
-        sub_timesteps_tensor = torch.tensor(
-            self.sub_timesteps, dtype=torch.long, device=self.device
-        )
+        sub_timesteps_tensor = torch.tensor(self.sub_timesteps, dtype=torch.long, device=self.device)
         self.sub_timesteps_tensor = torch.repeat_interleave(
             sub_timesteps_tensor,
             repeats=self.frame_bff_size if self.use_denoising_batch else 1,
@@ -494,16 +489,8 @@ class StreamDiffusion:
             c_skip_list.append(c_skip)
             c_out_list.append(c_out)
 
-        self.c_skip = (
-            torch.stack(c_skip_list)
-            .view(len(self.t_list), 1, 1, 1)
-            .to(dtype=self.dtype, device=self.device)
-        )
-        self.c_out = (
-            torch.stack(c_out_list)
-            .view(len(self.t_list), 1, 1, 1)
-            .to(dtype=self.dtype, device=self.device)
-        )
+        self.c_skip = torch.stack(c_skip_list).view(len(self.t_list), 1, 1, 1).to(dtype=self.dtype, device=self.device)
+        self.c_out = torch.stack(c_out_list).view(len(self.t_list), 1, 1, 1).to(dtype=self.dtype, device=self.device)
 
         alpha_prod_t_sqrt_list = []
         beta_prod_t_sqrt_list = []
@@ -518,9 +505,7 @@ class StreamDiffusion:
             .to(dtype=self.dtype, device=self.device)
         )
         beta_prod_t_sqrt = (
-            torch.stack(beta_prod_t_sqrt_list)
-            .view(len(self.t_list), 1, 1, 1)
-            .to(dtype=self.dtype, device=self.device)
+            torch.stack(beta_prod_t_sqrt_list).view(len(self.t_list), 1, 1, 1).to(dtype=self.dtype, device=self.device)
         )
         self.alpha_prod_t_sqrt = torch.repeat_interleave(
             alpha_prod_t_sqrt,
@@ -532,7 +517,7 @@ class StreamDiffusion:
             repeats=self.frame_bff_size if self.use_denoising_batch else 1,
             dim=0,
         )
-        #NOTE: this is a hack. Pipeline needs a major refactor along with stream parameter updater. 
+        # NOTE: this is a hack. Pipeline needs a major refactor along with stream parameter updater.
         self.update_prompt(prompt)
 
         # Only collapse tensors to scalars for LCM non-batched mode
@@ -561,14 +546,7 @@ class StreamDiffusion:
 
     @torch.inference_mode()
     def update_prompt(self, prompt: str) -> None:
-        self._param_updater.update_stream_params(
-            prompt_list=[(prompt, 1.0)],
-            prompt_interpolation_method="linear"
-        )
-
-    
-
-
+        self._param_updater.update_stream_params(prompt_list=[(prompt, 1.0)], prompt_interpolation_method="linear")
 
     def get_normalize_prompt_weights(self) -> bool:
         """Get the current prompt weight normalization setting."""
@@ -578,14 +556,14 @@ class StreamDiffusion:
         """Get the current seed weight normalization setting."""
         return self._param_updater.get_normalize_seed_weights()
 
-
-
-
-
-    def set_scheduler(self, scheduler: Literal["lcm", "tcd"] = None, sampler: Literal["simple", "sgm uniform", "normal", "ddim", "beta", "karras"] = None) -> None:
+    def set_scheduler(
+        self,
+        scheduler: Literal["lcm", "tcd"] = None,
+        sampler: Literal["simple", "sgm uniform", "normal", "ddim", "beta", "karras"] = None,
+    ) -> None:
         """
         Change the scheduler and/or sampler at runtime.
-        
+
         Parameters
         ----------
         scheduler : str, optional
@@ -597,7 +575,7 @@ class StreamDiffusion:
             self.scheduler_type = scheduler
         if sampler is not None:
             self.sampler_type = sampler
-            
+
         self.scheduler = self._initialize_scheduler(self.scheduler_type, self.sampler_type, self.pipe.scheduler.config)
         logger.info(f"Scheduler changed to {self.scheduler_type} with {self.sampler_type} sampler")
 
@@ -605,18 +583,13 @@ class StreamDiffusion:
         """Return True if scheduler uses LCM-style consistency boundary-condition math."""
         return isinstance(self.scheduler, LCMScheduler)
 
-
-
     def add_noise(
         self,
         original_samples: torch.Tensor,
         noise: torch.Tensor,
         t_index: int,
     ) -> torch.Tensor:
-        noisy_samples = (
-            self.alpha_prod_t_sqrt[t_index] * original_samples
-            + self.beta_prod_t_sqrt[t_index] * noise
-        )
+        noisy_samples = self.alpha_prod_t_sqrt[t_index] * original_samples + self.beta_prod_t_sqrt[t_index] * noise
         return noisy_samples
 
     def scheduler_step_batch(
@@ -629,8 +602,7 @@ class StreamDiffusion:
             # Upcast division to fp32 — alpha_prod_t_sqrt can be small at early timesteps,
             # causing fp16 rounding artifacts; cast result back to original dtype.
             F_theta = (
-                (x_t_latent_batch - self.beta_prod_t_sqrt * model_pred_batch).float()
-                / self.alpha_prod_t_sqrt.float()
+                (x_t_latent_batch - self.beta_prod_t_sqrt * model_pred_batch).float() / self.alpha_prod_t_sqrt.float()
             ).to(x_t_latent_batch.dtype)
             denoised_batch = self.c_out * F_theta + self.c_skip * x_t_latent_batch
         else:
@@ -638,9 +610,7 @@ class StreamDiffusion:
                 (x_t_latent_batch - self.beta_prod_t_sqrt[idx] * model_pred_batch).float()
                 / self.alpha_prod_t_sqrt[idx].float()
             ).to(x_t_latent_batch.dtype)
-            denoised_batch = (
-                self.c_out[idx] * F_theta + self.c_skip[idx] * x_t_latent_batch
-            )
+            denoised_batch = self.c_out[idx] * F_theta + self.c_skip[idx] * x_t_latent_batch
         return denoised_batch
 
     def unet_step(
@@ -660,37 +630,38 @@ class StreamDiffusion:
 
         # Prepare UNet call arguments
         unet_kwargs = {
-            'sample': x_t_latent_plus_uc,
-            'timestep': t_list,
-            'encoder_hidden_states': self.prompt_embeds,
-            'return_dict': False,
+            "sample": x_t_latent_plus_uc,
+            "timestep": t_list,
+            "encoder_hidden_states": self.prompt_embeds,
+            "return_dict": False,
         }
-        
+
         # Add SDXL-specific conditioning if this is an SDXL model
-        if self.is_sdxl and hasattr(self, 'add_text_embeds') and hasattr(self, 'add_time_ids'):
+        if self.is_sdxl and hasattr(self, "add_text_embeds") and hasattr(self, "add_time_ids"):
             if self.add_text_embeds is not None and self.add_time_ids is not None:
                 # Handle batching for CFG - replicate conditioning to match batch size
                 batch_size = x_t_latent_plus_uc.shape[0]
-                
+
                 # Use optimized caching system for SDXL conditioning tensors
-                cached_conditioning = self._get_cached_sdxl_conditioning(batch_size, self.cfg_type, self.guidance_scale)
+                cached_conditioning = self._get_cached_sdxl_conditioning(
+                    batch_size, self.cfg_type, self.guidance_scale
+                )
                 if cached_conditioning is not None:
                     # Cache hit - reuse existing tensors
-                    add_text_embeds = cached_conditioning['text_embeds']
-                    add_time_ids = cached_conditioning['time_ids']
+                    add_text_embeds = cached_conditioning["text_embeds"]
+                    add_time_ids = cached_conditioning["time_ids"]
                 else:
                     # Cache miss - build new tensors using optimized operations
                     conditioning = self._build_sdxl_conditioning(batch_size)
-                    add_text_embeds = conditioning['text_embeds']
-                    add_time_ids = conditioning['time_ids']
+                    add_text_embeds = conditioning["text_embeds"]
+                    add_time_ids = conditioning["time_ids"]
                     # Cache for future use
-                    self._cache_sdxl_conditioning(batch_size, self.cfg_type, self.guidance_scale, add_text_embeds, add_time_ids)
-                
-                unet_kwargs['added_cond_kwargs'] = {
-                    'text_embeds': add_text_embeds,
-                    'time_ids': add_time_ids
-                }
-        
+                    self._cache_sdxl_conditioning(
+                        batch_size, self.cfg_type, self.guidance_scale, add_text_embeds, add_time_ids
+                    )
+
+                unet_kwargs["added_cond_kwargs"] = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+
         # Allow modules to contribute additional UNet kwargs via hooks
         try:
             step_ctx = StepCtx(
@@ -698,7 +669,7 @@ class StreamDiffusion:
                 t_list=t_list,
                 step_index=idx if isinstance(idx, int) else (int(idx) if idx is not None else None),
                 guidance_mode=self.cfg_type if self.guidance_scale > 1.0 else "none",
-                sdxl_cond=unet_kwargs.get('added_cond_kwargs', None)
+                sdxl_cond=unet_kwargs.get("added_cond_kwargs", None),
             )
             extra_from_hooks = {}
             for hook in self.unet_hooks:
@@ -706,42 +677,40 @@ class StreamDiffusion:
                 if delta is None:
                     continue
                 if delta.down_block_additional_residuals is not None:
-                    unet_kwargs['down_block_additional_residuals'] = delta.down_block_additional_residuals
+                    unet_kwargs["down_block_additional_residuals"] = delta.down_block_additional_residuals
                 if delta.mid_block_additional_residual is not None:
-                    unet_kwargs['mid_block_additional_residual'] = delta.mid_block_additional_residual
+                    unet_kwargs["mid_block_additional_residual"] = delta.mid_block_additional_residual
                 if delta.added_cond_kwargs is not None:
                     # Merge SDXL cond if both exist
-                    base_added = unet_kwargs.get('added_cond_kwargs', {})
+                    base_added = unet_kwargs.get("added_cond_kwargs", {})
                     base_added.update(delta.added_cond_kwargs)
-                    unet_kwargs['added_cond_kwargs'] = base_added
-                if getattr(delta, 'extra_unet_kwargs', None):
+                    unet_kwargs["added_cond_kwargs"] = base_added
+                if getattr(delta, "extra_unet_kwargs", None):
                     # Merge extra kwargs from hooks (e.g., ipadapter_scale)
                     try:
                         extra_from_hooks.update(delta.extra_unet_kwargs)
                     except Exception:
                         pass
             if extra_from_hooks:
-                unet_kwargs['extra_unet_kwargs'] = extra_from_hooks
+                unet_kwargs["extra_unet_kwargs"] = extra_from_hooks
         except Exception as e:
             logger.error(f"unet_step: unet hook failed: {e}")
             raise
 
         # Extract potential ControlNet residual kwargs and generic extra kwargs (e.g., ipadapter_scale)
-        hook_down_res = unet_kwargs.get('down_block_additional_residuals', None)
-        hook_mid_res = unet_kwargs.get('mid_block_additional_residual', None)
-        hook_extra_kwargs = unet_kwargs.get('extra_unet_kwargs', None) if 'extra_unet_kwargs' in unet_kwargs else None
+        hook_down_res = unet_kwargs.get("down_block_additional_residuals", None)
+        hook_mid_res = unet_kwargs.get("mid_block_additional_residual", None)
+        hook_extra_kwargs = unet_kwargs.get("extra_unet_kwargs", None) if "extra_unet_kwargs" in unet_kwargs else None
 
         # Call UNet with appropriate conditioning
         if self.is_sdxl:
             try:
-
-                
                 # Detect UNet type and use appropriate calling convention
-                added_cond_kwargs = unet_kwargs.get('added_cond_kwargs', {})
-                
+                added_cond_kwargs = unet_kwargs.get("added_cond_kwargs", {})
+
                 # Check if this is a TensorRT engine or PyTorch UNet
                 is_tensorrt_engine = self._check_unet_tensorrt()
-                
+
                 if is_tensorrt_engine:
                     # TensorRT engine expects positional args + kwargs. IP-Adapter scale vector, if any, is provided by hooks via extra_unet_kwargs
                     extra_kwargs = {}
@@ -750,41 +719,42 @@ class StreamDiffusion:
 
                     # Include ControlNet residuals if provided by hooks
                     if hook_down_res is not None:
-                        extra_kwargs['down_block_additional_residuals'] = hook_down_res
+                        extra_kwargs["down_block_additional_residuals"] = hook_down_res
                     if hook_mid_res is not None:
-                        extra_kwargs['mid_block_additional_residual'] = hook_mid_res
+                        extra_kwargs["mid_block_additional_residual"] = hook_mid_res
 
                     model_pred, kvo_cache_out = self.unet(
-                        unet_kwargs['sample'],                    # latent_model_input (positional)
-                        unet_kwargs['timestep'],                  # timestep (positional)
-                        unet_kwargs['encoder_hidden_states'],     # encoder_hidden_states (positional)
+                        unet_kwargs["sample"],  # latent_model_input (positional)
+                        unet_kwargs["timestep"],  # timestep (positional)
+                        unet_kwargs["encoder_hidden_states"],  # encoder_hidden_states (positional)
                         kvo_cache=self.kvo_cache,
                         **extra_kwargs,
                         # For TRT engines, ensure SDXL cond shapes match engine builds; if engine expects 81 tokens (77+4), append dummy image tokens when none
-                        **added_cond_kwargs                       # SDXL conditioning as kwargs
+                        **added_cond_kwargs,  # SDXL conditioning as kwargs
                     )
                     self.update_kvo_cache(kvo_cache_out)
                 else:
                     # PyTorch UNet expects diffusers-style named arguments. Any processor scaling is handled by IP-Adapter hook
 
-                    call_kwargs = dict(
-                        sample=unet_kwargs['sample'],
-                        timestep=unet_kwargs['timestep'],
-                        encoder_hidden_states=unet_kwargs['encoder_hidden_states'],
-                        added_cond_kwargs=added_cond_kwargs,
-                        return_dict=False,
-                    )
+                    call_kwargs = {
+                        "sample": unet_kwargs["sample"],
+                        "timestep": unet_kwargs["timestep"],
+                        "encoder_hidden_states": unet_kwargs["encoder_hidden_states"],
+                        "added_cond_kwargs": added_cond_kwargs,
+                        "return_dict": False,
+                    }
                     # Include ControlNet residuals if present
                     if hook_down_res is not None:
-                        call_kwargs['down_block_additional_residuals'] = hook_down_res
+                        call_kwargs["down_block_additional_residuals"] = hook_down_res
                     if hook_mid_res is not None:
-                        call_kwargs['mid_block_additional_residual'] = hook_mid_res
+                        call_kwargs["mid_block_additional_residual"] = hook_mid_res
                     model_pred = self.unet(**call_kwargs)[0]
                     # No restoration for per-layer scale; next step will set again via updater/time factor
-                
+
             except Exception as e:
                 logger.error(f"[PIPELINE] unet_step: *** ERROR: SDXL UNet call failed: {e} ***")
                 import traceback
+
                 traceback.print_exc()
                 raise
         else:
@@ -798,9 +768,9 @@ class StreamDiffusion:
 
             # Include ControlNet residuals if present
             if hook_down_res is not None:
-                ip_scale_kw['down_block_additional_residuals'] = hook_down_res
+                ip_scale_kw["down_block_additional_residuals"] = hook_down_res
             if hook_mid_res is not None:
-                ip_scale_kw['mid_block_additional_residual'] = hook_mid_res
+                ip_scale_kw["mid_block_additional_residual"] = hook_mid_res
 
             model_pred, kvo_cache_out = self.unet(
                 x_t_latent_plus_uc,
@@ -821,23 +791,19 @@ class StreamDiffusion:
             noise_pred_uncond, noise_pred_text = model_pred.chunk(2)
         else:
             noise_pred_text = model_pred
-            
-        if self.guidance_scale > 1.0 and (
-            self.cfg_type == "self" or self.cfg_type == "initialize"
-        ):
+
+        if self.guidance_scale > 1.0 and (self.cfg_type == "self" or self.cfg_type == "initialize"):
             noise_pred_uncond = self.stock_noise * self.delta
-            
+
         if self.guidance_scale > 1.0 and self.cfg_type != "none":
-            model_pred = noise_pred_uncond + self.guidance_scale * (
-                noise_pred_text - noise_pred_uncond
-            )
+            model_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
         else:
             model_pred = noise_pred_text
 
         # compute the previous noisy sample x_t -> x_t-1
         if self.use_denoising_batch:
             denoised_batch = self.scheduler_step_batch(model_pred, x_t_latent, idx)
-            
+
             if self.cfg_type == "self" or self.cfg_type == "initialize":
                 scaled_noise = self.beta_prod_t_sqrt * self.stock_noise
                 delta_x = self.scheduler_step_batch(model_pred, scaled_noise, idx)
@@ -857,9 +823,7 @@ class StreamDiffusion:
                     dim=0,
                 )
                 delta_x = delta_x / beta_next
-                init_noise = torch.concat(
-                    [self.init_noise[1:], self.init_noise[0:1]], dim=0
-                )
+                init_noise = torch.concat([self.init_noise[1:], self.init_noise[0:1]], dim=0)
                 self.stock_noise = init_noise + delta_x
 
         else:
@@ -890,11 +854,11 @@ class StreamDiffusion:
         )
         with torch.autocast("cuda", dtype=self.dtype):
             img_latent = retrieve_latents(self.vae.encode(image_tensors), self.generator)
-        
+
         img_latent = img_latent * self.vae.config.scaling_factor
-        
+
         x_t_latent = self.add_noise(img_latent, self.init_noise[0], 0)
-        
+
         return x_t_latent
 
     def decode_image(self, x_0_pred_out: torch.Tensor) -> torch.Tensor:
@@ -905,16 +869,14 @@ class StreamDiffusion:
 
     def predict_x0_batch(self, x_t_latent: torch.Tensor) -> torch.Tensor:
         prev_latent_batch = self.x_t_latent_buffer
-        
+
         # LCM supports our denoising-batch trick. TCD must use standard scheduler.step() sequentially
         # but now properly processes ControlNet hooks through unet_step()
         if self.use_denoising_batch and isinstance(self.scheduler, LCMScheduler):
             t_list = self.sub_timesteps_tensor
             if self.denoising_steps_num > 1:
                 x_t_latent = torch.cat((x_t_latent, prev_latent_batch), dim=0)
-                self.stock_noise = torch.cat(
-                    (self.init_noise[0:1], self.stock_noise[:-1]), dim=0
-                )
+                self.stock_noise = torch.cat((self.init_noise[0:1], self.stock_noise[:-1]), dim=0)
             x_0_pred_batch, model_pred = self.unet_step(x_t_latent, t_list)
 
             if self.denoising_steps_num > 1:
@@ -925,9 +887,7 @@ class StreamDiffusion:
                         + self.beta_prod_t_sqrt[1:] * self.init_noise[1:]
                     )
                 else:
-                    self.x_t_latent_buffer = (
-                        self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
-                    )
+                    self.x_t_latent_buffer = self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
             else:
                 x_0_pred_out = x_0_pred_batch
                 self.x_t_latent_buffer = None
@@ -944,15 +904,25 @@ class StreamDiffusion:
                 # For TCD, use the same UNet calling logic as LCM to ensure ControlNet hooks are processed
                 if isinstance(self.scheduler, TCDScheduler):
                     # Use unet_step to process ControlNet hooks and get proper noise prediction
-                    t_expanded = t.view(1,).repeat(self.frame_bff_size,)
+                    t_expanded = t.view(
+                        1,
+                    ).repeat(
+                        self.frame_bff_size,
+                    )
                     x_0_pred, model_pred = self.unet_step(sample, t_expanded, idx)
-                    
+
                     # Apply TCD scheduler step to the guided noise prediction
                     step_out = self.scheduler.step(model_pred, t, sample)
-                    sample = getattr(step_out, "prev_sample", step_out[0] if isinstance(step_out, (tuple, list)) else step_out)
+                    sample = getattr(
+                        step_out, "prev_sample", step_out[0] if isinstance(step_out, (tuple, list)) else step_out
+                    )
                 else:
                     # Original LCM logic for non-batched mode
-                    t = t.view(1,).repeat(self.frame_bff_size,)
+                    t = t.view(
+                        1,
+                    ).repeat(
+                        self.frame_bff_size,
+                    )
                     x_0_pred, model_pred = self.unet_step(sample, t, idx)
                     if idx < len(self.sub_timesteps_tensor) - 1:
                         if self.do_add_noise:
@@ -972,21 +942,17 @@ class StreamDiffusion:
         return x_0_pred_out
 
     @torch.inference_mode()
-    def __call__(
-        self, x: Union[torch.Tensor, PIL.Image.Image, np.ndarray] = None
-    ) -> torch.Tensor:
+    def __call__(self, x: Union[torch.Tensor, PIL.Image.Image, np.ndarray] = None) -> torch.Tensor:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        
+
         if x is not None:
-            x = self.image_processor.preprocess(x, self.height, self.width).to(
-                device=self.device, dtype=self.dtype
-            )
-            
+            x = self.image_processor.preprocess(x, self.height, self.width).to(device=self.device, dtype=self.dtype)
+
             # IMAGE PREPROCESSING HOOKS: After built-in preprocessing, before filtering
             x = self._apply_image_preprocessing_hooks(x)
-            
+
             if self.similar_image_filter:
                 x = self.similar_filter(x)
                 if x is None:
@@ -996,7 +962,7 @@ class StreamDiffusion:
 
             self.last_frame_was_skipped = False
             x_t_latent = self.encode_image(x)
-            
+
             # LATENT PREPROCESSING HOOKS: After VAE encoding, before diffusion
             x_t_latent = self._apply_latent_preprocessing_hooks(x_t_latent)
         else:
@@ -1004,94 +970,101 @@ class StreamDiffusion:
             x_t_latent = torch.randn((1, 4, self.latent_height, self.latent_width)).to(
                 device=self.device, dtype=self.dtype
             )
-        
+
         x_0_pred_out = self.predict_x0_batch(x_t_latent)
-        
+
         # LATENT POSTPROCESSING HOOKS: After diffusion, before VAE decoding
         x_0_pred_out = self._apply_latent_postprocessing_hooks(x_0_pred_out)
-        
+
         # Store latent result for latent feedback processors (reuse pre-allocated buffer)
         if self._latent_cache is None:
             self._latent_cache = torch.empty_like(x_0_pred_out)
         self._latent_cache.copy_(x_0_pred_out)
         self.prev_latent_result = self._latent_cache
 
-        x_output = self.decode_image(x_0_pred_out).clone()
+        _decoded = self.decode_image(x_0_pred_out)
+        if self._image_decode_buf is None:
+            self._image_decode_buf = torch.empty_like(_decoded)
+        self._image_decode_buf.copy_(_decoded)
+        x_output = self._image_decode_buf
 
         # IMAGE POSTPROCESSING HOOKS: After VAE decoding, before final output
         x_output = self._apply_image_postprocessing_hooks(x_output)
 
-        # Clone for skip-frame cache — TRT VAE buffer is reused on next decode call
-        self.prev_image_result = x_output.clone()
+        # Copy into pre-allocated skip-frame cache — TRT VAE buffer is reused on next decode call
+        if self._prev_image_buf is None:
+            self._prev_image_buf = torch.empty_like(x_output)
+        self._prev_image_buf.copy_(x_output)
+        self.prev_image_result = self._prev_image_buf
         end.record()
         end.synchronize()  # Wait only for this event, not all streams globally
         inference_time = start.elapsed_time(end) / 1000
         self.inference_time_ema = 0.9 * self.inference_time_ema + 0.1 * inference_time
-        
+
         return x_output
 
     # =========================================================================
     # Pipeline Hook Helper Methods (Phase 3: Performance-Optimized Hot Path)
     # =========================================================================
-    
+
     def _apply_image_preprocessing_hooks(self, x: torch.Tensor) -> torch.Tensor:
         """Apply image preprocessing hooks with minimal hot path overhead."""
         # Early exit - zero overhead when no hooks registered
         if not self.image_preprocessing_hooks:
             return x
-        
+
         # Single context object creation to minimize allocation overhead
         image_ctx = ImageCtx(image=x, width=self.width, height=self.height)
-        
+
         # Direct iteration - no additional function calls
         for hook in self.image_preprocessing_hooks:
             image_ctx = hook(image_ctx)
-        
+
         return image_ctx.image
-    
+
     def _apply_image_postprocessing_hooks(self, x: torch.Tensor) -> torch.Tensor:
         """Apply image postprocessing hooks with minimal hot path overhead."""
         # Early exit - zero overhead when no hooks registered
         if not self.image_postprocessing_hooks:
             return x
-        
+
         # Single context object creation to minimize allocation overhead
         image_ctx = ImageCtx(image=x, width=self.width, height=self.height)
-        
+
         # Direct iteration - no additional function calls
         for hook in self.image_postprocessing_hooks:
             image_ctx = hook(image_ctx)
-        
+
         return image_ctx.image
-    
+
     def _apply_latent_preprocessing_hooks(self, latent: torch.Tensor) -> torch.Tensor:
         """Apply latent preprocessing hooks with minimal hot path overhead."""
         # Early exit - zero overhead when no hooks registered
         if not self.latent_preprocessing_hooks:
             return latent
-        
+
         # Single context object creation to minimize allocation overhead
         latent_ctx = LatentCtx(latent=latent)
-        
+
         # Direct iteration - no additional function calls
         for hook in self.latent_preprocessing_hooks:
             latent_ctx = hook(latent_ctx)
-        
+
         return latent_ctx.latent
-    
+
     def _apply_latent_postprocessing_hooks(self, latent: torch.Tensor) -> torch.Tensor:
         """Apply latent postprocessing hooks with minimal hot path overhead."""
-        # Early exit - zero overhead when no hooks registered  
+        # Early exit - zero overhead when no hooks registered
         if not self.latent_postprocessing_hooks:
             return latent
-        
+
         # Single context object creation to minimize allocation overhead
         latent_ctx = LatentCtx(latent=latent)
-        
+
         # Direct iteration - no additional function calls
         for hook in self.latent_postprocessing_hooks:
             latent_ctx = hook(latent_ctx)
-        
+
         return latent_ctx.latent
 
     @torch.inference_mode()
@@ -1101,18 +1074,21 @@ class StreamDiffusion:
                 device=self.device, dtype=self.dtype
             )
         )
-        
+
         # LATENT POSTPROCESSING HOOKS: After diffusion, before VAE decoding
         x_0_pred_out = self._apply_latent_postprocessing_hooks(x_0_pred_out)
-        
+
         # Store latent result for latent feedback processors (reuse pre-allocated buffer)
         if self._latent_cache is None:
             self._latent_cache = torch.empty_like(x_0_pred_out)
         self._latent_cache.copy_(x_0_pred_out)
         self.prev_latent_result = self._latent_cache
 
-        
-        x_output = self.decode_image(x_0_pred_out).clone()
+        _decoded = self.decode_image(x_0_pred_out)
+        if self._image_decode_buf is None:
+            self._image_decode_buf = torch.empty_like(_decoded)
+        self._image_decode_buf.copy_(_decoded)
+        x_output = self._image_decode_buf
 
         # IMAGE POSTPROCESSING HOOKS: After VAE decoding, before final output
         x_output = self._apply_image_postprocessing_hooks(x_output)
@@ -1126,26 +1102,31 @@ class StreamDiffusion:
             device=self.device,
             dtype=self.dtype,
         )
-        
+
         # Prepare UNet call arguments
         unet_kwargs = {
-            'sample': x_t_latent,
-            'timestep': self.sub_timesteps_tensor,
-            'encoder_hidden_states': self.prompt_embeds,
-            'return_dict': False,
+            "sample": x_t_latent,
+            "timestep": self.sub_timesteps_tensor,
+            "encoder_hidden_states": self.prompt_embeds,
+            "return_dict": False,
         }
-        
+
         # Add SDXL-specific conditioning if this is an SDXL model
-        if self.is_sdxl and hasattr(self, 'add_text_embeds') and hasattr(self, 'add_time_ids'):
+        if self.is_sdxl and hasattr(self, "add_text_embeds") and hasattr(self, "add_time_ids"):
             if self.add_text_embeds is not None and self.add_time_ids is not None:
                 # For txt2img, replicate conditioning to match batch size
-                add_text_embeds = self.add_text_embeds[1:2].repeat(batch_size, 1) if self.add_text_embeds.shape[0] > 1 else self.add_text_embeds.repeat(batch_size, 1)
-                add_time_ids = self.add_time_ids[1:2].repeat(batch_size, 1) if self.add_time_ids.shape[0] > 1 else self.add_time_ids.repeat(batch_size, 1)
-                
-                unet_kwargs['added_cond_kwargs'] = {
-                    'text_embeds': add_text_embeds,
-                    'time_ids': add_time_ids
-                }
+                add_text_embeds = (
+                    self.add_text_embeds[1:2].repeat(batch_size, 1)
+                    if self.add_text_embeds.shape[0] > 1
+                    else self.add_text_embeds.repeat(batch_size, 1)
+                )
+                add_time_ids = (
+                    self.add_time_ids[1:2].repeat(batch_size, 1)
+                    if self.add_time_ids.shape[0] > 1
+                    else self.add_time_ids.repeat(batch_size, 1)
+                )
+
+                unet_kwargs["added_cond_kwargs"] = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
 
         # Call UNet with appropriate conditioning
         if self.is_sdxl:
@@ -1158,24 +1139,21 @@ class StreamDiffusion:
                 encoder_hidden_states=self.prompt_embeds,
                 return_dict=False,
             )
-            
-        x_0_pred_out = (
-            x_t_latent - self.beta_prod_t_sqrt * model_pred
-        ) / self.alpha_prod_t_sqrt
-        
+
+        x_0_pred_out = (x_t_latent - self.beta_prod_t_sqrt * model_pred) / self.alpha_prod_t_sqrt
+
         # LATENT POSTPROCESSING HOOKS: After diffusion, before VAE decoding
         x_0_pred_out = self._apply_latent_postprocessing_hooks(x_0_pred_out)
-        
+
         # Store latent result for latent feedback processors (reuse pre-allocated buffer)
         if self._latent_cache is None:
             self._latent_cache = torch.empty_like(x_0_pred_out)
         self._latent_cache.copy_(x_0_pred_out)
         self.prev_latent_result = self._latent_cache
 
-        
         x_output = self.decode_image(x_0_pred_out)
-        
+
         # IMAGE POSTPROCESSING HOOKS: After VAE decoding, before final output
         x_output = self._apply_image_postprocessing_hooks(x_output)
-        
+
         return x_output
