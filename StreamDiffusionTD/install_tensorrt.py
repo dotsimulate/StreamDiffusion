@@ -143,6 +143,11 @@ def install(cu: Optional[str] = None):
         print("Installing pywin32...")
         run_pip("install pywin32==306 --no-cache-dir")
 
+    # Pin onnx to IR 10 — onnxruntime-gpu 1.22 max supported IR version is 10
+    # (onnx 1.18+ exports IR 11/12 which breaks polygraphy constant folding)
+    print("Pinning onnx==1.17.0 (IR 10 for onnxruntime-gpu 1.22 compatibility)...")
+    run_pip("install onnx==1.17.0 --no-cache-dir")
+
     # FP8 quantization dependencies (CUDA 12 only)
     # nvidia-modelopt requires cupy; pin cupy 13.x + numpy<2 for mediapipe compat
     if cuda_major == "12":

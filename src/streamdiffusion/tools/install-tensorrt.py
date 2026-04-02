@@ -36,6 +36,10 @@ def install(cu: Optional[Literal["11", "12"]] = get_cuda_major()):
     if platform.system() == "Windows" and not is_installed("triton"):
         run_pip("install triton-windows==3.4.0.post21")
 
+    # Pin onnx to IR 10 — onnxruntime-gpu 1.22 max supported IR version is 10
+    # (onnx 1.18+ exports IR 11/12 which breaks polygraphy constant folding)
+    run_pip("install onnx==1.17.0 --no-cache-dir")
+
     # FP8 quantization dependencies (CUDA 12 only)
     # nvidia-modelopt requires cupy; pin cupy 13.x + numpy<2 for mediapipe compat
     if cu == "12":

@@ -4,11 +4,11 @@ import sys
 
 from setuptools import find_packages, setup
 
+
 # Copied from pip_utils.py to avoid import
 def _check_torch_installed():
     try:
         import torch
-        import torchvision
     except Exception:
         msg = (
             "Missing required pre-installed packages: torch, torchvision\n"
@@ -19,16 +19,18 @@ def _check_torch_installed():
         raise RuntimeError(msg)
 
     if not torch.version.cuda:
-        raise RuntimeError("Detected CPU-only PyTorch. Install CUDA-enabled torch/vision/audio before installing this package.")
+        raise RuntimeError(
+            "Detected CPU-only PyTorch. Install CUDA-enabled torch/vision/audio before installing this package."
+        )
 
 
 def get_cuda_constraint():
-    cuda_version = os.environ.get("STREAMDIFFUSION_CUDA_VERSION") or \
-                    os.environ.get("CUDA_VERSION")
+    cuda_version = os.environ.get("STREAMDIFFUSION_CUDA_VERSION") or os.environ.get("CUDA_VERSION")
 
     if not cuda_version:
         try:
             import torch
+
             cuda_version = torch.version.cuda
         except Exception:
             # might not be available during wheel build, so we have to ignore
@@ -56,10 +58,9 @@ _deps = [
     "Pillow>=12.1.1",  # CVE-2026-25990: out-of-bounds write in PSD loading
     "fire==0.7.1",
     "omegaconf==2.3.0",
-    "onnx==1.18.0",  # onnx-graphsurgeon 0.5.8 requires onnx.helper.float32_to_bfloat16 (removed in onnx 1.19+)
-    "onnxruntime==1.24.3",
-    "onnxruntime-gpu==1.24.3",
-    "polygraphy==0.49.26",
+    "onnx==1.17.0",  # IR 10 — onnxruntime-gpu 1.22 max IR 10; float32_to_bfloat16 present (removed in 1.19+)
+    "onnxruntime-gpu==1.22.0",  # TRT EP; never co-install CPU onnxruntime — shared files conflict
+    "polygraphy==0.49.24",
     "protobuf>=4.25.8,<5",  # mediapipe 0.10.21 requires protobuf 4.x; 4.25.8 fixes CVE-2025-4565; CVE-2026-0994 (JSON DoS) accepted risk for local pipeline
     "colored==2.3.1",
     "pywin32==311;sys_platform == 'win32'",
@@ -82,7 +83,9 @@ def deps_list(*pkgs):
 extras = {}
 extras["xformers"] = deps_list("xformers")
 extras["torch"] = deps_list("torch", "accelerate")
-extras["tensorrt"] = deps_list("protobuf", "cuda-python", "onnx", "onnxruntime", "onnxruntime-gpu", "colored", "polygraphy", "onnx-graphsurgeon")
+extras["tensorrt"] = deps_list(
+    "protobuf", "cuda-python", "onnx", "onnxruntime-gpu", "colored", "polygraphy", "onnx-graphsurgeon"
+)
 extras["controlnet"] = deps_list("onnx-graphsurgeon", "controlnet-aux")
 extras["ipadapter"] = deps_list("diffusers-ipadapter", "mediapipe", "insightface")
 
