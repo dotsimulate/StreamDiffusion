@@ -187,6 +187,31 @@ def quantize_onnx_fp8(
 
     _onnx.ModelProto.ByteSize = _safe_byte_size
 
+    # Ensure NVIDIA DLLs (cuDNN, cuBLAS, CUDA runtime) are on PATH so modelopt's
+    # ORT sessions can use CUDA/TensorRT EPs instead of CPU EP (which is stricter
+    # about mixed-precision Cast nodes and fails on FP16 models).
+    _nvidia_pkg_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))), os.pardir, "venv", "Lib",
+        "site-packages", "nvidia")
+    _nvidia_pkg_dir = os.path.normpath(_nvidia_pkg_dir)
+    if not os.path.isdir(_nvidia_pkg_dir):
+        # Fallback: find via importlib
+        try:
+            import nvidia.cudnn
+            _nvidia_pkg_dir = os.path.dirname(os.path.dirname(nvidia.cudnn.__file__))
+        except ImportError:
+            _nvidia_pkg_dir = None
+
+    if _nvidia_pkg_dir and os.path.isdir(_nvidia_pkg_dir):
+        _bin_dirs = []
+        for _subpkg in ("cudnn", "cublas", "cuda_runtime", "cufft", "curand"):
+            _bdir = os.path.join(_nvidia_pkg_dir, _subpkg, "bin")
+            if os.path.isdir(_bdir) and _bdir not in os.environ.get("PATH", ""):
+                _bin_dirs.append(_bdir)
+        if _bin_dirs:
+            os.environ["PATH"] = os.pathsep.join(_bin_dirs) + os.pathsep + os.environ.get("PATH", "")
+            logger.info(f"[FP8] Added {len(_bin_dirs)} NVIDIA DLL dirs to PATH")
+
     # modelopt expects {name: ndarray} with calibration samples stacked along axis 0,
     # not a list of dicts. Merge: [(name: shape)...] → {name: (N, *shape)}
     if isinstance(calibration_data, list) and calibration_data:
@@ -213,10 +238,23 @@ def quantize_onnx_fp8(
     except TypeError as e:
         # Older nvidia-modelopt versions may not support alpha / quantize_mha.
         # Retry with base parameters only.
-        logger.warning(f"[FP8] Retrying without alpha/quantize_mha (API error: {e})")
+        logger.warning(f"[FP8] Retrying without alpha/quantize_mha (TypeError: {e})")
         quantize_kwargs.pop("alpha", None)
         quantize_kwargs.pop("quantize_mha", None)
         modelopt_quantize(onnx_opt_path, **quantize_kwargs)
+    except Exception as e:
+        # quantize_mha=True requires ORT CUDA/TRT EP to analyze MHA patterns.
+        # If CUDA EP is unavailable (e.g. cuDNN not on PATH), ORT falls back to CPU
+        # EP which is stricter about fp32/fp16 Cast type mismatches in the FP16 graph.
+        # Retry with quantize_mha disabled so the MHA analysis path is skipped.
+        if quantize_kwargs.pop("quantize_mha", None):
+            logger.warning(
+                f"[FP8] quantize_mha=True failed ({type(e).__name__}: {e}). "
+                "Retrying with quantize_mha disabled (MHA layers will use default precision)."
+            )
+            modelopt_quantize(onnx_opt_path, **quantize_kwargs)
+        else:
+            raise
     finally:
         _onnx.ModelProto.ByteSize = _orig_byte_size  # Restore original method
 
