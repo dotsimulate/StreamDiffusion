@@ -58,8 +58,8 @@ _deps = [
     "Pillow>=12.1.1",  # CVE-2026-25990: out-of-bounds write in PSD loading
     "fire==0.7.1",
     "omegaconf==2.3.0",
-    "onnx==1.17.0",  # IR 10 — onnxruntime-gpu 1.22 max IR 10; float32_to_bfloat16 present (removed in 1.19+)
-    "onnxruntime-gpu==1.22.0",  # TRT EP; never co-install CPU onnxruntime — shared files conflict
+    "onnx==1.18.0",  # IR 11 — modelopt needs FLOAT4E2M1 (added in 1.18); float32_to_bfloat16 present (removed in 1.19+)
+    "onnxruntime-gpu==1.24.3",  # TRT EP, supports IR 11; never co-install CPU onnxruntime — shared files conflict
     "polygraphy==0.49.24",
     "protobuf>=4.25.8,<5",  # mediapipe 0.10.21 requires protobuf 4.x; 4.25.8 fixes CVE-2025-4565; CVE-2026-0994 (JSON DoS) accepted risk for local pipeline
     "colored==2.3.1",
