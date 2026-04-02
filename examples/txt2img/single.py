@@ -1,6 +1,6 @@
 import os
 import sys
-from typing import Literal, Dict, Optional
+from typing import Dict, Literal, Optional
 
 import fire
 
@@ -8,6 +8,7 @@ import fire
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from streamdiffusion import StreamDiffusionWrapper
+
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -23,7 +24,6 @@ def main(
     use_denoising_batch: bool = False,
     seed: int = 2,
 ):
-
     """
     Process for generating images based on a prompt using a specified model.
 

@@ -1,0 +1,70 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - "**/*.py"
+      - "**/*.cu"
+      - "**/*.cuh"
+      - "setup.py"
+      - "pyproject.toml"
+      - "Dockerfile"
+      - ".github/workflows/**"
+
+# Prevent multiple runs on rapid PR updates
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        id: claude-review
+        continue-on-error: true  # Don't fail PR status if Claude has issues
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_bots: "*"
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Please review this pull request for a real-time diffusion inference pipeline
+            (StreamDiffusion Livepeer fork) with CUDA/TensorRT acceleration and TouchDesigner integration.
+
+            Focus on:
+            - Correctness and potential bugs
+            - CUDA memory management and error handling (check for missing cudaError_t checks)
+            - TensorRT engine compatibility and version handling
+            - Performance considerations for real-time inference
+            - Python code quality and style (ruff, line-length 119)
+            - Security concerns
+            - Backward compatibility with existing TouchDesigner integrations
+
+            Note: CLAUDE.md is available locally for project-specific guidance.
+            Be constructive and specific in your feedback.
+
+            Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
+
+          claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
+
+      - name: Comment on failure
+        if: failure()
+        run: gh pr comment ${{ github.event.pull_request.number }} --body "Claude Code review encountered an error. Check the Actions log for details."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

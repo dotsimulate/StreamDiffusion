@@ -1,10 +1,12 @@
-from typing import Dict, Union
-from uuid import UUID
 import asyncio
-from fastapi import WebSocket
-from starlette.websockets import WebSocketState
 import logging
 from types import SimpleNamespace
+from typing import Dict, Union
+from uuid import UUID
+
+from fastapi import WebSocket
+from starlette.websockets import WebSocketState
+
 
 Connections = Dict[UUID, Dict[str, Union[WebSocket, asyncio.Queue]]]
 
@@ -20,9 +22,7 @@ class ConnectionManager:
         self.active_connections: Connections = {}
         self.latest_data: Dict[UUID, SimpleNamespace] = {}  # Store latest parameters for HTTP streaming
 
-    async def connect(
-        self, user_id: UUID, websocket: WebSocket, max_queue_size: int = 0
-    ):
+    async def connect(self, user_id: UUID, websocket: WebSocket, max_queue_size: int = 0):
         await websocket.accept()
         user_count = self.get_user_count()
         print(f"User count: {user_count}")
@@ -61,7 +61,7 @@ class ConnectionManager:
                 return await queue.get()
             except asyncio.QueueEmpty:
                 return None
-                
+
     def get_latest_data_sync(self, user_id: UUID) -> SimpleNamespace:
         """Get the latest data without consuming it from the queue (for HTTP streaming)"""
         return self.latest_data.get(user_id)

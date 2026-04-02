@@ -1,0 +1,45 @@
+# Line endings
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Merge strategies
+*.py merge=diff3
+*.json merge=diff3
+*.yaml merge=diff3
+*.yml merge=diff3
+*.toml merge=diff3
+*.md merge=diff3
+CHANGELOG.md merge=union
+
+# Binary files (ML models, images, compiled artifacts)
+*.onnx binary
+*.engine binary
+*.trt binary
+*.pth binary
+*.pt binary
+*.safetensors binary
+*.pkl binary
+*.pb binary
+*.h5 binary
+
+# Images
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+
+# Archives
+*.zip binary
+*.tar binary
+*.gz binary
+*.whl binary

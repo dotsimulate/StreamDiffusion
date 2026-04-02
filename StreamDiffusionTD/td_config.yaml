@@ -1,0 +1,77 @@
+
+model_id: "stabilityai/sdxl-turbo"
+
+# Core StreamDiffusion parameters
+t_index_list: [9, 32]
+width: 512
+height: 512
+device: "cuda"
+dtype: "float16"
+
+# Generation parameters (defaults, can be updated via OSC)
+guidance_scale: 1.0
+num_inference_steps: 50
+seed: 3972332
+delta: 1.0
+
+# Prompt configuration (supports both single and blending)
+prompt: "default fancy banana"
+negative_prompt: "only work with cfg = full"
+
+# Optimization settings
+mode: "img2img"  # Always use img2img engines (mode switching handled at runtime)
+frame_buffer_size: 1
+use_denoising_batch: true
+use_tiny_vae: true
+acceleration: "tensorrt"
+fp8: true
+cfg_type: "self"
+do_add_noise: true
+warmup: 10
+use_safety_checker: false
+skip_diffusion: false
+compile_engines_only: false
+build_engines_if_missing: true
+
+# Scheduler and sampler (TCD/StreamV2V support)
+scheduler: "lcm"
+sampler: "normal"
+
+# StreamV2V Cached Attention (Cattenable enables, Cattmaxframes/Cattinterval tune)
+use_cached_attn: true
+cache_maxframes: 3
+cache_interval: 1
+
+# Image filtering (similar frame skip)
+enable_similar_image_filter: true
+similar_image_filter_threshold: 0.9
+similar_image_filter_max_skip_frame: 0
+
+# HuggingFace cache directory (for model downloads)
+hf_cache: ""
+
+# TensorRT engine directory
+engine_dir: "D:/Users/alexk/FORKNI/STREAM_DIFFUSION/STREAM_DIFFUSION_LIVEPEER/StreamDiffusion/engines/td"
+
+# ControlNet configuration (disabled)
+use_controlnet: false
+
+# IPAdapter configuration (disabled)
+use_ipadapter: false
+
+
+
+
+
+# TouchDesigner specific settings
+td_settings:
+  # OSC communication
+  osc_receive_port: 8569
+  osc_transmit_port: 8578
+  
+  # Memory interface
+  input_mem_name: "StreamDiffusionTD_512-512"
+  output_mem_name: "StreamDiffusionTD_512-512_out"
+  
+  # Debug settings
+  debug_mode: true

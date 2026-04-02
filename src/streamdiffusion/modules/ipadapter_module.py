@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Any
 from enum import Enum
+from typing import Any, Dict, Optional, Tuple
+
 import torch
 
-from streamdiffusion.hooks import EmbedsCtx, EmbeddingHook, StepCtx, UnetKwargsDelta, UnetHook
-import os
+from streamdiffusion.hooks import EmbeddingHook, EmbedsCtx, StepCtx, UnetHook, UnetKwargsDelta
 from streamdiffusion.preprocessing.orchestrator_user import OrchestratorUser
-import logging
 from streamdiffusion.utils.reporting import report_error
+
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,7 @@ class IPAdapterConfig:
     This module focuses only on embedding composition (step 2 of migration).
     Runtime installation and wrapper wiring will come in later steps.
     """
+
     style_image_key: Optional[str] = None
     num_image_tokens: int = 4  # e.g., 4 for standard, 16 for plus
     ipadapter_model_path: Optional[str] = None
@@ -59,7 +62,7 @@ IPADAPTER_MODEL_MAP: Dict[tuple, Optional[Dict[str, str]]] = {
         "image_encoder_path": "h94/IP-Adapter/models/image_encoder",
     },
     ("SD2.1", IPAdapterType.REGULAR): None,  # not available from h94 (ip-adapter_sd21.bin was never released)
-    ("SD2.1", IPAdapterType.PLUS): None,    # not available from h94
+    ("SD2.1", IPAdapterType.PLUS): None,  # not available from h94
     ("SD2.1", IPAdapterType.FACEID): None,  # not available from h94
     ("SDXL", IPAdapterType.REGULAR): {
         "model_path": "h94/IP-Adapter/sdxl_models/ip-adapter_sdxl.bin",
@@ -78,15 +81,15 @@ IPADAPTER_MODEL_MAP: Dict[tuple, Optional[Dict[str, str]]] = {
 # Set of all known HF model paths — used to distinguish known vs custom paths.
 # Custom/local paths are never overridden.
 _KNOWN_IPADAPTER_PATHS: frozenset = frozenset(
-    entry["model_path"]
-    for entry in IPADAPTER_MODEL_MAP.values()
-    if entry is not None
+    entry["model_path"] for entry in IPADAPTER_MODEL_MAP.values() if entry is not None
 )
 
-_KNOWN_ENCODER_PATHS: frozenset = frozenset({
-    "h94/IP-Adapter/models/image_encoder",
-    "h94/IP-Adapter/sdxl_models/image_encoder",
-})
+_KNOWN_ENCODER_PATHS: frozenset = frozenset(
+    {
+        "h94/IP-Adapter/models/image_encoder",
+        "h94/IP-Adapter/sdxl_models/image_encoder",
+    }
+)
 
 
 def _normalize_model_type(detected_model_type: str, is_sdxl: bool) -> Optional[str]:
@@ -183,10 +186,7 @@ def resolve_ipadapter_paths(
 
     # Resolve encoder path (only if it's a known HF encoder — custom encoders untouched)
     if current_encoder_path in _KNOWN_ENCODER_PATHS and current_encoder_path != correct_encoder_path:
-        logger.info(
-            f"IP-Adapter: resolving image encoder "
-            f"'{current_encoder_path}' → '{correct_encoder_path}'."
-        )
+        logger.info(f"IP-Adapter: resolving image encoder '{current_encoder_path}' → '{correct_encoder_path}'.")
         cfg["image_encoder_path"] = correct_encoder_path
 
     return cfg
@@ -209,7 +209,9 @@ class IPAdapterModule(OrchestratorUser):
 
         def _embedding_hook(ctx: EmbedsCtx) -> EmbedsCtx:
             # Fetch cached image token embeddings (prompt, negative)
-            cached: Optional[Tuple[torch.Tensor, torch.Tensor]] = stream._param_updater.get_cached_embeddings(style_key)
+            cached: Optional[Tuple[torch.Tensor, torch.Tensor]] = stream._param_updater.get_cached_embeddings(
+                style_key
+            )
             image_prompt_tokens: Optional[torch.Tensor] = None
             image_negative_tokens: Optional[torch.Tensor] = None
             if cached is not None:
@@ -220,7 +222,9 @@ class IPAdapterModule(OrchestratorUser):
             batch_size = ctx.prompt_embeds.shape[0]
             if image_prompt_tokens is None:
                 image_prompt_tokens = torch.zeros(
-                    (batch_size, num_tokens, hidden_dim), dtype=ctx.prompt_embeds.dtype, device=ctx.prompt_embeds.device
+                    (batch_size, num_tokens, hidden_dim),
+                    dtype=ctx.prompt_embeds.dtype,
+                    device=ctx.prompt_embeds.device,
                 )
             else:
                 if image_prompt_tokens.shape[1] != num_tokens:
@@ -242,7 +246,9 @@ class IPAdapterModule(OrchestratorUser):
             if neg_with_image is not None:
                 if image_negative_tokens is None:
                     image_negative_tokens = torch.zeros(
-                        (neg_with_image.shape[0], num_tokens, hidden_dim), dtype=neg_with_image.dtype, device=neg_with_image.device
+                        (neg_with_image.shape[0], num_tokens, hidden_dim),
+                        dtype=neg_with_image.dtype,
+                        device=neg_with_image.device,
                     )
                 else:
                     if image_negative_tokens.shape[0] != neg_with_image.shape[0]:
@@ -291,14 +297,14 @@ class IPAdapterModule(OrchestratorUser):
 
         # Create IP-Adapter and install processors into UNet (FaceID-aware)
         ip_kwargs = {
-            'pipe': stream.pipe,
-            'ipadapter_ckpt_path': resolved_ip_path,
-            'image_encoder_path': resolved_encoder_path,
-            'device': stream.device,
-            'dtype': stream.dtype,
+            "pipe": stream.pipe,
+            "ipadapter_ckpt_path": resolved_ip_path,
+            "image_encoder_path": resolved_encoder_path,
+            "device": stream.device,
+            "dtype": stream.dtype,
         }
         if self.config.type == IPAdapterType.FACEID and self.config.insightface_model_name:
-            ip_kwargs['insightface_model_name'] = self.config.insightface_model_name
+            ip_kwargs["insightface_model_name"] = self.config.insightface_model_name
             print(
                 f"IPAdapterModule.install: Initializing FaceID IP-Adapter with InsightFace model: {self.config.insightface_model_name}"
             )
@@ -311,6 +317,7 @@ class IPAdapterModule(OrchestratorUser):
         # AttnProcessor2_0 which accepts kvo_cache and returns (hidden_states, kvo_cache).
         try:
             from diffusers.models.attention_processor import AttnProcessor2_0 as NativeAttnProcessor2_0
+
             attn_procs = stream.pipe.unet.attn_processors
             for name in attn_procs:
                 if name.endswith("attn1.processor"):
@@ -324,6 +331,7 @@ class IPAdapterModule(OrchestratorUser):
         if self.config.type == IPAdapterType.FACEID:
             try:
                 from streamdiffusion.preprocessing.processors.faceid_embedding import FaceIDEmbeddingPreprocessor
+
                 embedding_preprocessor = FaceIDEmbeddingPreprocessor(
                     ipadapter=ipadapter,
                     device=stream.device,
@@ -357,11 +365,11 @@ class IPAdapterModule(OrchestratorUser):
 
         # Expose IPAdapter instance as single source of truth
         try:
-            setattr(stream, 'ipadapter', ipadapter)
+            setattr(stream, "ipadapter", ipadapter)
             # Extend IPAdapter with our custom attributes since diffusers IPAdapter doesn't expose current state
-            setattr(ipadapter, 'weight_type', self.config.weight_type)  # For build_layer_weights
-            setattr(ipadapter, 'scale', float(self.config.scale))       # Track current scale
-            setattr(ipadapter, 'enabled', bool(self.config.enabled))    # Track enabled state
+            setattr(ipadapter, "weight_type", self.config.weight_type)  # For build_layer_weights
+            setattr(ipadapter, "scale", float(self.config.scale))  # Track current scale
+            setattr(ipadapter, "enabled", bool(self.config.enabled))  # Track enabled state
         except Exception:
             pass
 
@@ -389,7 +397,10 @@ class IPAdapterModule(OrchestratorUser):
             from huggingface_hub import hf_hub_download, snapshot_download
         except Exception as e:
             import logging
-            logging.getLogger(__name__).error(f"IPAdapterModule: huggingface_hub required to resolve '{model_path}': {e}")
+
+            logging.getLogger(__name__).error(
+                f"IPAdapterModule: huggingface_hub required to resolve '{model_path}': {e}"
+            )
             raise
 
         parts = model_path.split("/")
@@ -419,28 +430,28 @@ class IPAdapterModule(OrchestratorUser):
         - For PyTorch UNet with installed IP processors, modulate per-layer processor scale by time factor
         """
         _last_enabled_state = None  # Track previous enabled state to avoid redundant updates
-        
+
         def _unet_hook(ctx: StepCtx) -> UnetKwargsDelta:
             # If no IP-Adapter installed, do nothing
-            if not hasattr(stream, 'ipadapter') or stream.ipadapter is None:
+            if not hasattr(stream, "ipadapter") or stream.ipadapter is None:
                 return UnetKwargsDelta()
 
             # Check if IPAdapter is enabled
-            enabled = getattr(stream.ipadapter, 'enabled', True)
+            enabled = getattr(stream.ipadapter, "enabled", True)
 
             # Read base weight and weight type from IPAdapter instance
             try:
-                base_weight = float(getattr(stream.ipadapter, 'scale', 1.0)) if enabled else 0.0
+                base_weight = float(getattr(stream.ipadapter, "scale", 1.0)) if enabled else 0.0
             except Exception:
                 base_weight = 0.0 if not enabled else 1.0
-            weight_type = getattr(stream.ipadapter, 'weight_type', None)
+            weight_type = getattr(stream.ipadapter, "weight_type", None)
 
             # Determine total steps and current step index for time scheduling
             total_steps = None
             try:
-                if hasattr(stream, 'denoising_steps_num') and isinstance(stream.denoising_steps_num, int):
+                if hasattr(stream, "denoising_steps_num") and isinstance(stream.denoising_steps_num, int):
                     total_steps = int(stream.denoising_steps_num)
-                elif hasattr(stream, 't_list') and stream.t_list is not None:
+                elif hasattr(stream, "t_list") and stream.t_list is not None:
                     total_steps = len(stream.t_list)
             except Exception:
                 total_steps = None
@@ -449,6 +460,7 @@ class IPAdapterModule(OrchestratorUser):
             if total_steps is not None and ctx.step_index is not None:
                 try:
                     from diffusers_ipadapter.ip_adapter.attention_processor import build_time_weight_factor
+
                     time_factor = float(build_time_weight_factor(weight_type, int(ctx.step_index), int(total_steps)))
                 except Exception:
                     # Do not add fallback mechanisms
@@ -456,18 +468,20 @@ class IPAdapterModule(OrchestratorUser):
 
             # TensorRT engine path: supply ipadapter_scale vector via extra kwargs
             try:
-                is_trt_unet = hasattr(stream, 'unet') and hasattr(stream.unet, 'engine') and hasattr(stream.unet, 'stream')
+                is_trt_unet = (
+                    hasattr(stream, "unet") and hasattr(stream.unet, "engine") and hasattr(stream.unet, "stream")
+                )
             except Exception:
                 is_trt_unet = False
 
-            if is_trt_unet and getattr(stream.unet, 'use_ipadapter', False):
+            if is_trt_unet and getattr(stream.unet, "use_ipadapter", False):
                 try:
                     from diffusers_ipadapter.ip_adapter.attention_processor import build_layer_weights
                 except Exception:
                     # If helper unavailable, do not construct weights here
                     build_layer_weights = None  # type: ignore
 
-                num_ip_layers = getattr(stream.unet, 'num_ip_layers', None)
+                num_ip_layers = getattr(stream.unet, "num_ip_layers", None)
                 if isinstance(num_ip_layers, int) and num_ip_layers > 0:
                     weights_tensor = None
                     try:
@@ -476,24 +490,26 @@ class IPAdapterModule(OrchestratorUser):
                     except Exception:
                         weights_tensor = None
                     if weights_tensor is None:
-                        weights_tensor = torch.full((num_ip_layers,), float(base_weight), dtype=torch.float32, device=stream.device)
+                        weights_tensor = torch.full(
+                            (num_ip_layers,), float(base_weight), dtype=torch.float32, device=stream.device
+                        )
                     # Apply per-step time factor
                     try:
                         weights_tensor = weights_tensor * float(time_factor)
                     except Exception:
                         pass
-                    return UnetKwargsDelta(extra_unet_kwargs={'ipadapter_scale': weights_tensor})
+                    return UnetKwargsDelta(extra_unet_kwargs={"ipadapter_scale": weights_tensor})
 
             # PyTorch UNet path: modulate installed processor scales by time factor and enabled state
             try:
                 nonlocal _last_enabled_state
                 # Only process if we need to make changes (time scaling or state transition)
-                needs_update = (time_factor != 1.0 or enabled != _last_enabled_state)
-                if needs_update and hasattr(stream.pipe, 'unet') and hasattr(stream.pipe.unet, 'attn_processors'):
+                needs_update = time_factor != 1.0 or enabled != _last_enabled_state
+                if needs_update and hasattr(stream.pipe, "unet") and hasattr(stream.pipe.unet, "attn_processors"):
                     _last_enabled_state = enabled
                     for proc in stream.pipe.unet.attn_processors.values():
-                        if hasattr(proc, 'scale') and hasattr(proc, '_ip_layer_index'):
-                            base_val = getattr(proc, '_base_scale', proc.scale)
+                        if hasattr(proc, "scale") and hasattr(proc, "_ip_layer_index"):
+                            base_val = getattr(proc, "_base_scale", proc.scale)
                             # Apply both enabled state and time factor
                             final_scale = float(base_val) * float(time_factor) if enabled else 0.0
                             proc.scale = final_scale
@@ -503,4 +519,3 @@ class IPAdapterModule(OrchestratorUser):
             return UnetKwargsDelta()
 
         return _unet_hook
-

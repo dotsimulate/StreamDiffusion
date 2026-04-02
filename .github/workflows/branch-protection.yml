@@ -1,0 +1,88 @@
+name: Branch Protection
+
+on:
+  push:
+    branches: [development, main]
+  pull_request:
+    branches: [development, main]
+
+jobs:
+  validate:
+    name: Validate Branch State
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for local-only files
+        run: |
+          echo "Checking for accidentally committed local files..."
+
+          FOUND_ISSUES=0
+
+          for file in CLAUDE.md MEMORY.md; do
+            if git ls-files | grep -q "^$file$"; then
+              echo "ERROR: $file is tracked in git (should be local-only)"
+              FOUND_ISSUES=1
+            fi
+          done
+
+          # Check for .claude/ directory
+          if git ls-files | grep -q "^\.claude/"; then
+            echo "ERROR: .claude/ directory is tracked in git (should be local-only)"
+            FOUND_ISSUES=1
+          fi
+
+          if [ $FOUND_ISSUES -eq 0 ]; then
+            echo "No local-only files detected"
+          else
+            echo ""
+            echo "Fix: Remove these files from git tracking with: git rm --cached <file>"
+            exit 1
+          fi
+
+  lint:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run ruff check (linting + import sorting)
+        run: ruff check .
+        continue-on-error: true  # Non-blocking: codebase has not been fully lint-cleaned
+
+      - name: Check formatting (ruff format)
+        run: ruff format --check .
+        continue-on-error: true  # Non-blocking: apply formatting incrementally
+
+  # Test job placeholder - uncomment when CPU-compatible tests exist
+  # test:
+  #   name: Run Tests (CPU only)
+  #   runs-on: ubuntu-latest
+  #   needs: validate
+  #   if: github.ref == 'refs/heads/development'
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: '3.10'
+  #     - name: Install CPU-only PyTorch + package
+  #       run: |
+  #         pip install torch --index-url https://download.pytorch.org/whl/cpu
+  #         pip install -e ".[test]"
+  #     - name: Run CPU tests
+  #       run: pytest tests/ -v --ignore=tests/gpu/ --ignore=tests/tensorrt/

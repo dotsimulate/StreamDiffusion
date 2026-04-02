@@ -1,7 +1,7 @@
 import io
 import os
 import sys
-from typing import List, Literal, Optional, Dict
+from typing import Dict, List, Literal, Optional
 
 import fire
 import PIL.Image
@@ -101,9 +101,7 @@ def run(
         delta=0.5,
     )
 
-    downloaded_image = download_image("https://github.com/ddpn08.png").resize(
-        (width, height)
-    )
+    downloaded_image = download_image("https://github.com/ddpn08.png").resize((width, height))
 
     # warmup
     for _ in range(warmup):

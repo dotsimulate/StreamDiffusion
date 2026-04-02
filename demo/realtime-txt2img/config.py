@@ -1,8 +1,9 @@
+import os
 from dataclasses import dataclass, field
 from typing import List, Literal
 
 import torch
-import os
+
 
 SAFETY_CHECKER = os.environ.get("SAFETY_CHECKER", "False") == "True"
 

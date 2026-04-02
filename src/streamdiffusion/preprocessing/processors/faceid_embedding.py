@@ -1,8 +1,11 @@
-from typing import Tuple, Any
+from typing import Any, Tuple
+
 import torch
 from PIL import Image
-from .ipadapter_embedding import IPAdapterEmbeddingPreprocessor
+
 from streamdiffusion.utils.reporting import report_error
+
+from .ipadapter_embedding import IPAdapterEmbeddingPreprocessor
 
 
 class FaceIDEmbeddingPreprocessor(IPAdapterEmbeddingPreprocessor):
@@ -45,9 +48,7 @@ class FaceIDEmbeddingPreprocessor(IPAdapterEmbeddingPreprocessor):
         self.faceid_v2_weight = float(faceid_v2_weight)
 
         if not hasattr(ipadapter, "insightface_model") or ipadapter.insightface_model is None:
-            raise ValueError(
-                "FaceIDEmbeddingPreprocessor: ipadapter must have an initialized InsightFace model"
-            )
+            raise ValueError("FaceIDEmbeddingPreprocessor: ipadapter must have an initialized InsightFace model")
 
     def _process_core(self, image: Image.Image) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -78,8 +79,4 @@ class FaceIDEmbeddingPreprocessor(IPAdapterEmbeddingPreprocessor):
 
     def update_faceid_v2_weight(self, weight: float) -> None:
         self.faceid_v2_weight = float(weight)
-        print(
-            f"FaceIDEmbeddingPreprocessor.update_faceid_v2_weight: Updated weight to {self.faceid_v2_weight}"
-        )
-
-
+        print(f"FaceIDEmbeddingPreprocessor.update_faceid_v2_weight: Updated weight to {self.faceid_v2_weight}")

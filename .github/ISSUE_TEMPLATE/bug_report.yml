@@ -1,0 +1,114 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: ["bug", "status/needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the form below.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of the bug.
+      placeholder: What happened? What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Steps to reproduce the behavior.
+      placeholder: |
+        1. Load model '...'
+        2. Set parameters '...'
+        3. Run inference '...'
+        4. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Error Output
+      description: Paste the full error output or traceback.
+      render: shell
+
+  - type: markdown
+    attributes:
+      value: "## Environment"
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU Model
+      placeholder: e.g. NVIDIA RTX 3090, A100 80GB
+    validations:
+      required: true
+
+  - type: input
+    id: cuda
+    attributes:
+      label: CUDA Version
+      placeholder: e.g. 11.8
+    validations:
+      required: true
+
+  - type: input
+    id: driver
+    attributes:
+      label: NVIDIA Driver Version
+      placeholder: e.g. 525.85.12
+    validations:
+      required: true
+
+  - type: input
+    id: tensorrt
+    attributes:
+      label: TensorRT Version (if applicable)
+      placeholder: e.g. 8.6.1
+
+  - type: input
+    id: python
+    attributes:
+      label: Python Version
+      placeholder: e.g. 3.10.12
+    validations:
+      required: true
+
+  - type: input
+    id: torch
+    attributes:
+      label: PyTorch Version
+      placeholder: e.g. 2.0.1+cu118
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Ubuntu 22.04
+        - Ubuntu 20.04
+        - Windows 11
+        - Windows 10
+        - macOS (MPS)
+        - Other Linux
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: branch
+    attributes:
+      label: Branch / Commit
+      placeholder: e.g. SDTD_031_stable, main, commit hash
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Any other context, config files, or screenshots.

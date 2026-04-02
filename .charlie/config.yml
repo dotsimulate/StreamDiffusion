@@ -1,0 +1,9 @@
+checkCommands:
+  fix: ruff check --fix . && ruff format .
+  lint: pip install ruff && ruff check .
+  # Type checking not yet configured - add when ready:
+  # types: pip install pyrefly && pyrefly check
+  # Tests not yet available - add when CPU-compatible tests exist:
+  # test: pip install pytest && pytest tests/ -x -q --ignore=tests/gpu/
+beta:
+  canApprovePullRequests: false

@@ -119,10 +119,8 @@ class TouchDesignerManager:
         self.total_frame_count = 0  # Total frames processed (for OSC)
         self.start_time = time.time()
         self.fps_smoothing = 0.9  # For exponential moving average
-        self.current_fps = 0.0          # Output FPS: includes cached/skipped frames
-        self.inference_fps = 0.0        # Inference FPS: only frames that ran GPU inference
-        self.last_frame_output_time = 0.0   # Wall-clock time of last frame output (any frame)
-        self.last_inference_time = 0.0      # Wall-clock time of last real inference frame
+        self.current_fps = 0.0
+        self.last_frame_output_time = 0.0  # Track actual frame output timing
 
         # OSC notification flags
         self._sent_processed_cn_name = False
@@ -529,32 +527,19 @@ class TouchDesignerManager:
                 # Send output frame to TouchDesigner
                 self._send_output_frame(output_image)
 
-                # Output FPS: wall-clock rate of all frames sent to TD (includes cached skips)
+                # Calculate FPS based on actual frame output timing (not loop timing)
                 frame_output_time = time.time()
                 if self.last_frame_output_time > 0:
                     frame_interval = frame_output_time - self.last_frame_output_time
                     instantaneous_fps = (
                         1.0 / frame_interval if frame_interval > 0 else 0.0
                     )
+                    # Smooth the FPS calculation
                     self.current_fps = (
                         self.current_fps * self.fps_smoothing
                         + instantaneous_fps * (1 - self.fps_smoothing)
                     )
                 self.last_frame_output_time = frame_output_time
-
-                # Inference FPS: only frames that actually ran GPU inference (similar filter skips excluded)
-                was_skipped = getattr(self.wrapper.stream, 'last_frame_was_skipped', False)
-                if not was_skipped:
-                    if self.last_inference_time > 0:
-                        inf_interval = frame_output_time - self.last_inference_time
-                        instantaneous_inf_fps = (
-                            1.0 / inf_interval if inf_interval > 0 else 0.0
-                        )
-                        self.inference_fps = (
-                            self.inference_fps * self.fps_smoothing
-                            + instantaneous_inf_fps * (1 - self.fps_smoothing)
-                        )
-                    self.last_inference_time = frame_output_time
 
                 # Update frame counters
                 self.frame_count += 1
@@ -596,18 +581,16 @@ class TouchDesignerManager:
                     uptime_str = f"{uptime_mins:02d}:{uptime_secs:02d}"
 
                     # Clear the line properly and write new status with color
-                    status_line = f"\033[38;5;208mStreaming | FPS: {self.inference_fps:.1f} (out: {self.current_fps:.1f}) | Uptime: {uptime_str}\033[0m"
+                    status_line = f"\033[38;5;208mStreaming | FPS: {self.current_fps:.1f} | Uptime: {uptime_str}\033[0m"
                     print(f"\r{' ' * 80}\r{status_line}", end="", flush=True)
 
                     # Reset counters
                     frame_time_accumulator = 0.0
                     self.frame_count = 0
 
-                # Send FPS EVERY FRAME via reporter — use inference FPS (excludes similar-filter skips)
-                if self.osc_reporter:
-                    reported_fps = self.inference_fps if self.inference_fps > 0 else self.current_fps
-                    if reported_fps > 0:
-                        self.osc_reporter.send_fps(reported_fps)
+                # Send FPS EVERY FRAME via reporter (like main_sdtd.py) - report actual measured FPS
+                if self.osc_reporter and self.current_fps > 0:
+                    self.osc_reporter.send_fps(self.current_fps)
 
                 # Handle frame acknowledgment for pause mode synchronization
                 if self.paused:

@@ -1,0 +1,61 @@
+#!/bin/sh
+# Pre-commit hook to prevent accidental commit of local-only files
+# Prevents commits of CLAUDE.md, MEMORY.md, .claude/ directory
+# Allows DELETIONS (D) but blocks additions (A) or modifications (M)
+
+echo "Checking for local-only files..."
+
+# Check if any local-only files are being ADDED or MODIFIED (not deleted)
+PROBLEMATIC_FILES=$(git diff --cached --name-status | grep -E "^[AM]\s+(CLAUDE\.md|MEMORY\.md|\.claude/)")
+
+if [ -n "$PROBLEMATIC_FILES" ]; then
+    echo "ERROR: Attempting to add or modify local-only files!"
+    echo ""
+    echo "The following files must remain local only:"
+    echo "- CLAUDE.md (development context, project-specific AI instructions)"
+    echo "- MEMORY.md (session memory)"
+    echo "- .claude/ (Claude Code configuration, hooks, skills)"
+    echo ""
+    echo "Problematic files:"
+    echo "$PROBLEMATIC_FILES"
+    echo ""
+    echo "DELETIONS are allowed (removing from git tracking)"
+    echo "ADDITIONS/MODIFICATIONS are blocked (privacy protection)"
+    echo ""
+    echo "To fix this, reset the problematic files:"
+    echo "  git reset HEAD <file>"
+    echo ""
+    exit 1
+fi
+
+# Check for deletions (which are allowed and expected)
+DELETED_FILES=$(git diff --cached --name-status | grep -E "^D\s+(CLAUDE\.md|MEMORY\.md|\.claude/)")
+if [ -n "$DELETED_FILES" ]; then
+    echo "  Local-only files being removed from git tracking (as intended)"
+fi
+
+echo "  No local-only files detected"
+echo "  Privacy protection active"
+
+# Optional: Check code quality for Python files (non-blocking)
+PYTHON_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep '\.py$')
+
+if [ -n "$PYTHON_FILES" ]; then
+    echo ""
+    echo "Checking code quality (non-blocking)..."
+
+    if command -v ruff > /dev/null 2>&1; then
+        if ! ruff check $PYTHON_FILES > /dev/null 2>&1; then
+            echo "  WARNING: ruff found lint issues in staged Python files"
+            echo "  Run 'ruff check --fix .' to auto-fix, or 'ruff check .' to see details"
+            echo "  (Commit will proceed - fix lint issues when ready)"
+        else
+            echo "  Code quality checks passed"
+        fi
+    else
+        echo "  ruff not found - skipping lint check (install: pip install ruff)"
+    fi
+fi
+
+echo ""
+exit 0

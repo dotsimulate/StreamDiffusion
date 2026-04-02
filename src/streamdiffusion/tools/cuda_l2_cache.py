@@ -112,17 +112,11 @@ def _get_cudart() -> Optional[ctypes.CDLL]:
 
     # Option 1: PyTorch ships cudart in torch/lib/
     torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
-    candidates = sorted(
-        glob.glob(os.path.join(torch_lib, "cudart64_*.dll")), reverse=True
-    )
+    candidates = sorted(glob.glob(os.path.join(torch_lib, "cudart64_*.dll")), reverse=True)
 
     # Option 2: CUDA toolkit installation
-    cuda_path = os.environ.get(
-        "CUDA_PATH", r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
-    )
-    candidates += sorted(
-        glob.glob(os.path.join(cuda_path, "bin", "cudart64_*.dll")), reverse=True
-    )
+    cuda_path = os.environ.get("CUDA_PATH", r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8")
+    candidates += sorted(glob.glob(os.path.join(cuda_path, "bin", "cudart64_*.dll")), reverse=True)
 
     for dll_path in candidates:
         try:
@@ -162,9 +156,7 @@ def reserve_l2_persisting_cache(persist_mb: int = L2_PERSIST_MB) -> bool:
     props = torch.cuda.get_device_properties(device)
     major, minor = props.major, props.minor
     if major < 8:
-        print(
-            f"[L2] L2 persistence skipped — compute {major}.{minor} < 8.0 (Ampere required)"
-        )
+        print(f"[L2] L2 persistence skipped — compute {major}.{minor} < 8.0 (Ampere required)")
         return False
 
     l2_total_mb = props.L2_cache_size // (1024 * 1024)
@@ -344,9 +336,7 @@ def pin_hot_unet_weights(
             f"({pinned_bytes / 1024 / 1024:.1f}MB) in L2 persisting cache"
         )
     else:
-        print(
-            "[L2] No tensors pinned (params may require_grad=True before compile — call after freeze)"
-        )
+        print("[L2] No tensors pinned (params may require_grad=True before compile — call after freeze)")
 
     return pinned_count
 
@@ -367,10 +357,7 @@ def setup_l2_persistence(unet: torch.nn.Module) -> bool:
     if not L2_PERSIST_ENABLED:
         return False
 
-    print(
-        f"\n[L2] Setting up L2 cache persistence "
-        f"(SDTD_L2_PERSIST_MB={L2_PERSIST_MB})..."
-    )
+    print(f"\n[L2] Setting up L2 cache persistence (SDTD_L2_PERSIST_MB={L2_PERSIST_MB})...")
 
     # Tier 1 is the reliable baseline — always attempt
     tier1_ok = reserve_l2_persisting_cache(L2_PERSIST_MB)

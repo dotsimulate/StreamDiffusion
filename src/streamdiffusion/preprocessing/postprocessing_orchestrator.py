@@ -73,7 +73,7 @@ class PostprocessingOrchestrator(BaseOrchestrator[torch.Tensor, torch.Tensor]):
         if not processors:
             return False
         for proc in processors:
-            if proc is not None and getattr(proc, 'requires_sync_processing', False):
+            if proc is not None and getattr(proc, "requires_sync_processing", False):
                 return True
         return False
 

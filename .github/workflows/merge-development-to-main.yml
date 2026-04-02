@@ -1,0 +1,111 @@
+name: Merge Development to Main
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_backup:
+        description: 'Create backup tag before merge'
+        required: true
+        type: boolean
+        default: true
+      dry_run:
+        description: 'Dry run (preview only, no actual merge)'
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  merge:
+    name: Merge development → main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update branches from remote
+        run: |
+          git fetch origin development:development
+          git fetch origin main:main
+
+      - name: Create backup tag
+        if: ${{ inputs.create_backup == true && inputs.dry_run == false }}
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          BACKUP_TAG="backup-main-before-merge-$TIMESTAMP"
+
+          git checkout main
+          git tag "$BACKUP_TAG"
+          git push origin "$BACKUP_TAG"
+
+          echo "Backup tag created: $BACKUP_TAG"
+          echo "BACKUP_TAG=$BACKUP_TAG" >> $GITHUB_ENV
+
+      - name: Preview merge (Dry Run)
+        if: ${{ inputs.dry_run == true }}
+        run: |
+          git checkout main
+
+          echo "=== DRY RUN: Files that would change ==="
+          git diff --name-status main development || true
+
+          echo ""
+          echo "=== Commits to be merged ==="
+          git log main..development --oneline
+
+          echo ""
+          echo "=== DRY RUN COMPLETE: No changes made ==="
+
+      - name: Perform merge
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          git checkout main
+
+          echo "Merging development into main..."
+          git merge --no-ff development -m "$(cat <<'EOF'
+          chore: Merge development to main
+
+          - Automated merge via GitHub Actions
+          EOF
+          )"
+
+          if [ $? -ne 0 ]; then
+            echo "ERROR: Merge failed - conflicts detected"
+            git merge --abort
+            exit 1
+          fi
+
+          echo "Merge completed successfully"
+
+      - name: Push to main
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          git push origin main
+          echo "Main branch updated successfully"
+
+      - name: Create merge summary
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          echo "=== MERGE SUMMARY ==="
+          echo "Development to Main merge successful"
+          echo "Method: Git --no-ff merge"
+
+          if [ -n "$BACKUP_TAG" ]; then
+            echo "Backup tag: $BACKUP_TAG"
+            echo ""
+            echo "To rollback: git reset --hard $BACKUP_TAG && git push --force-with-lease origin main"
+          fi
+
+          echo ""
+          echo "Changes merged:"
+          git diff --stat HEAD~1

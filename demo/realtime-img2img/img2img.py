@@ -1,6 +1,7 @@
-import sys
-import os
 import logging
+import os
+import sys
+
 
 sys.path.append(
     os.path.join(
@@ -12,10 +13,11 @@ sys.path.append(
 
 # Config system functions are now used only in main.py
 
+
 import torch
-from pydantic import BaseModel, Field
 from PIL import Image
-from typing import Optional
+from pydantic import BaseModel, Field
+
 
 # Default values for pipeline parameters
 default_negative_prompt = "black and white, blurry, low resolution, pixelated,  pixel art, low quality, low fidelity"
@@ -78,26 +80,22 @@ class Pipeline:
                 "768x512 (3:2)",
                 "896x640 (7:5)",
                 "1024x768 (4:3)",
-                "1024x576 (16:9)"
-            ]
+                "1024x576 (16:9)",
+            ],
         )
-        width: int = Field(
-            512, min=2, max=15, title="Width", disabled=True, hide=True, id="width"
-        )
-        height: int = Field(
-            512, min=2, max=15, title="Height", disabled=True, hide=True, id="height"
-        )
+        width: int = Field(512, min=2, max=15, title="Width", disabled=True, hide=True, id="width")
+        height: int = Field(512, min=2, max=15, title="Height", disabled=True, hide=True, id="height")
 
-#TODO update naming convention to reflect the controlnet agnostic nature of the config system (pipeline_config instead of controlnet_config for example)
+    # TODO update naming convention to reflect the controlnet agnostic nature of the config system (pipeline_config instead of controlnet_config for example)
     def __init__(self, wrapper, config):
         """
         Initialize Pipeline with pre-created wrapper and config.
-        
+
         Args:
             wrapper: Pre-created StreamDiffusionWrapper instance
             config: Configuration dictionary used to create the wrapper
         """
-        
+
         # IPAdapter state tracking for optimization
         self._last_ipadapter_source_type = None
         self._last_ipadapter_source_data = None
@@ -106,16 +104,16 @@ class Pipeline:
         self.stream = wrapper
         self.config = config
         self.use_config = True
-        
+
         # Extract pipeline configuration from config
-        self.pipeline_mode = self.config.get('mode', 'img2img')
-        self.has_controlnet = 'controlnets' in self.config and len(self.config['controlnets']) > 0
-        self.has_ipadapter = 'ipadapters' in self.config and len(self.config['ipadapters']) > 0
-        
+        self.pipeline_mode = self.config.get("mode", "img2img")
+        self.has_controlnet = "controlnets" in self.config and len(self.config["controlnets"]) > 0
+        self.has_ipadapter = "ipadapters" in self.config and len(self.config["ipadapters"]) > 0
+
         # Store config values for later use
-        self.negative_prompt = self.config.get('negative_prompt', default_negative_prompt)
-        self.guidance_scale = self.config.get('guidance_scale', 1.2)
-        self.num_inference_steps = self.config.get('num_inference_steps', 50)
+        self.negative_prompt = self.config.get("negative_prompt", default_negative_prompt)
+        self.guidance_scale = self.config.get("guidance_scale", 1.2)
+        self.num_inference_steps = self.config.get("num_inference_steps", 50)
 
         # Update input_mode based on pipeline mode
         self.info = self.Info()
@@ -129,23 +127,23 @@ class Pipeline:
         self.guidance_scale = 1.1
         self.num_inference_steps = 50
         self.negative_prompt = default_negative_prompt
-        
+
         # Store output type for frame conversion - always force "pt" for optimal performance
         self.output_type = "pt"
 
     def predict(self, params: "Pipeline.InputParams") -> Image.Image:
         # Get input manager if available (passed from websocket handler)
-        input_manager = getattr(params, 'input_manager', None)
-        
+        input_manager = getattr(params, "input_manager", None)
+
         # Handle different modes
         if self.pipeline_mode == "txt2img":
             # Text-to-image mode
-            
+
             # Handle ControlNet updates if enabled
             if self.has_controlnet:
                 try:
                     stream_state = self.stream.get_stream_state()
-                    current_cfg = stream_state.get('controlnet_config', [])
+                    current_cfg = stream_state.get("controlnet_config", [])
                 except Exception:
                     current_cfg = []
                 if current_cfg:
@@ -154,11 +152,11 @@ class Pipeline:
                         control_image = self._get_controlnet_input(input_manager, i, params.image)
                         if control_image is not None:
                             self.stream.update_control_image(index=i, image=control_image)
-            
+
             # Handle IPAdapter updates if enabled
             if self.has_ipadapter:
                 self._update_ipadapter_style_image(input_manager)
-            
+
             # Generate output based on what's enabled
             if self.has_controlnet and not self.has_ipadapter:
                 # ControlNet only: use base input for generation
@@ -176,12 +174,12 @@ class Pipeline:
                 output_image = self.stream()
         else:
             # Image-to-image mode: use original logic
-            
+
             # Handle ControlNet updates if enabled
             if self.has_controlnet:
                 try:
                     stream_state = self.stream.get_stream_state()
-                    current_cfg = stream_state.get('controlnet_config', [])
+                    current_cfg = stream_state.get("controlnet_config", [])
                 except Exception:
                     current_cfg = []
                 if current_cfg:
@@ -190,11 +188,11 @@ class Pipeline:
                         control_image = self._get_controlnet_input(input_manager, i, params.image)
                         if control_image is not None:
                             self.stream.update_control_image(index=i, image=control_image)
-            
+
             # Handle IPAdapter updates if enabled
             if self.has_ipadapter:
                 self._update_ipadapter_style_image(input_manager)
-            
+
             # Generate output based on what's enabled
             if self.has_controlnet or self.has_ipadapter:
                 # ControlNet and/or IPAdapter: use base input for img2img
@@ -216,150 +214,153 @@ class Pipeline:
     def _get_controlnet_input(self, input_manager, index: int, fallback_image):
         """
         Get input image for a specific ControlNet index.
-        
+
         Args:
             input_manager: InputSourceManager instance (can be None)
             index: ControlNet index
             fallback_image: Fallback image if no specific source is configured
-            
+
         Returns:
             Input image for the ControlNet or fallback
         """
         if input_manager:
-            frame = input_manager.get_frame('controlnet', index)
+            frame = input_manager.get_frame("controlnet", index)
             if frame is not None:
                 return frame
-        
+
         # Fallback to main image input
         return fallback_image
-    
+
     def _get_ipadapter_input(self, input_manager):
         """
         Get input image for IPAdapter.
-        
+
         Args:
             input_manager: InputSourceManager instance (can be None)
-            
+
         Returns:
             Input image for IPAdapter or None
         """
         if input_manager:
-            return input_manager.get_frame('ipadapter')
+            return input_manager.get_frame("ipadapter")
         return None
-    
+
     def _update_ipadapter_style_image(self, input_manager):
         """
         Update IPAdapter style image from InputSourceManager.
         Only updates when source actually changes to avoid unnecessary processing.
-        
+
         Args:
             input_manager: InputSourceManager instance (can be None)
         """
         if not input_manager or not self.has_ipadapter:
             return
-            
+
         try:
             # Get current source info to check if it changed
-            source_info = input_manager.get_source_info('ipadapter')
-            current_source_type = source_info.get('source_type')
-            current_source_data = source_info.get('source_data')
-            is_stream = source_info.get('is_stream', False)
-            
+            source_info = input_manager.get_source_info("ipadapter")
+            current_source_type = source_info.get("source_type")
+            current_source_data = source_info.get("source_data")
+            is_stream = source_info.get("is_stream", False)
+
             # Check if source changed (for static images, only update when source changes)
             source_changed = (
-                current_source_type != self._last_ipadapter_source_type or
-                current_source_data != self._last_ipadapter_source_data
+                current_source_type != self._last_ipadapter_source_type
+                or current_source_data != self._last_ipadapter_source_data
             )
-            
+
             # For streaming sources (webcam/video), always get fresh frame
             # For static sources (uploaded image), only update when source changes
             should_update = is_stream or source_changed
-            
+
             if not should_update:
                 return  # No update needed - static source unchanged
-            
+
             # Get IPAdapter style image from input source manager
-            ipadapter_frame = input_manager.get_frame('ipadapter')
-            
+            ipadapter_frame = input_manager.get_frame("ipadapter")
+
             if ipadapter_frame is not None:
                 import torch
-                
+
                 # Use tensor directly - update_style_image expects torch tensor
                 if isinstance(ipadapter_frame, torch.Tensor):
                     try:
                         # Update IPAdapter with tensor and stream configuration
                         self.stream.update_style_image(ipadapter_frame, is_stream=is_stream)
-                        self.stream.update_stream_params(ipadapter_config={'is_stream': is_stream})
-                        
+                        self.stream.update_stream_params(ipadapter_config={"is_stream": is_stream})
+
                         # Force prompt re-encoding to apply new style image embeddings
                         # This is critical because IPAdapter embedding hook only runs during prompt encoding
                         try:
                             state = self.stream.get_stream_state()
-                            current_prompts = state.get('prompt_list', [])
+                            current_prompts = state.get("prompt_list", [])
                             if current_prompts:
                                 self.stream.update_prompt(current_prompts, prompt_interpolation_method="slerp")
                         except Exception as e:
-                            logging.exception(f"_update_ipadapter_style_image: Failed to force prompt re-encoding: {e}")
-                        
-                        
+                            logging.exception(
+                                f"_update_ipadapter_style_image: Failed to force prompt re-encoding: {e}"
+                            )
+
                         # Update tracking variables only on successful update
                         self._last_ipadapter_source_type = current_source_type
                         self._last_ipadapter_source_data = current_source_data
-                        
+
                     except Exception as e:
                         logging.exception(f"_update_ipadapter_style_image: Failed to update IPAdapter: {e}")
                 else:
-                    logging.warning("_update_ipadapter_style_image: IPAdapter frame is not a tensor, skipping style image update")
+                    logging.warning(
+                        "_update_ipadapter_style_image: IPAdapter frame is not a tensor, skipping style image update"
+                    )
         except Exception as e:
             logging.exception(f"_update_ipadapter_style_image: Error updating IPAdapter style image: {e}")
-    
+
     def _get_base_input(self, input_manager, fallback_image):
         """
         Get input image for base pipeline.
-        
+
         Args:
             input_manager: InputSourceManager instance (can be None)
             fallback_image: Fallback image if no specific source is configured
-            
+
         Returns:
             Input image for base pipeline or fallback
         """
         if input_manager:
-            frame = input_manager.get_frame('base')
+            frame = input_manager.get_frame("base")
             if frame is not None:
                 return frame
-        
+
         # Fallback to main image input
         return fallback_image
 
     def update_ipadapter_config(self, scale: float = None, style_image: Image.Image = None) -> bool:
         """
         Update IPAdapter configuration in real-time using direct methods
-        
+
         Args:
             scale: New IPAdapter scale value (optional)
             style_image: New style image (PIL Image, optional)
-            
+
         Returns:
             bool: True if successful, False otherwise
         """
         if not self.has_ipadapter:
             return False
-            
+
         if scale is None and style_image is None:
             return False  # Nothing to update
-            
+
         try:
             # Update scale via unified config system (no direct method needed)
             if scale is not None:
-                self.stream.update_stream_params(ipadapter_config={'scale': scale})
-            
+                self.stream.update_stream_params(ipadapter_config={"scale": scale})
+
             # Update style image via direct method
             if style_image is not None:
                 self.stream.update_style_image(style_image)
-                
+
             return True
-        except Exception as e:
+        except Exception:
             return False
 
     def update_ipadapter_scale(self, scale: float) -> bool:
@@ -374,21 +375,21 @@ class Pipeline:
         """Update IPAdapter weight type in real-time"""
         if not self.has_ipadapter:
             return False
-            
+
         try:
             # Use unified updater on wrapper
-            if hasattr(self.stream, 'update_stream_params'):
-                self.stream.update_stream_params(ipadapter_config={ 'weight_type': weight_type })
+            if hasattr(self.stream, "update_stream_params"):
+                self.stream.update_stream_params(ipadapter_config={"weight_type": weight_type})
                 return True
             # Should not reach here in normal operation
             return False
-        except Exception as e:
+        except Exception:
             return False
 
     def get_ipadapter_info(self) -> dict:
         """
         Get current IPAdapter information
-        
+
         Returns:
             dict: IPAdapter information including scale, model info, etc.
         """
@@ -397,35 +398,37 @@ class Pipeline:
             "scale": 1.0,
             "weight_type": "linear",
             "model_path": None,
-            "style_image_set": False
+            "style_image_set": False,
         }
-        
-        if self.has_ipadapter and self.config and 'ipadapters' in self.config:
+
+        if self.has_ipadapter and self.config and "ipadapters" in self.config:
             # Get info from first IPAdapter config
-            if len(self.config['ipadapters']) > 0:
-                ipadapter_config = self.config['ipadapters'][0]
-                info["scale"] = ipadapter_config.get('scale', 1.0)
-                info["weight_type"] = ipadapter_config.get('weight_type', 'linear')
-                info["model_path"] = ipadapter_config.get('ipadapter_model_path')
-                info["style_image_set"] = 'style_image' in ipadapter_config
-                
+            if len(self.config["ipadapters"]) > 0:
+                ipadapter_config = self.config["ipadapters"][0]
+                info["scale"] = ipadapter_config.get("scale", 1.0)
+                info["weight_type"] = ipadapter_config.get("weight_type", "linear")
+                info["model_path"] = ipadapter_config.get("ipadapter_model_path")
+                info["style_image_set"] = "style_image" in ipadapter_config
+
         # Get current runtime state from wrapper's public API
         try:
-            if hasattr(self.stream, 'get_stream_state'):
+            if hasattr(self.stream, "get_stream_state"):
                 stream_state = self.stream.get_stream_state()
-                ipadapter_runtime_config = stream_state.get('ipadapter_config', {})
+                ipadapter_runtime_config = stream_state.get("ipadapter_config", {})
                 if ipadapter_runtime_config:
-                    info["scale"] = ipadapter_runtime_config.get('scale', info.get("scale", 1.0))
-                    info["weight_type"] = ipadapter_runtime_config.get('weight_type', info.get("weight_type", 'linear'))
+                    info["scale"] = ipadapter_runtime_config.get("scale", info.get("scale", 1.0))
+                    info["weight_type"] = ipadapter_runtime_config.get(
+                        "weight_type", info.get("weight_type", "linear")
+                    )
         except Exception:
             pass  # Use defaults from config if wrapper method fails
-            
+
         return info
 
     def update_stream_params(self, **kwargs):
         """
         Update streaming parameters using the consolidated API
-        
+
         Args:
             **kwargs: All parameters supported by StreamDiffusionWrapper.update_stream_params()
                      including controlnet_config, guidance_scale, delta, etc.

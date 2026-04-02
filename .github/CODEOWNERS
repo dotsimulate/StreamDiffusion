@@ -1,0 +1,14 @@
+# Default owners for all files
+* @forkni
+
+# CUDA/TensorRT specific code
+*.cu @forkni
+*.cuh @forkni
+*tensorrt* @forkni
+*trt* @forkni
+
+# CI/CD workflows
+.github/ @forkni
+
+# Core streaming pipeline
+src/streamdiffusion/ @forkni

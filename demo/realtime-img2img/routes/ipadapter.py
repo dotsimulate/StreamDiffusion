@@ -1,13 +1,21 @@
 """
 IPAdapter-related endpoints for realtime-img2img
 """
-from fastapi import APIRouter, Request, HTTPException, Depends
-from fastapi.responses import JSONResponse, Response
+
 import logging
 import os
 
-from .common.api_utils import handle_api_request, create_success_response, handle_api_error, validate_pipeline, validate_feature_enabled, validate_config_mode
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response
+
+from .common.api_utils import (
+    create_success_response,
+    handle_api_error,
+    handle_api_request,
+    validate_config_mode,
+)
 from .common.dependencies import get_app_instance
+
 
 router = APIRouter(prefix="/api", tags=["ipadapter"])
 
@@ -15,23 +23,27 @@ router = APIRouter(prefix="/api", tags=["ipadapter"])
 
 # Legacy get uploaded image endpoint removed - use InputSourceManager instead
 
+
 @router.get("/default-image")
 async def get_default_image():
     """Get the default image (input.png)"""
     try:
         default_image_path = os.path.join(os.path.dirname(__file__), "..", "..", "..", "images", "inputs", "input.png")
-        
+
         if not os.path.exists(default_image_path):
             raise HTTPException(status_code=404, detail="Default image not found")
-        
+
         # Read and return the default image file
         with open(default_image_path, "rb") as image_file:
             image_content = image_file.read()
-        
-        return Response(content=image_content, media_type="image/png", headers={"Cache-Control": "public, max-age=3600"})
-        
+
+        return Response(
+            content=image_content, media_type="image/png", headers={"Cache-Control": "public, max-age=3600"}
+        )
+
     except Exception as e:
         raise handle_api_error(e, "get_default_image")
+
 
 @router.post("/ipadapter/update-scale")
 async def update_ipadapter_scale(request: Request, app_instance=Depends(get_app_instance)):
@@ -39,22 +51,25 @@ async def update_ipadapter_scale(request: Request, app_instance=Depends(get_app_
     try:
         data = await handle_api_request(request, "update_ipadapter_scale", ["scale"])
         scale = data.get("scale")
-        
+
         # Validate AppState has IPAdapter configuration (pipeline not required)
         if not app_instance.app_state.ipadapter_info["enabled"]:
-            raise HTTPException(status_code=400, detail="IPAdapter is not enabled. Please upload a config with IPAdapter first.")
-        
+            raise HTTPException(
+                status_code=400, detail="IPAdapter is not enabled. Please upload a config with IPAdapter first."
+            )
+
         # Update AppState as single source of truth (works before pipeline creation)
         app_instance.app_state.update_parameter("ipadapter_scale", float(scale))
-        
+
         # Sync to pipeline if active
-        if app_instance.pipeline and hasattr(app_instance.pipeline, 'stream'):
+        if app_instance.pipeline and hasattr(app_instance.pipeline, "stream"):
             app_instance._sync_appstate_to_pipeline()
-        
+
         return create_success_response(f"Updated IPAdapter scale to {scale}")
-        
+
     except Exception as e:
         raise handle_api_error(e, "update_ipadapter_scale")
+
 
 @router.post("/ipadapter/update-weight-type")
 async def update_ipadapter_weight_type(request: Request, app_instance=Depends(get_app_instance)):
@@ -62,22 +77,25 @@ async def update_ipadapter_weight_type(request: Request, app_instance=Depends(ge
     try:
         data = await handle_api_request(request, "update_ipadapter_weight_type", ["weight_type"])
         weight_type = data.get("weight_type")
-        
+
         # Validate AppState has IPAdapter configuration (pipeline not required)
         if not app_instance.app_state.ipadapter_info["enabled"]:
-            raise HTTPException(status_code=400, detail="IPAdapter is not enabled. Please upload a config with IPAdapter first.")
-        
+            raise HTTPException(
+                status_code=400, detail="IPAdapter is not enabled. Please upload a config with IPAdapter first."
+            )
+
         # Update AppState as single source of truth (works before pipeline creation)
         app_instance.app_state.ipadapter_info["weight_type"] = weight_type
-        
+
         # Sync to pipeline if active
-        if app_instance.pipeline and hasattr(app_instance.pipeline, 'stream'):
+        if app_instance.pipeline and hasattr(app_instance.pipeline, "stream"):
             app_instance._sync_appstate_to_pipeline()
-        
+
         return create_success_response(f"Updated IPAdapter weight type to {weight_type}")
-        
+
     except Exception as e:
         raise handle_api_error(e, "update_ipadapter_weight_type")
+
 
 @router.post("/ipadapter/update-enabled")
 async def update_ipadapter_enabled(request: Request, app_instance=Depends(get_app_instance)):
@@ -85,23 +103,20 @@ async def update_ipadapter_enabled(request: Request, app_instance=Depends(get_ap
     try:
         data = await handle_api_request(request, "update_ipadapter_enabled", ["enabled"])
         enabled = data.get("enabled")
-        
+
         # Update AppState as single source of truth (works before pipeline creation)
         app_instance.app_state.ipadapter_info["enabled"] = bool(enabled)
         logging.info(f"update_ipadapter_enabled: Updated AppState ipadapter enabled to {enabled}")
-        
+
         # Sync to pipeline if active
         if app_instance.pipeline:
             validate_config_mode(app_instance.pipeline, "ipadapters")
-            
+
             # Update IPAdapter enabled state in the pipeline
-            app_instance.pipeline.stream.update_stream_params(
-                ipadapter_config={'enabled': bool(enabled)}
-            )
-            logging.info(f"update_ipadapter_enabled: Synced to active pipeline")
-        
+            app_instance.pipeline.stream.update_stream_params(ipadapter_config={"enabled": bool(enabled)})
+            logging.info("update_ipadapter_enabled: Synced to active pipeline")
+
         return create_success_response(f"IPAdapter {'enabled' if enabled else 'disabled'} successfully")
-        
+
     except Exception as e:
         raise handle_api_error(e, "update_ipadapter_enabled")
-

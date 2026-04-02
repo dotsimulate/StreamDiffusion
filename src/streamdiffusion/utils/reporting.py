@@ -25,5 +25,3 @@ def report_error(
         stacklevel=stacklevel,
         extra={"report_error": True},
     )
-
-

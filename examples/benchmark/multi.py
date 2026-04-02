@@ -3,7 +3,7 @@ import os
 import sys
 import time
 from multiprocessing import Process, Queue
-from typing import List, Literal, Optional, Dict
+from typing import Dict, List, Literal, Optional
 
 import fire
 import PIL.Image
@@ -12,6 +12,7 @@ import torch
 from tqdm import tqdm
 
 from streamdiffusion.image_utils import postprocess_image
+
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 

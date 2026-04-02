@@ -1,17 +1,18 @@
+import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Union, Any, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
-import torch
 import numpy as np
+import torch
+from diffusers import AutoencoderTiny, AutoPipelineForText2Image, StableDiffusionPipeline, StableDiffusionXLPipeline
 from PIL import Image
-from diffusers import AutoencoderTiny, StableDiffusionPipeline, StableDiffusionXLPipeline, AutoPipelineForText2Image
 
-from .pipeline import StreamDiffusion
-from .model_detection import detect_model
 from .image_utils import postprocess_image
+from .model_detection import detect_model
+from .pipeline import StreamDiffusion
 
-import logging
+
 logger = logging.getLogger(__name__)
 
 torch.set_grad_enabled(False)
@@ -66,6 +67,7 @@ class StreamDiffusionWrapper:
     - Use get_cache_info() to inspect cache statistics
     - Use clear_caches() to free memory
     """
+
     def __init__(
         self,
         model_id_or_path: str,
@@ -122,6 +124,7 @@ class StreamDiffusionWrapper:
         cache_interval: int = 1,
         min_cache_maxframes: int = 1,
         max_cache_maxframes: int = 4,
+        fp8: bool = False,
     ):
         """
         Initializes the StreamDiffusionWrapper.
@@ -243,7 +246,7 @@ class StreamDiffusionWrapper:
         """
         if compile_engines_only:
             logger.info("compile_engines_only is True, will only compile engines and not load the model")
-        
+
         # Store use_lcm_lora for backwards compatibility processing in _load_model
         self.use_lcm_lora = use_lcm_lora
 
@@ -251,7 +254,7 @@ class StreamDiffusionWrapper:
         self.use_controlnet = use_controlnet
         self.use_ipadapter = use_ipadapter
         self.ipadapter_config = ipadapter_config
-        
+
         # Store pipeline hook configurations
         self.image_preprocessing_config = image_preprocessing_config
         self.image_postprocessing_config = image_postprocessing_config
@@ -260,20 +263,14 @@ class StreamDiffusionWrapper:
 
         if mode == "txt2img":
             if cfg_type != "none":
-                raise ValueError(
-                    f"txt2img mode accepts only cfg_type = 'none', but got {cfg_type}"
-                )
+                raise ValueError(f"txt2img mode accepts only cfg_type = 'none', but got {cfg_type}")
             if use_denoising_batch and frame_buffer_size > 1:
                 if not self.sd_turbo:
-                    raise ValueError(
-                        "txt2img mode cannot use denoising batch with frame_buffer_size > 1."
-                    )
+                    raise ValueError("txt2img mode cannot use denoising batch with frame_buffer_size > 1.")
 
         if mode == "img2img":
             if not use_denoising_batch:
-                raise NotImplementedError(
-                    "img2img mode must use denoising batch for now."
-                )
+                raise NotImplementedError("img2img mode must use denoising batch for now.")
 
         self.device = device
         self.dtype = dtype
@@ -282,11 +279,7 @@ class StreamDiffusionWrapper:
         self.mode = mode
         self.output_type = output_type
         self.frame_buffer_size = frame_buffer_size
-        self.batch_size = (
-            len(t_index_list) * frame_buffer_size
-            if use_denoising_batch
-            else frame_buffer_size
-        )
+        self.batch_size = len(t_index_list) * frame_buffer_size if use_denoising_batch else frame_buffer_size
         self.min_batch_size = min_batch_size
         self.max_batch_size = max_batch_size
 
@@ -296,6 +289,7 @@ class StreamDiffusionWrapper:
         self.set_nsfw_fallback_img(height, width)
         self.safety_checker_fallback_type = safety_checker_fallback_type
         self.safety_checker_threshold = safety_checker_threshold
+        self.fp8 = fp8
 
         self.stream: StreamDiffusion = self._load_model(
             model_id_or_path=model_id_or_path,
@@ -304,7 +298,7 @@ class StreamDiffusionWrapper:
             t_index_list=t_index_list,
             acceleration=acceleration,
             do_add_noise=do_add_noise,
-            use_lcm_lora=use_lcm_lora, # Deprecated:Backwards compatibility
+            use_lcm_lora=use_lcm_lora,  # Deprecated:Backwards compatibility
             use_tiny_vae=use_tiny_vae,
             cfg_type=cfg_type,
             engine_dir=engine_dir,
@@ -328,6 +322,7 @@ class StreamDiffusionWrapper:
             cache_interval=cache_interval,
             min_cache_maxframes=min_cache_maxframes,
             max_cache_maxframes=max_cache_maxframes,
+            fp8=fp8,
         )
 
         # Store skip_diffusion on wrapper for execution flow control
@@ -343,9 +338,7 @@ class StreamDiffusionWrapper:
             "",
             "",
             num_inference_steps=50,
-            guidance_scale=1.1
-            if self.stream.cfg_type in ["full", "self", "initialize"]
-            else 1.0,
+            guidance_scale=1.1 if self.stream.cfg_type in ["full", "self", "initialize"] else 1.0,
             generator=torch.manual_seed(seed),
             seed=seed,
         )
@@ -363,9 +356,7 @@ class StreamDiffusionWrapper:
         self._engine_dir = engine_dir
 
         if device_ids is not None:
-            self.stream.unet = torch.nn.DataParallel(
-                self.stream.unet, device_ids=device_ids
-            )
+            self.stream.unet = torch.nn.DataParallel(self.stream.unet, device_ids=device_ids)
 
         if enable_similar_image_filter:
             self.stream.enable_similar_image_filter(
@@ -413,7 +404,6 @@ class StreamDiffusionWrapper:
         seed_interpolation_method : Literal["linear", "slerp"], optional
             Method for interpolating between seed noise tensors, by default "linear".
         """
-
 
         # Handle both single prompt and prompt blending
         if isinstance(prompt, str):
@@ -500,7 +490,7 @@ class StreamDiffusionWrapper:
         negative_prompt: str = "",
         prompt_interpolation_method: Literal["linear", "slerp"] = "slerp",
         clear_blending: bool = True,
-        warn_about_conflicts: bool = True
+        warn_about_conflicts: bool = True,
     ) -> None:
         """
         Update to a new prompt or prompt blending configuration.
@@ -631,8 +621,8 @@ class StreamDiffusionWrapper:
             When False, weights > 1 will amplify noise.
         controlnet_config : Optional[List[Dict[str, Any]]]
             Complete ControlNet configuration list defining the desired state.
-            Each dict contains: model_id, preprocessor, conditioning_scale, enabled, 
-            preprocessor_params, etc. System will diff current vs desired state and 
+            Each dict contains: model_id, preprocessor, conditioning_scale, enabled,
+            preprocessor_params, etc. System will diff current vs desired state and
             perform minimal add/remove/update operations.
         ipadapter_config : Optional[Dict[str, Any]]
             IPAdapter configuration dict containing scale, style_image, etc.
@@ -699,45 +689,44 @@ class StreamDiffusionWrapper:
         """
         if self.skip_diffusion:
             return self._process_skip_diffusion(image, prompt)
-        
+
         if self.mode == "img2img":
             return self.img2img(image, prompt)
         else:
             return self.txt2img(prompt)
 
     def _process_skip_diffusion(
-        self, 
-        image: Optional[Union[str, Image.Image, torch.Tensor]] = None, 
-        prompt: Optional[str] = None
+        self, image: Optional[Union[str, Image.Image, torch.Tensor]] = None, prompt: Optional[str] = None
     ) -> Union[Image.Image, List[Image.Image], torch.Tensor, np.ndarray]:
         """
         Process input directly without diffusion, applying pre/post processing hooks.
-        
+
         This method bypasses VAE encoding, diffusion, and VAE decoding, but still
         applies image preprocessing and postprocessing hooks for consistent processing.
-        
+
         Parameters
         ----------
         image : Optional[Union[str, Image.Image, torch.Tensor]]
             The image to process directly.
         prompt : Optional[str]
             Prompt (ignored in skip mode, but kept for API consistency).
-            
+
         Returns
         -------
         Union[Image.Image, List[Image.Image], torch.Tensor, np.ndarray]
             The processed image with hooks applied.
         """
 
-        #TODO: add safety checker call somewhere in this method
-
+        # TODO: add safety checker call somewhere in this method
 
         if self.mode == "txt2img":
-            raise RuntimeError("_process_skip_diffusion: skip_diffusion mode not applicable for txt2img - no input image")
-        
+            raise RuntimeError(
+                "_process_skip_diffusion: skip_diffusion mode not applicable for txt2img - no input image"
+            )
+
         if image is None:
             raise ValueError("_process_skip_diffusion: image required for skip diffusion mode")
-        
+
         # Handle input tensor normalization to [-1,1] pipeline range
         if isinstance(image, str) or isinstance(image, Image.Image):
             processed_tensor = self.preprocess_image(image)
@@ -749,19 +738,17 @@ class StreamDiffusionWrapper:
             preprocessor_input = image
 
         preprocessor_output = self.stream._apply_image_preprocessing_hooks(preprocessor_input)
-        
+
         # Convert [0,1] -> [-1,1] back to pipeline range for postprocessing hooks
         processed_tensor = self._normalize_on_gpu(preprocessor_output)
-        
+
         # Apply image postprocessing hooks (expect [-1,1] range - post-VAE decoding)
         processed_tensor = self.stream._apply_image_postprocessing_hooks(processed_tensor)
-        
+
         # Final postprocessing for output format
         return self.postprocess_image(processed_tensor, output_type=self.output_type)
 
-    def txt2img(
-        self, prompt: Optional[str] = None
-    ) -> Union[Image.Image, List[Image.Image], torch.Tensor, np.ndarray]:
+    def txt2img(self, prompt: Optional[str] = None) -> Union[Image.Image, List[Image.Image], torch.Tensor, np.ndarray]:
         """
         Performs txt2img.
 
@@ -778,12 +765,12 @@ class StreamDiffusionWrapper:
         """
         if prompt is not None:
             self.update_prompt(prompt, warn_about_conflicts=True)
-        
+
         if self.sd_turbo:
             image_tensor = self.stream.txt2img_sd_turbo(self.batch_size)
         else:
             image_tensor = self.stream.txt2img(self.frame_buffer_size)
-        
+
         image = self.postprocess_image(image_tensor, output_type=self.output_type)
 
         if self.use_safety_checker:
@@ -856,15 +843,15 @@ class StreamDiffusionWrapper:
         # Use stream's current resolution instead of wrapper's cached values
         current_width = self.stream.width
         current_height = self.stream.height
-        
+
         if isinstance(image, str):
             image = Image.open(image).convert("RGB").resize((current_width, current_height))
         if isinstance(image, Image.Image):
             image = image.convert("RGB").resize((current_width, current_height))
 
-        return self.stream.image_processor.preprocess(
-            image, current_height, current_width
-        ).to(device=self.device, dtype=self.dtype)
+        return self.stream.image_processor.preprocess(image, current_height, current_width).to(
+            device=self.device, dtype=self.dtype
+        )
 
     def postprocess_image(
         self, image_tensor: torch.Tensor, output_type: str = "pil"
@@ -893,14 +880,12 @@ class StreamDiffusionWrapper:
             denormalized = self._denormalize_on_gpu(image_tensor)
             return denormalized.cpu().permute(0, 2, 3, 1).float().numpy()
 
-
         # PIL output path (optimized)
         if output_type == "pil":
             if self.frame_buffer_size > 1:
                 return self._tensor_to_pil_optimized(image_tensor)
             else:
                 return self._tensor_to_pil_optimized(image_tensor)[0]
-
 
         # Fallback to original method for any unexpected output types
         if self.frame_buffer_size > 1:
@@ -965,27 +950,22 @@ class StreamDiffusionWrapper:
         # Denormalize on GPU first
         denormalized = self._denormalize_on_gpu(image_tensor)
 
-
         # Convert to uint8 on GPU to reduce transfer size
         # Scale to [0, 255] and convert to uint8
         # Scale to [0, 255] and convert to uint8
         uint8_tensor = (denormalized * 255).clamp(0, 255).to(torch.uint8)
 
-
         # Single efficient CPU transfer
         cpu_tensor = uint8_tensor.cpu()
-
 
         # Convert to HWC format for PIL
         # From BCHW to BHWC
         cpu_tensor = cpu_tensor.permute(0, 2, 3, 1)
 
-
         # Convert to PIL images efficiently
         pil_images = []
         for i in range(cpu_tensor.shape[0]):
             img_array = cpu_tensor[i].numpy()
-
 
             if img_array.shape[-1] == 1:
                 # Grayscale
@@ -993,7 +973,6 @@ class StreamDiffusionWrapper:
             else:
                 # RGB
                 pil_images.append(Image.fromarray(img_array))
-
 
         return pil_images
 
@@ -1054,6 +1033,7 @@ class StreamDiffusionWrapper:
         cache_interval: int = 1,
         min_cache_maxframes: int = 1,
         max_cache_maxframes: int = 4,
+        fp8: bool = False,
     ) -> StreamDiffusion:
         """
         Loads the model.
@@ -1149,7 +1129,7 @@ class StreamDiffusionWrapper:
             self.cleanup_gpu_memory()
         except Exception as e:
             logger.warning(f"GPU cleanup warning: {e}")
-        
+
         # Reset CUDA context to prevent corruption from previous runs
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
@@ -1162,14 +1142,14 @@ class StreamDiffusionWrapper:
         # TODO: CAN we do this step with model_detection.py?
         is_sdxl_model = False
         model_path_lower = model_id_or_path.lower()
-        
+
         # Check path for SDXL indicators
-        if any(indicator in model_path_lower for indicator in ['sdxl', 'xl', '1024']):
+        if any(indicator in model_path_lower for indicator in ["sdxl", "xl", "1024"]):
             is_sdxl_model = True
             logger.info(f"_load_model: Path suggests SDXL model: {model_id_or_path}")
-        
+
         # For .safetensor files, we need to be more careful about pipeline selection
-        if model_id_or_path.endswith('.safetensors'):
+        if model_id_or_path.endswith(".safetensors"):
             # For .safetensor files, try SDXL pipeline first if path suggests SDXL
             if is_sdxl_model:
                 loading_methods = [
@@ -1181,14 +1161,14 @@ class StreamDiffusionWrapper:
                 loading_methods = [
                     (AutoPipelineForText2Image.from_pretrained, "AutoPipeline from_pretrained"),
                     (StableDiffusionPipeline.from_single_file, "SD from_single_file"),
-                    (StableDiffusionXLPipeline.from_single_file, "SDXL from_single_file")
+                    (StableDiffusionXLPipeline.from_single_file, "SDXL from_single_file"),
                 ]
         else:
             # For regular model directories or checkpoints, use the original order
             loading_methods = [
                 (AutoPipelineForText2Image.from_pretrained, "AutoPipeline from_pretrained"),
                 (StableDiffusionPipeline.from_single_file, "SD from_single_file"),
-                (StableDiffusionXLPipeline.from_single_file, "SDXL from_single_file")
+                (StableDiffusionXLPipeline.from_single_file, "SDXL from_single_file"),
             ]
 
         pipe = None
@@ -1198,19 +1178,19 @@ class StreamDiffusionWrapper:
                 logger.info(f"_load_model: Attempting to load with {method_name}...")
                 pipe = method(model_id_or_path).to(dtype=self.dtype)
                 logger.info(f"_load_model: Successfully loaded using {method_name}")
-                
+
                 # Verify that we have the right pipeline type for SDXL models
                 if is_sdxl_model and not isinstance(pipe, StableDiffusionXLPipeline):
                     logger.warning(f"_load_model: SDXL model detected but loaded with non-SDXL pipeline: {type(pipe)}")
                     # Try to explicitly load with SDXL pipeline instead
                     try:
-                        logger.info(f"_load_model: Retrying with StableDiffusionXLPipeline...")
+                        logger.info("_load_model: Retrying with StableDiffusionXLPipeline...")
                         pipe = StableDiffusionXLPipeline.from_single_file(model_id_or_path).to(dtype=self.dtype)
-                        logger.info(f"_load_model: Successfully loaded using SDXL pipeline on retry")
+                        logger.info("_load_model: Successfully loaded using SDXL pipeline on retry")
                     except Exception as retry_error:
                         logger.warning(f"_load_model: SDXL pipeline retry failed: {retry_error}")
                         # Continue with the originally loaded pipeline
-                
+
                 break
             except Exception as e:
                 logger.warning(f"_load_model: {method_name} failed: {e}")
@@ -1218,11 +1198,14 @@ class StreamDiffusionWrapper:
                 continue
 
         if pipe is None:
-            error_msg = f"_load_model: All loading methods failed for model '{model_id_or_path}'. Last error: {last_error}"
+            error_msg = (
+                f"_load_model: All loading methods failed for model '{model_id_or_path}'. Last error: {last_error}"
+            )
             logger.error(error_msg)
             if last_error:
                 logger.warning("Full traceback of last error:")
                 import traceback
+
                 traceback.print_exc()
             raise RuntimeError(error_msg)
         else:
@@ -1237,34 +1220,35 @@ class StreamDiffusionWrapper:
                 pipe.vae = pipe.vae.to(device=self.device)
 
         # If we get here, the model loaded successfully - break out of retry loop
-        logger.info(f"Model loading succeeded")
+        logger.info("Model loading succeeded")
 
         # Use comprehensive model detection instead of basic detection
         detection_result = detect_model(pipe.unet, pipe)
-        model_type = detection_result['model_type']
-        is_sdxl = detection_result['is_sdxl']
-        is_turbo = detection_result['is_turbo']
-        confidence = detection_result['confidence']
-        
+        model_type = detection_result["model_type"]
+        is_sdxl = detection_result["is_sdxl"]
+        is_turbo = detection_result["is_turbo"]
+        confidence = detection_result["confidence"]
+
         # Store comprehensive model info for later use (after TensorRT conversion)
         self._detected_model_type = model_type
         self._detection_confidence = confidence
         self._is_turbo = is_turbo
         self._is_sdxl = is_sdxl
-        
+
         logger.info(f"_load_model: Detected model type: {model_type} (confidence: {confidence:.2f})")
 
         # Auto-resolve IP-Adapter model/encoder paths for detected architecture.
         # Runs once here so both pre-TRT and post-TRT installation paths see the resolved cfg.
         if use_ipadapter and ipadapter_config:
             from streamdiffusion.modules.ipadapter_module import resolve_ipadapter_paths
+
             _ip_cfgs = ipadapter_config if isinstance(ipadapter_config, list) else [ipadapter_config]
             for _ip_cfg in _ip_cfgs:
                 resolve_ipadapter_paths(_ip_cfg, model_type, is_sdxl)
 
         # DEPRECATED: THIS WILL LOAD LCM_LORA IF USE_LCM_LORA IS TRUE
         # Validate backwards compatibility LCM LoRA selection using proper model detection
-        if hasattr(self, 'use_lcm_lora') and self.use_lcm_lora is not None:
+        if hasattr(self, "use_lcm_lora") and self.use_lcm_lora is not None:
             if self.use_lcm_lora and not self.sd_turbo:
                 if lora_dict is None:
                     lora_dict = {}
@@ -1279,11 +1263,13 @@ class StreamDiffusionWrapper:
                 else:
                     logger.info(f"LCM LoRA {lcm_lora} already present in lora_dict with scale {lora_dict[lcm_lora]}")
             else:
-                logger.info(f"LCM LoRA will not be loaded because use_lcm_lora is {self.use_lcm_lora} and sd_turbo is {self.sd_turbo}")
+                logger.info(
+                    f"LCM LoRA will not be loaded because use_lcm_lora is {self.use_lcm_lora} and sd_turbo is {self.sd_turbo}"
+                )
 
                 # Remove use_lcm_lora from self
                 self.use_lcm_lora = None
-                logger.info(f"use_lcm_lora has been removed from self")
+                logger.info("use_lcm_lora has been removed from self")
 
         # Get kvo_cache_structure before stream init (needed for TRT export wrapper).
         # Actual cache tensors are created AFTER stream init so we can use
@@ -1291,6 +1277,7 @@ class StreamDiffusionWrapper:
         # (e.g. TCD sets trt_unet_batch_size = frame_buffer_size, not denoising_steps * frame_buffer_size).
         if use_cached_attn:
             from streamdiffusion.acceleration.tensorrt.models.utils import get_kvo_cache_info
+
             _, kvo_cache_structure, _ = get_kvo_cache_info(pipe.unet, self.height, self.width)
         else:
             kvo_cache_structure = []
@@ -1306,7 +1293,7 @@ class StreamDiffusionWrapper:
             frame_buffer_size=self.frame_buffer_size,
             use_denoising_batch=self.use_denoising_batch,
             cfg_type=cfg_type,
-            lora_dict=lora_dict, # We pass this to include loras in engine path names
+            lora_dict=lora_dict,  # We pass this to include loras in engine path names
             normalize_prompt_weights=normalize_prompt_weights,
             normalize_seed_weights=normalize_seed_weights,
             scheduler=scheduler,
@@ -1321,26 +1308,28 @@ class StreamDiffusionWrapper:
         # so this must happen after StreamDiffusion.__init__ to get the correct value.
         if use_cached_attn:
             from streamdiffusion.acceleration.tensorrt.models.utils import create_kvo_cache
-            kvo_cache, _ = create_kvo_cache(pipe.unet,
-                                            batch_size=stream.trt_unet_batch_size,
-                                            cache_maxframes=cache_maxframes,
-                                            height=self.height,
-                                            width=self.width,
-                                            device=self.device,
-                                            dtype=self.dtype)
+
+            kvo_cache, _ = create_kvo_cache(
+                pipe.unet,
+                batch_size=stream.trt_unet_batch_size,
+                cache_maxframes=cache_maxframes,
+                height=self.height,
+                width=self.width,
+                device=self.device,
+                dtype=self.dtype,
+            )
             stream.kvo_cache = kvo_cache
 
-        
         # Load and properly merge LoRA weights using the standard diffusers approach
         lora_adapters_to_merge = []
         lora_scales_to_merge = []
-        
+
         # Collect all LoRA adapters and their scales from lora_dict
         if lora_dict is not None:
             for i, (lora_name, lora_scale) in enumerate(lora_dict.items()):
                 adapter_name = f"custom_lora_{i}"
                 logger.info(f"_load_model: Loading LoRA '{lora_name}' with scale {lora_scale}")
-                
+
                 try:
                     # Load LoRA weights with unique adapter name
                     stream.pipe.load_lora_weights(lora_name, adapter_name=adapter_name)
@@ -1351,22 +1340,22 @@ class StreamDiffusionWrapper:
                     logger.error(f"Failed to load LoRA {lora_name}: {e}")
                     # Continue with other LoRAs even if one fails
                     continue
-        
+
         # Merge all LoRA adapters using the proper diffusers method
         if lora_adapters_to_merge:
             try:
                 for adapter_name, scale in zip(lora_adapters_to_merge, lora_scales_to_merge):
                     logger.info(f"Merging individual LoRA: {adapter_name} with scale {scale}")
                     stream.pipe.fuse_lora(lora_scale=scale, adapter_names=[adapter_name])
-                
+
                 # Clean up after individual merging
                 stream.pipe.unload_lora_weights()
                 logger.info("Successfully merged LoRAs individually")
-                
+
             except Exception as fallback_error:
                 logger.error(f"LoRA merging fallback also failed: {fallback_error}")
                 logger.warning("Continuing without LoRA merging - LoRAs may not be applied correctly")
-                
+
                 # Clean up any partial state
                 try:
                     stream.pipe.unload_lora_weights()
@@ -1390,20 +1379,22 @@ class StreamDiffusionWrapper:
                 stream.pipe.enable_xformers_memory_efficient_attention()
             if acceleration == "tensorrt":
                 from polygraphy import cuda
+
                 from streamdiffusion.acceleration.tensorrt import TorchVAEEncoder
-                from streamdiffusion.acceleration.tensorrt.runtime_engines.unet_engine import AutoencoderKLEngine, NSFWDetectorEngine
+                from streamdiffusion.acceleration.tensorrt.engine_manager import EngineManager, EngineType
                 from streamdiffusion.acceleration.tensorrt.models.models import (
                     VAE,
+                    NSFWDetector,
                     UNet,
                     VAEEncoder,
-                    NSFWDetector,
                 )
-                from streamdiffusion.acceleration.tensorrt.engine_manager import EngineManager, EngineType
+                from streamdiffusion.acceleration.tensorrt.runtime_engines.unet_engine import (
+                    AutoencoderKLEngine,
+                    NSFWDetectorEngine,
+                )
+
                 # Add ControlNet detection and support
-                from streamdiffusion.model_detection import (
-                    extract_unet_architecture,
-                    validate_architecture
-                )
+                from streamdiffusion.model_detection import extract_unet_architecture, validate_architecture
 
                 # Legacy TensorRT implementation (fallback)
                 # Initialize engine manager
@@ -1415,32 +1406,32 @@ class StreamDiffusionWrapper:
                 unet_arch = {}
                 is_sdxl_model = False
                 load_engine = not compile_engines_only
-                
+
                 # Use the explicit use_ipadapter parameter
                 has_ipadapter = use_ipadapter
-                
+
                 # Determine IP-Adapter presence and token count directly from config (no legacy pipeline)
                 if has_ipadapter and not ipadapter_config:
                     has_ipadapter = False
-                
+
                 try:
                     # Use model detection results already computed during model loading
-                    model_type = getattr(self, '_detected_model_type', 'SD15')
-                    is_sdxl = getattr(self, '_is_sdxl', False)
-                    is_turbo = getattr(self, '_is_turbo', False)
-                    confidence = getattr(self, '_detection_confidence', 0.0)
-                    
+                    model_type = getattr(self, "_detected_model_type", "SD15")
+                    is_sdxl = getattr(self, "_is_sdxl", False)
+                    is_turbo = getattr(self, "_is_turbo", False)
+                    confidence = getattr(self, "_detection_confidence", 0.0)
+
                     if is_sdxl:
                         logger.info(f"Building TensorRT engines for SDXL model: {model_type}")
                         logger.info(f"   Turbo variant: {is_turbo}")
                         logger.info(f"   Detection confidence: {confidence:.2f}")
                     else:
                         logger.info(f"Building TensorRT engines for {model_type}")
-                    
+
                     # Enable IPAdapter TensorRT if configured and available
                     if has_ipadapter:
                         use_ipadapter_trt = True
-                    
+
                     # Only enable ControlNet for legacy TensorRT if ControlNet is actually being used
                     if self.use_controlnet:
                         try:
@@ -1451,7 +1442,7 @@ class StreamDiffusionWrapper:
                         except Exception as e:
                             logger.warning(f"   ControlNet architecture detection failed: {e}")
                             use_controlnet_trt = False
-                    
+
                     # Set up architecture info for enabled modes
                     if use_controlnet_trt and not use_ipadapter_trt:
                         # ControlNet only: Full architecture needed
@@ -1470,28 +1461,28 @@ class StreamDiffusionWrapper:
                     else:
                         # Neither enabled: Standard UNet
                         unet_arch = {}
-                        
+
                 except Exception as e:
                     logger.error(f"Advanced model detection failed: {e}")
                     logger.error("   Falling back to basic TensorRT")
-                    
+
                     # Fallback to basic detection
                     try:
                         detection_result = detect_model(stream.unet, None)
-                        model_type = detection_result['model_type']
-                        is_sdxl = detection_result['is_sdxl']
+                        model_type = detection_result["model_type"]
+                        is_sdxl = detection_result["is_sdxl"]
                         if self.use_controlnet:
                             unet_arch = extract_unet_architecture(stream.unet)
                             unet_arch = validate_architecture(unet_arch, model_type)
                             use_controlnet_trt = True
                     except Exception:
                         pass
-                
+
                 if not use_controlnet_trt and not self.use_controlnet:
                     logger.info("ControlNet not enabled, building engines without ControlNet support")
 
                 # Use the engine_dir parameter passed to this function, with fallback to instance variable
-                engine_dir = engine_dir if engine_dir else getattr(self, '_engine_dir', 'engines')
+                engine_dir = engine_dir if engine_dir else getattr(self, "_engine_dir", "engines")
 
                 # Resolve IP-Adapter runtime params from config
                 # Strength is now a runtime input, so we do NOT bake scale into engine identity
@@ -1500,9 +1491,9 @@ class StreamDiffusionWrapper:
                 if use_ipadapter_trt and has_ipadapter and ipadapter_config:
                     cfg0 = ipadapter_config[0] if isinstance(ipadapter_config, list) else ipadapter_config
                     # scale omitted from engine naming; runtime will pass ipadapter_scale vector
-                    ipadapter_tokens = cfg0.get('num_image_tokens', 4)
+                    ipadapter_tokens = cfg0.get("num_image_tokens", 4)
                     # Determine FaceID type from config for engine naming
-                    is_faceid = (cfg0['type'] == 'faceid')
+                    is_faceid = cfg0["type"] == "faceid"
                 # Generate engine paths using EngineManager
                 unet_path = engine_manager.get_engine_path(
                     EngineType.UNET,
@@ -1517,6 +1508,7 @@ class StreamDiffusionWrapper:
                     is_faceid=is_faceid if use_ipadapter_trt else None,
                     use_cached_attn=use_cached_attn,
                     use_controlnet=use_controlnet_trt,
+                    fp8=fp8,
                 )
                 vae_encoder_path = engine_manager.get_engine_path(
                     EngineType.VAE_ENCODER,
@@ -1528,7 +1520,7 @@ class StreamDiffusionWrapper:
                     lora_dict=lora_dict,
                     ipadapter_scale=ipadapter_scale,
                     ipadapter_tokens=ipadapter_tokens,
-                    is_faceid=is_faceid if use_ipadapter_trt else None
+                    is_faceid=is_faceid if use_ipadapter_trt else None,
                 )
                 vae_decoder_path = engine_manager.get_engine_path(
                     EngineType.VAE_DECODER,
@@ -1540,7 +1532,7 @@ class StreamDiffusionWrapper:
                     lora_dict=lora_dict,
                     ipadapter_scale=ipadapter_scale,
                     ipadapter_tokens=ipadapter_tokens,
-                    is_faceid=is_faceid if use_ipadapter_trt else None
+                    is_faceid=is_faceid if use_ipadapter_trt else None,
                 )
 
                 # Check if all required engines exist
@@ -1554,14 +1546,16 @@ class StreamDiffusionWrapper:
 
                 if missing_engines:
                     if build_engines_if_missing:
-                        logger.info(f"Missing TensorRT engines, building them...")
+                        logger.info("Missing TensorRT engines, building them...")
                         for engine in missing_engines:
                             logger.info(f"  - {engine}")
                     else:
-                        error_msg = f"Required TensorRT engines are missing and build_engines_if_missing=False:\n"
+                        error_msg = "Required TensorRT engines are missing and build_engines_if_missing=False:\n"
                         for engine in missing_engines:
                             error_msg += f"  - {engine}\n"
-                        error_msg += f"\nTo build engines, set build_engines_if_missing=True or run the build script manually."
+                        error_msg += (
+                            "\nTo build engines, set build_engines_if_missing=True or run the build script manually."
+                        )
                         raise RuntimeError(error_msg)
 
                 # Determine correct embedding dimension based on model type
@@ -1577,32 +1571,41 @@ class StreamDiffusionWrapper:
                 # Gather parameters for unified wrapper - validate IPAdapter first for consistent token count
                 control_input_names = None
                 num_tokens = 4  # Default for non-IPAdapter mode
-                
+
                 if use_ipadapter_trt:
                     # Use token count resolved from configuration (default to 4)
                     num_tokens = ipadapter_tokens if isinstance(ipadapter_tokens, int) else 4
 
                 # Compile UNet engine using EngineManager
-                logger.info(f"compile_and_load_engine: Compiling UNet engine for image size: {self.width}x{self.height}")
+                logger.info(
+                    f"compile_and_load_engine: Compiling UNet engine for image size: {self.width}x{self.height}"
+                )
                 try:
-                    logger.debug(f"compile_and_load_engine: use_ipadapter_trt={use_ipadapter_trt}, num_ip_layers={num_ip_layers}, tokens={num_tokens}")
+                    logger.debug(
+                        f"compile_and_load_engine: use_ipadapter_trt={use_ipadapter_trt}, num_ip_layers={num_ip_layers}, tokens={num_tokens}"
+                    )
                 except Exception:
                     pass
-                
+
                 # Note: LoRA weights have already been merged permanently during model loading
-                
+
                 # CRITICAL: Install IPAdapter module BEFORE TensorRT compilation to ensure processors are baked into engines
-                if use_ipadapter and ipadapter_config and not hasattr(stream, '_ipadapter_module'):
+                if use_ipadapter and ipadapter_config and not hasattr(stream, "_ipadapter_module"):
                     # Check if auto-resolution disabled IP-Adapter (e.g. no adapter released for this arch)
                     _cfg_check = ipadapter_config[0] if isinstance(ipadapter_config, list) else ipadapter_config
-                    if _cfg_check.get('enabled', True) is False:
+                    if _cfg_check.get("enabled", True) is False:
                         logger.info(
                             "IP-Adapter disabled by auto-resolution (no compatible adapter for this model). Skipping."
                         )
                         use_ipadapter_trt = False
                     else:
                         try:
-                            from streamdiffusion.modules.ipadapter_module import IPAdapterModule, IPAdapterConfig, IPAdapterType
+                            from streamdiffusion.modules.ipadapter_module import (
+                                IPAdapterConfig,
+                                IPAdapterModule,
+                                IPAdapterType,
+                            )
+
                             logger.info("Installing IPAdapter module before TensorRT compilation...")
 
                             # Snapshot processors before install — IPAdapter.set_ip_adapter() replaces them
@@ -1612,14 +1615,14 @@ class StreamDiffusionWrapper:
                             # Use first config if list provided
                             cfg = ipadapter_config[0] if isinstance(ipadapter_config, list) else ipadapter_config
                             ip_cfg = IPAdapterConfig(
-                                style_image_key=cfg.get('style_image_key') or 'ipadapter_main',
-                                num_image_tokens=cfg.get('num_image_tokens', 4),
-                                ipadapter_model_path=cfg['ipadapter_model_path'],
-                                image_encoder_path=cfg['image_encoder_path'],
-                                style_image=cfg.get('style_image'),
-                                scale=cfg.get('scale', 1.0),
-                                type=IPAdapterType(cfg.get('type', "regular")),
-                                insightface_model_name=cfg.get('insightface_model_name'),
+                                style_image_key=cfg.get("style_image_key") or "ipadapter_main",
+                                num_image_tokens=cfg.get("num_image_tokens", 4),
+                                ipadapter_model_path=cfg["ipadapter_model_path"],
+                                image_encoder_path=cfg["image_encoder_path"],
+                                style_image=cfg.get("style_image"),
+                                scale=cfg.get("scale", 1.0),
+                                type=IPAdapterType(cfg.get("type", "regular")),
+                                insightface_model_name=cfg.get("insightface_model_name"),
                             )
                             ip_module = IPAdapterModule(ip_cfg)
                             ip_module.install(stream)
@@ -1629,6 +1632,7 @@ class StreamDiffusionWrapper:
 
                             # Cleanup after IPAdapter installation
                             import gc
+
                             gc.collect()
                             torch.cuda.empty_cache()
                             torch.cuda.synchronize()
@@ -1636,12 +1640,16 @@ class StreamDiffusionWrapper:
                         except torch.cuda.OutOfMemoryError as oom_error:
                             logger.error(f"CUDA Out of Memory during early IPAdapter installation: {oom_error}")
                             logger.error("Try reducing batch size, using smaller models, or increasing GPU memory")
-                            raise RuntimeError("Insufficient VRAM for IPAdapter installation. Consider using a GPU with more memory or reducing model complexity.")
+                            raise RuntimeError(
+                                "Insufficient VRAM for IPAdapter installation. Consider using a GPU with more memory or reducing model complexity."
+                            )
 
                         except RuntimeError as rt_error:
                             if "size mismatch" in str(rt_error):
-                                unet_dim = getattr(getattr(stream, 'unet', None), 'config', None)
-                                unet_cross_attn = getattr(unet_dim, 'cross_attention_dim', 'unknown') if unet_dim else 'unknown'
+                                unet_dim = getattr(getattr(stream, "unet", None), "config", None)
+                                unet_cross_attn = (
+                                    getattr(unet_dim, "cross_attention_dim", "unknown") if unet_dim else "unknown"
+                                )
                                 logger.warning(
                                     f"IP-Adapter weights are incompatible with this model "
                                     f"(UNet cross_attention_dim={unet_cross_attn}). "
@@ -1654,23 +1662,24 @@ class StreamDiffusionWrapper:
                                 # them before load_state_dict() failed, leaving the UNet in a corrupted state
                                 try:
                                     stream.unet.set_attn_processor(_saved_unet_processors)
-                                    logger.info("Restored original UNet attention processors after IP-Adapter failure.")
+                                    logger.info(
+                                        "Restored original UNet attention processors after IP-Adapter failure."
+                                    )
                                 except Exception as restore_err:
                                     logger.warning(f"Could not restore UNet processors: {restore_err}")
                                 use_ipadapter_trt = False
                             else:
                                 import traceback
+
                                 traceback.print_exc()
                                 logger.error("Failed to install IPAdapterModule before TensorRT compilation")
                                 raise
 
                         except Exception as e:
                             import traceback
+
                             traceback.print_exc()
-                            logger.warning(
-                                f"Failed to install IPAdapterModule: {e}. "
-                                f"Continuing without IP-Adapter."
-                            )
+                            logger.warning(f"Failed to install IPAdapterModule: {e}. Continuing without IP-Adapter.")
                             try:
                                 stream.unet.set_attn_processor(_saved_unet_processors)
                                 logger.info("Restored original UNet attention processors after IP-Adapter failure.")
@@ -1683,20 +1692,23 @@ class StreamDiffusionWrapper:
                 # then construct UNet model with that value.
 
                 # Build a temporary unified wrapper to install processors and discover num_ip_layers
-                from streamdiffusion.acceleration.tensorrt.export_wrappers.unet_unified_export import UnifiedExportWrapper
+                from streamdiffusion.acceleration.tensorrt.export_wrappers.unet_unified_export import (
+                    UnifiedExportWrapper,
+                )
+
                 temp_wrapped_unet = UnifiedExportWrapper(
                     stream.unet,
                     use_controlnet=use_controlnet_trt,
                     use_ipadapter=use_ipadapter_trt,
                     control_input_names=None,
-                    num_tokens=num_tokens
+                    num_tokens=num_tokens,
                 )
 
                 num_ip_layers = None
                 if use_ipadapter_trt:
                     # Access underlying IPAdapter wrapper
-                    if hasattr(temp_wrapped_unet, 'ipadapter_wrapper') and temp_wrapped_unet.ipadapter_wrapper:
-                        num_ip_layers = getattr(temp_wrapped_unet.ipadapter_wrapper, 'num_ip_layers', None)
+                    if hasattr(temp_wrapped_unet, "ipadapter_wrapper") and temp_wrapped_unet.ipadapter_wrapper:
+                        num_ip_layers = getattr(temp_wrapped_unet.ipadapter_wrapper, "num_ip_layers", None)
                         if not isinstance(num_ip_layers, int) or num_ip_layers <= 0:
                             raise RuntimeError("Failed to determine num_ip_layers for IP-Adapter")
                         try:
@@ -1729,9 +1741,9 @@ class StreamDiffusionWrapper:
                 if use_controlnet_trt:
                     # Build control_input_names excluding ipadapter_scale so indices align to 3-base offset
                     all_input_names = unet_model.get_input_names()
-                    control_input_names = [name for name in all_input_names if name != 'ipadapter_scale']
+                    control_input_names = [name for name in all_input_names if name != "ipadapter_scale"]
 
-                # Unified compilation path 
+                # Unified compilation path
                 # Recreate wrapped_unet with control input names if needed (after unet_model is ready)
                 wrapped_unet = UnifiedExportWrapper(
                     stream.unet,
@@ -1744,6 +1756,7 @@ class StreamDiffusionWrapper:
 
                 if use_cached_attn:
                     from .acceleration.tensorrt.models.attention_processors import CachedSTAttnProcessor2_0
+
                     processors = stream.unet.attn_processors
                     for name, processor in processors.items():
                         # Target self-attention layers (attn1) by name — kvo_cache is only passed
@@ -1770,13 +1783,13 @@ class StreamDiffusionWrapper:
                     cuda_stream=None,
                     stream_vae=stream.vae,
                     engine_build_options={
-                        'opt_image_height': self.height,
-                        'opt_image_width': self.width,
-                        'build_dynamic_shape': True,
-                        'min_image_resolution': 384,
-                        'max_image_resolution': 1024,
-                        'build_all_tactics': True,
-                    }
+                        "opt_image_height": self.height,
+                        "opt_image_width": self.width,
+                        "build_dynamic_shape": True,
+                        "min_image_resolution": 384,
+                        "max_image_resolution": 1024,
+                        "build_all_tactics": True,
+                    },
                 )
 
                 # Compile VAE encoder engine using EngineManager
@@ -1796,13 +1809,13 @@ class StreamDiffusionWrapper:
                     batch_size=self.batch_size if self.mode == "txt2img" else stream.frame_bff_size,
                     cuda_stream=None,
                     engine_build_options={
-                        'opt_image_height': self.height,
-                        'opt_image_width': self.width,
-                        'build_dynamic_shape': True,
-                        'min_image_resolution': 384,
-                        'max_image_resolution': 1024,
-                        'build_all_tactics': True,
-                    }
+                        "opt_image_height": self.height,
+                        "opt_image_width": self.width,
+                        "build_dynamic_shape": True,
+                        "min_image_resolution": 384,
+                        "max_image_resolution": 1024,
+                        "build_all_tactics": True,
+                    },
                 )
 
                 cuda_stream = cuda.Stream()
@@ -1812,6 +1825,25 @@ class StreamDiffusionWrapper:
 
                 try:
                     logger.info("Loading TensorRT UNet engine...")
+                    # Build engine_build_options, adding FP8 calibration callback when enabled.
+                    _unet_build_opts = {
+                        "opt_image_height": self.height,
+                        "opt_image_width": self.width,
+                        "build_all_tactics": True,
+                    }
+                    if fp8:
+                        from streamdiffusion.acceleration.tensorrt.fp8_quantize import (
+                            generate_unet_calibration_data,
+                        )
+                        _captured_model = unet_model
+                        _calib_batch = stream.trt_unet_batch_size
+                        _calib_h, _calib_w = self.height, self.width
+                        _unet_build_opts["fp8"] = True
+                        _unet_build_opts["onnx_opset"] = 19  # modelopt FP8 needs opset ≥19 for fp16 Q/DQ scales
+                        _unet_build_opts["calibration_data_fn"] = lambda: generate_unet_calibration_data(
+                            _captured_model, _calib_batch, _calib_h, _calib_w
+                        )
+
                     # Compile and load UNet engine using EngineManager
                     stream.unet = engine_manager.compile_and_load_engine(
                         EngineType.UNET,
@@ -1825,46 +1857,48 @@ class StreamDiffusionWrapper:
                         use_ipadapter_trt=use_ipadapter_trt,
                         unet_arch=unet_arch,
                         num_ip_layers=num_ip_layers if use_ipadapter_trt else None,
-                        engine_build_options={
-                            'opt_image_height': self.height,
-                            'opt_image_width': self.width,
-                            'build_all_tactics': True,
-                        }
+                        engine_build_options=_unet_build_opts,
                     )
                     if load_engine:
                         logger.info("TensorRT UNet engine loaded successfully")
-                    
+
                 except Exception as e:
                     error_msg = str(e).lower()
-                    is_oom_error = ('out of memory' in error_msg or 'outofmemory' in error_msg or 
-                                   'oom' in error_msg or 'cuda error' in error_msg)
-                    
+                    is_oom_error = (
+                        "out of memory" in error_msg
+                        or "outofmemory" in error_msg
+                        or "oom" in error_msg
+                        or "cuda error" in error_msg
+                    )
+
                     if is_oom_error:
                         logger.error(f"TensorRT UNet engine OOM: {e}")
                         logger.info("Falling back to PyTorch UNet (no TensorRT acceleration)")
                         logger.info("This will be slower but should work with less memory")
-                        
+
                         # Clean up any partial TensorRT state
-                        if hasattr(stream, 'unet'):
+                        if hasattr(stream, "unet"):
                             try:
                                 del stream.unet
                             except:
                                 pass
-                        
+
                         self.cleanup_gpu_memory()
-                        
+
                         # Fall back to original PyTorch UNet
                         try:
                             logger.info("Loading PyTorch UNet as fallback...")
                             # Keep the original UNet from the pipe
-                            if hasattr(stream, 'pipe') and hasattr(stream.pipe, 'unet'):
+                            if hasattr(stream, "pipe") and hasattr(stream.pipe, "unet"):
                                 stream.unet = stream.pipe.unet
                                 logger.info("PyTorch UNet fallback successful")
                             else:
                                 raise RuntimeError("No PyTorch UNet available for fallback")
                         except Exception as fallback_error:
                             logger.error(f"PyTorch UNet fallback also failed: {fallback_error}")
-                            raise RuntimeError(f"Both TensorRT and PyTorch UNet loading failed. TensorRT error: {e}, Fallback error: {fallback_error}")
+                            raise RuntimeError(
+                                f"Both TensorRT and PyTorch UNet loading failed. TensorRT error: {e}, Fallback error: {fallback_error}"
+                            )
                     else:
                         # Non-OOM error, re-raise
                         logger.error(f"TensorRT UNet engine loading failed (non-OOM): {e}")
@@ -1872,7 +1906,9 @@ class StreamDiffusionWrapper:
 
                 if load_engine:
                     try:
-                        logger.info(f"Loading TensorRT VAE engines vae_encoder_path: {vae_encoder_path}, vae_decoder_path: {vae_decoder_path}")
+                        logger.info(
+                            f"Loading TensorRT VAE engines vae_encoder_path: {vae_encoder_path}, vae_decoder_path: {vae_decoder_path}"
+                        )
                         stream.vae = AutoencoderKLEngine(
                             str(vae_encoder_path),
                             str(vae_decoder_path),
@@ -1883,38 +1919,44 @@ class StreamDiffusionWrapper:
                         stream.vae.config = vae_config
                         stream.vae.dtype = vae_dtype
                         logger.info("TensorRT VAE engines loaded successfully")
-                        
+
                     except Exception as e:
                         error_msg = str(e).lower()
-                        is_oom_error = ('out of memory' in error_msg or 'outofmemory' in error_msg or 
-                                    'oom' in error_msg or 'cuda error' in error_msg)
-                        
+                        is_oom_error = (
+                            "out of memory" in error_msg
+                            or "outofmemory" in error_msg
+                            or "oom" in error_msg
+                            or "cuda error" in error_msg
+                        )
+
                         if is_oom_error:
                             logger.error(f"TensorRT VAE engine OOM: {e}")
                             logger.info("Falling back to PyTorch VAE (no TensorRT acceleration)")
                             logger.info("This will be slower but should work with less memory")
-                            
+
                             # Clean up any partial TensorRT state
-                            if hasattr(stream, 'vae'):
+                            if hasattr(stream, "vae"):
                                 try:
                                     del stream.vae
                                 except:
                                     pass
-                            
+
                             self.cleanup_gpu_memory()
-                            
+
                             # Fall back to original PyTorch VAE
                             try:
                                 logger.info("Loading PyTorch VAE as fallback...")
                                 # Keep the original VAE from the pipe
-                                if hasattr(stream, 'pipe') and hasattr(stream.pipe, 'vae'):
+                                if hasattr(stream, "pipe") and hasattr(stream.pipe, "vae"):
                                     stream.vae = stream.pipe.vae
                                     logger.info("PyTorch VAE fallback successful")
                                 else:
                                     raise RuntimeError("No PyTorch VAE available for fallback")
                             except Exception as fallback_error:
                                 logger.error(f"PyTorch VAE fallback also failed: {fallback_error}")
-                                raise RuntimeError(f"Both TensorRT and PyTorch VAE loading failed. TensorRT error: {e}, Fallback error: {fallback_error}")
+                                raise RuntimeError(
+                                    f"Both TensorRT and PyTorch VAE loading failed. TensorRT error: {e}, Fallback error: {fallback_error}"
+                                )
                         else:
                             # Non-OOM error, re-raise
                             logger.error(f"TensorRT VAE engine loading failed (non-OOM): {e}")
@@ -1935,6 +1977,7 @@ class StreamDiffusionWrapper:
                 if self.use_safety_checker or safety_checker_engine_exists:
                     if not safety_checker_engine_exists:
                         from transformers import AutoModelForImageClassification
+
                         self.safety_checker = AutoModelForImageClassification.from_pretrained(safety_checker_model_id)
 
                         safety_checker_model = NSFWDetector(
@@ -1952,7 +1995,7 @@ class StreamDiffusionWrapper:
                             cuda_stream=None,
                             load_engine=False,
                         )
-                    
+
                     if load_engine:
                         self.safety_checker = NSFWDetectorEngine(
                             safety_checker_path,
@@ -1960,7 +2003,7 @@ class StreamDiffusionWrapper:
                             use_cuda_graph=True,
                         )
                         logger.info("Safety Checker engine loaded successfully")
-                        
+
             if acceleration == "sfast":
                 from streamdiffusion.acceleration.sfast import (
                     accelerate_with_stable_fast,
@@ -1969,13 +2012,15 @@ class StreamDiffusionWrapper:
                 stream = accelerate_with_stable_fast(stream)
         except Exception:
             import traceback
+
             traceback.print_exc()
             raise Exception("Acceleration has failed.")
 
         # Install modules via hooks instead of patching (wrapper keeps forwarding updates only)
         if use_controlnet:
             try:
-                from streamdiffusion.modules.controlnet_module import ControlNetModule, ControlNetConfig
+                from streamdiffusion.modules.controlnet_module import ControlNetConfig, ControlNetModule
+
                 cn_module = ControlNetModule(device=self.device, dtype=self.dtype)
                 cn_module.install(stream)
                 # Normalize to list of configs
@@ -1987,28 +2032,28 @@ class StreamDiffusionWrapper:
                     else []
                 )
                 for cfg in configs:
-                    if not cfg.get('model_id'):
+                    if not cfg.get("model_id"):
                         continue
                     cn_cfg = ControlNetConfig(
-                        model_id=cfg['model_id'],
-                        preprocessor=cfg.get('preprocessor'),
-                        conditioning_scale=cfg.get('conditioning_scale', 1.0),
-                        enabled=cfg.get('enabled', True),
-                        conditioning_channels=cfg.get('conditioning_channels'),
-                        preprocessor_params=cfg.get('preprocessor_params'),
+                        model_id=cfg["model_id"],
+                        preprocessor=cfg.get("preprocessor"),
+                        conditioning_scale=cfg.get("conditioning_scale", 1.0),
+                        enabled=cfg.get("enabled", True),
+                        conditioning_channels=cfg.get("conditioning_channels"),
+                        preprocessor_params=cfg.get("preprocessor_params"),
                     )
-                    cn_module.add_controlnet(cn_cfg, control_image=cfg.get('control_image'))
+                    cn_module.add_controlnet(cn_cfg, control_image=cfg.get("control_image"))
                 # Expose for later updates if needed by caller code
                 stream._controlnet_module = cn_module
 
                 try:
                     compiled_cn_engines = []
                     for cfg, cn_model in zip(configs, cn_module.controlnets):
-                        if not cfg or not cfg.get('model_id') or cn_model is None:
+                        if not cfg or not cfg.get("model_id") or cn_model is None:
                             continue
                         try:
                             engine = engine_manager.get_or_load_controlnet_engine(
-                                model_id=cfg['model_id'],
+                                model_id=cfg["model_id"],
                                 pytorch_model=cn_model,
                                 model_type=model_type,
                                 batch_size=stream.trt_unet_batch_size,
@@ -2017,29 +2062,33 @@ class StreamDiffusionWrapper:
                                 cuda_stream=cuda_stream,
                                 use_cuda_graph=False,
                                 unet=None,
-                                model_path=cfg['model_id'],
+                                model_path=cfg["model_id"],
                                 load_engine=load_engine,
-                                conditioning_channels=cfg.get('conditioning_channels', 3)
+                                conditioning_channels=cfg.get("conditioning_channels", 3),
                             )
                             try:
-                                setattr(engine, 'model_id', cfg['model_id'])
+                                setattr(engine, "model_id", cfg["model_id"])
                             except Exception:
                                 pass
                             compiled_cn_engines.append(engine)
                         except Exception as e:
                             logger.warning(f"Failed to compile/load ControlNet engine for {cfg.get('model_id')}: {e}")
                     if compiled_cn_engines:
-                        setattr(stream, 'controlnet_engines', compiled_cn_engines)
+                        setattr(stream, "controlnet_engines", compiled_cn_engines)
                         try:
                             logger.info(f"Compiled/loaded {len(compiled_cn_engines)} ControlNet TensorRT engine(s)")
                         except Exception:
                             pass
                 except Exception:
                     import traceback
+
                     traceback.print_exc()
-                    logger.warning("ControlNet TensorRT engine build step encountered an issue; continuing with PyTorch ControlNet")
+                    logger.warning(
+                        "ControlNet TensorRT engine build step encountered an issue; continuing with PyTorch ControlNet"
+                    )
             except Exception:
                 import traceback
+
                 traceback.print_exc()
                 logger.error("Failed to install ControlNetModule")
                 raise
@@ -2048,24 +2097,30 @@ class StreamDiffusionWrapper:
         # This ensures processors are properly baked into the TensorRT engines
         # After TRT compilation, stream.unet is a UNet2DConditionModelEngine with no attn_processors —
         # skip IP-Adapter install entirely in that case.
-        if use_ipadapter and ipadapter_config and not hasattr(stream, '_ipadapter_module') and hasattr(stream.unet, 'attn_processors'):
+        if (
+            use_ipadapter
+            and ipadapter_config
+            and not hasattr(stream, "_ipadapter_module")
+            and hasattr(stream.unet, "attn_processors")
+        ):
             try:
-                from streamdiffusion.modules.ipadapter_module import IPAdapterModule, IPAdapterConfig, IPAdapterType
+                from streamdiffusion.modules.ipadapter_module import IPAdapterConfig, IPAdapterModule, IPAdapterType
+
                 # Use first config if list provided
                 cfg = ipadapter_config[0] if isinstance(ipadapter_config, list) else ipadapter_config
 
                 # Get adapter type from config
-                ipadapter_type = IPAdapterType(cfg['type'])
+                ipadapter_type = IPAdapterType(cfg["type"])
 
                 ip_cfg = IPAdapterConfig(
-                    style_image_key=cfg.get('style_image_key') or 'ipadapter_main',
-                    num_image_tokens=cfg.get('num_image_tokens', 4),
-                    ipadapter_model_path=cfg['ipadapter_model_path'],
-                    image_encoder_path=cfg['image_encoder_path'],
-                    style_image=cfg.get('style_image'),
-                    scale=cfg.get('scale', 1.0),
+                    style_image_key=cfg.get("style_image_key") or "ipadapter_main",
+                    num_image_tokens=cfg.get("num_image_tokens", 4),
+                    ipadapter_model_path=cfg["ipadapter_model_path"],
+                    image_encoder_path=cfg["image_encoder_path"],
+                    style_image=cfg.get("style_image"),
+                    scale=cfg.get("scale", 1.0),
                     type=ipadapter_type,
-                    insightface_model_name=cfg.get('insightface_model_name'),
+                    insightface_model_name=cfg.get("insightface_model_name"),
                 )
                 ip_module = IPAdapterModule(ip_cfg)
                 _saved_unet_processors_post = {name: proc for name, proc in stream.unet.attn_processors.items()}
@@ -2075,8 +2130,8 @@ class StreamDiffusionWrapper:
 
             except RuntimeError as rt_error:
                 if "size mismatch" in str(rt_error):
-                    unet_dim = getattr(getattr(stream, 'unet', None), 'config', None)
-                    unet_cross_attn = getattr(unet_dim, 'cross_attention_dim', 'unknown') if unet_dim else 'unknown'
+                    unet_dim = getattr(getattr(stream, "unet", None), "config", None)
+                    unet_cross_attn = getattr(unet_dim, "cross_attention_dim", "unknown") if unet_dim else "unknown"
                     logger.warning(
                         f"IP-Adapter weights are incompatible with this model "
                         f"(UNet cross_attention_dim={unet_cross_attn}). "
@@ -2088,12 +2143,14 @@ class StreamDiffusionWrapper:
                         logger.warning(f"Could not restore UNet processors: {restore_err}")
                 else:
                     import traceback
+
                     traceback.print_exc()
                     logger.error("Failed to install IPAdapterModule")
                     raise
 
             except Exception:
                 import traceback
+
                 traceback.print_exc()
                 logger.error("Failed to install IPAdapterModule")
                 raise
@@ -2101,45 +2158,49 @@ class StreamDiffusionWrapper:
         # Note: LoRA weights have already been merged permanently during model loading
 
         # Install pipeline hook modules (Phase 4: Configuration Integration)
-        if image_preprocessing_config and image_preprocessing_config.get('enabled', True):
+        if image_preprocessing_config and image_preprocessing_config.get("enabled", True):
             try:
                 from streamdiffusion.modules.image_processing_module import ImagePreprocessingModule
+
                 img_pre_module = ImagePreprocessingModule()
                 img_pre_module.install(stream)
-                for proc_config in image_preprocessing_config.get('processors', []):
+                for proc_config in image_preprocessing_config.get("processors", []):
                     img_pre_module.add_processor(proc_config)
                 stream._image_preprocessing_module = img_pre_module
             except Exception as e:
                 logger.error(f"Failed to install ImagePreprocessingModule: {e}")
-        
-        if image_postprocessing_config and image_postprocessing_config.get('enabled', True):
+
+        if image_postprocessing_config and image_postprocessing_config.get("enabled", True):
             try:
                 from streamdiffusion.modules.image_processing_module import ImagePostprocessingModule
+
                 img_post_module = ImagePostprocessingModule()
                 img_post_module.install(stream)
-                for proc_config in image_postprocessing_config.get('processors', []):
+                for proc_config in image_postprocessing_config.get("processors", []):
                     img_post_module.add_processor(proc_config)
                 stream._image_postprocessing_module = img_post_module
             except Exception as e:
                 logger.error(f"Failed to install ImagePostprocessingModule: {e}")
-        
-        if latent_preprocessing_config and latent_preprocessing_config.get('enabled', True):
+
+        if latent_preprocessing_config and latent_preprocessing_config.get("enabled", True):
             try:
                 from streamdiffusion.modules.latent_processing_module import LatentPreprocessingModule
+
                 latent_pre_module = LatentPreprocessingModule()
                 latent_pre_module.install(stream)
-                for proc_config in latent_preprocessing_config.get('processors', []):
+                for proc_config in latent_preprocessing_config.get("processors", []):
                     latent_pre_module.add_processor(proc_config)
                 stream._latent_preprocessing_module = latent_pre_module
             except Exception as e:
                 logger.error(f"Failed to install LatentPreprocessingModule: {e}")
-        
-        if latent_postprocessing_config and latent_postprocessing_config.get('enabled', True):
+
+        if latent_postprocessing_config and latent_postprocessing_config.get("enabled", True):
             try:
                 from streamdiffusion.modules.latent_processing_module import LatentPostprocessingModule
+
                 latent_post_module = LatentPostprocessingModule()
                 latent_post_module.install(stream)
-                for proc_config in latent_postprocessing_config.get('processors', []):
+                for proc_config in latent_postprocessing_config.get("processors", []):
                     latent_post_module.add_processor(proc_config)
                 stream._latent_postprocessing_module = latent_post_module
             except Exception as e:
@@ -2150,6 +2211,7 @@ class StreamDiffusionWrapper:
         # Requires Ampere+ (compute 8.0+). Expected gain: 2-5% end-to-end on SD1.5/SD-Turbo.
         try:
             from streamdiffusion.tools.cuda_l2_cache import setup_l2_persistence
+
             setup_l2_persistence(stream.unet)
         except Exception as e:
             logger.debug(f"L2 cache persistence setup skipped: {e}")
@@ -2159,39 +2221,45 @@ class StreamDiffusionWrapper:
     def get_last_processed_image(self, index: int) -> Optional[Image.Image]:
         """Forward get_last_processed_image call to the underlying ControlNet pipeline"""
         if not self.use_controlnet:
-            raise RuntimeError("get_last_processed_image: ControlNet support not enabled. Set use_controlnet=True in constructor.")
+            raise RuntimeError(
+                "get_last_processed_image: ControlNet support not enabled. Set use_controlnet=True in constructor."
+            )
 
         return self.stream.get_last_processed_image(index)
-        
+
     def cleanup_controlnets(self) -> None:
         """Cleanup ControlNet resources including background threads and VRAM"""
         if not self.use_controlnet:
             return
-            
-        if hasattr(self, 'stream') and self.stream and hasattr(self.stream, 'cleanup'):
+
+        if hasattr(self, "stream") and self.stream and hasattr(self.stream, "cleanup"):
             self.stream.cleanup_controlnets()
 
     def update_control_image(self, index: int, image: Union[str, Image.Image, torch.Tensor]) -> None:
         """Update control image for specific ControlNet index"""
         if not self.use_controlnet:
-            raise RuntimeError("update_control_image: ControlNet support not enabled. Set use_controlnet=True in constructor.")
+            raise RuntimeError(
+                "update_control_image: ControlNet support not enabled. Set use_controlnet=True in constructor."
+            )
         if not self.skip_diffusion:
             self.stream._controlnet_module.update_control_image_efficient(image, index=index)
         else:
             logger.debug("update_control_image: Skipping ControlNet update in skip diffusion mode")
 
-    def update_style_image(self, image: Union[str, Image.Image, torch.Tensor], is_stream: bool = False, style_key = "ipadapter_main") -> None:
+    def update_style_image(
+        self, image: Union[str, Image.Image, torch.Tensor], is_stream: bool = False, style_key="ipadapter_main"
+    ) -> None:
         """Update IPAdapter style image"""
         if not self.use_ipadapter:
-            raise RuntimeError("update_style_image: IPAdapter support not enabled. Set use_ipadapter=True in constructor.")
-        
+            raise RuntimeError(
+                "update_style_image: IPAdapter support not enabled. Set use_ipadapter=True in constructor."
+            )
+
         if not self.skip_diffusion:
             self.stream._param_updater.update_style_image(style_key, image, is_stream=is_stream)
         else:
             logger.debug("update_style_image: Skipping IPAdapter update in skip diffusion mode")
-        
-        
-        
+
     def clear_caches(self) -> None:
         """Clear all cached prompt embeddings and seed noise tensors."""
         self.stream._param_updater.clear_caches()
@@ -2218,52 +2286,58 @@ class StreamDiffusionWrapper:
         normalize_seed_weights = updater.get_normalize_seed_weights()
 
         # Core runtime params
-        guidance_scale = getattr(stream, 'guidance_scale', None)
-        delta = getattr(stream, 'delta', None)
-        t_index_list = list(getattr(stream, 't_list', []))
-        current_seed = getattr(stream, 'current_seed', None)
+        guidance_scale = getattr(stream, "guidance_scale", None)
+        delta = getattr(stream, "delta", None)
+        t_index_list = list(getattr(stream, "t_list", []))
+        current_seed = getattr(stream, "current_seed", None)
         num_inference_steps = None
         try:
-            if hasattr(stream, 'timesteps') and stream.timesteps is not None:
+            if hasattr(stream, "timesteps") and stream.timesteps is not None:
                 num_inference_steps = int(len(stream.timesteps))
         except Exception:
             pass
 
         # Resolution and model/pipeline info
         state: Dict[str, Any] = {
-            'width': getattr(stream, 'width', None),
-            'height': getattr(stream, 'height', None),
-            'latent_width': getattr(stream, 'latent_width', None),
-            'latent_height': getattr(stream, 'latent_height', None),
-            'device': getattr(stream, 'device', None).type if hasattr(getattr(stream, 'device', None), 'type') else getattr(stream, 'device', None),
-            'dtype': str(getattr(stream, 'dtype', None)),
-            'model_type': getattr(stream, 'model_type', None),
-            'is_sdxl': getattr(stream, 'is_sdxl', None),
-            'is_turbo': getattr(stream, 'is_turbo', None),
-            'cfg_type': getattr(stream, 'cfg_type', None),
-            'use_denoising_batch': getattr(stream, 'use_denoising_batch', None),
-            'batch_size': getattr(stream, 'batch_size', None),
-            'min_batch_size': getattr(stream, 'min_batch_size', None),
-            'max_batch_size': getattr(stream, 'max_batch_size', None),
+            "width": getattr(stream, "width", None),
+            "height": getattr(stream, "height", None),
+            "latent_width": getattr(stream, "latent_width", None),
+            "latent_height": getattr(stream, "latent_height", None),
+            "device": getattr(stream, "device", None).type
+            if hasattr(getattr(stream, "device", None), "type")
+            else getattr(stream, "device", None),
+            "dtype": str(getattr(stream, "dtype", None)),
+            "model_type": getattr(stream, "model_type", None),
+            "is_sdxl": getattr(stream, "is_sdxl", None),
+            "is_turbo": getattr(stream, "is_turbo", None),
+            "cfg_type": getattr(stream, "cfg_type", None),
+            "use_denoising_batch": getattr(stream, "use_denoising_batch", None),
+            "batch_size": getattr(stream, "batch_size", None),
+            "min_batch_size": getattr(stream, "min_batch_size", None),
+            "max_batch_size": getattr(stream, "max_batch_size", None),
         }
 
         # Blending state
-        state.update({
-            'prompt_list': prompts,
-            'seed_list': seeds,
-            'normalize_prompt_weights': normalize_prompt_weights,
-            'normalize_seed_weights': normalize_seed_weights,
-            'negative_prompt': getattr(updater, '_current_negative_prompt', ""),
-        })
+        state.update(
+            {
+                "prompt_list": prompts,
+                "seed_list": seeds,
+                "normalize_prompt_weights": normalize_prompt_weights,
+                "normalize_seed_weights": normalize_seed_weights,
+                "negative_prompt": getattr(updater, "_current_negative_prompt", ""),
+            }
+        )
 
         # Core runtime knobs
-        state.update({
-            'guidance_scale': guidance_scale,
-            'delta': delta,
-            't_index_list': t_index_list,
-            'current_seed': current_seed,
-            'num_inference_steps': num_inference_steps,
-        })
+        state.update(
+            {
+                "guidance_scale": guidance_scale,
+                "delta": delta,
+                "t_index_list": t_index_list,
+                "current_seed": current_seed,
+                "num_inference_steps": num_inference_steps,
+            }
+        )
 
         # Module configs (ControlNet, IP-Adapter)
         try:
@@ -2276,97 +2350,100 @@ class StreamDiffusionWrapper:
             ipadapter_config = None
         # Hook configs
         try:
-            image_preprocessing_config = updater._get_current_hook_config('image_preprocessing')
+            image_preprocessing_config = updater._get_current_hook_config("image_preprocessing")
         except Exception:
             image_preprocessing_config = []
         try:
-            image_postprocessing_config = updater._get_current_hook_config('image_postprocessing')
+            image_postprocessing_config = updater._get_current_hook_config("image_postprocessing")
         except Exception:
             image_postprocessing_config = []
         try:
-            latent_preprocessing_config = updater._get_current_hook_config('latent_preprocessing')
+            latent_preprocessing_config = updater._get_current_hook_config("latent_preprocessing")
         except Exception:
             latent_preprocessing_config = []
         try:
-            latent_postprocessing_config = updater._get_current_hook_config('latent_postprocessing')
+            latent_postprocessing_config = updater._get_current_hook_config("latent_postprocessing")
         except Exception:
             latent_postprocessing_config = []
-            
-        state.update({
-            'controlnet_config': controlnet_config,
-            'ipadapter_config': ipadapter_config,
-            'image_preprocessing_config': image_preprocessing_config,
-            'image_postprocessing_config': image_postprocessing_config,
-            'latent_preprocessing_config': latent_preprocessing_config,
-            'latent_postprocessing_config': latent_postprocessing_config,
-        })
+
+        state.update(
+            {
+                "controlnet_config": controlnet_config,
+                "ipadapter_config": ipadapter_config,
+                "image_preprocessing_config": image_preprocessing_config,
+                "image_postprocessing_config": image_postprocessing_config,
+                "latent_preprocessing_config": latent_preprocessing_config,
+                "latent_postprocessing_config": latent_postprocessing_config,
+            }
+        )
 
         # Optional caches
         if include_caches:
             try:
-                state['caches'] = updater.get_cache_info()
+                state["caches"] = updater.get_cache_info()
             except Exception:
-                state['caches'] = None
+                state["caches"] = None
 
         return state
-    
+
     def cleanup_gpu_memory(self) -> None:
         """Comprehensive GPU memory cleanup for model switching."""
         import gc
+
         import torch
-        
+
         logger.info("Cleaning up GPU memory...")
-        
+
         # Clear prompt caches
-        if hasattr(self, 'stream') and self.stream:
+        if hasattr(self, "stream") and self.stream:
             try:
                 self.stream._param_updater.clear_caches()
                 logger.info("   Cleared prompt caches")
             except:
                 pass
-        
+
         # Enhanced TensorRT engine cleanup
-        if hasattr(self, 'stream') and self.stream:
+        if hasattr(self, "stream") and self.stream:
             try:
                 # Cleanup UNet TensorRT engine
-                if hasattr(self.stream, 'unet'):
+                if hasattr(self.stream, "unet"):
                     unet_engine = self.stream.unet
                     logger.info("   Cleaning up TensorRT UNet engine...")
-                    
+
                     # Check if it's a TensorRT engine and cleanup properly
-                    if hasattr(unet_engine, 'engine') and hasattr(unet_engine.engine, '__del__'):
+                    if hasattr(unet_engine, "engine") and hasattr(unet_engine.engine, "__del__"):
                         try:
                             # Call the engine's destructor explicitly
                             unet_engine.engine.__del__()
                         except:
                             pass
-                    
+
                     # Clear all engine-related attributes
-                    if hasattr(unet_engine, 'context'):
+                    if hasattr(unet_engine, "context"):
                         try:
                             del unet_engine.context
                         except:
                             pass
-                    if hasattr(unet_engine, 'engine'):
+                    if hasattr(unet_engine, "engine"):
                         try:
                             del unet_engine.engine.engine  # TensorRT runtime engine
                             del unet_engine.engine
                         except:
                             pass
-                    
+
                     del self.stream.unet
                     logger.info("   UNet engine cleanup completed")
-                    
+
                 # Cleanup VAE TensorRT engines
-                if hasattr(self.stream, 'vae'):
+                if hasattr(self.stream, "vae"):
                     vae_engine = self.stream.vae
                     logger.info("   Cleaning up TensorRT VAE engines...")
-                    
+
                     # VAE has encoder and decoder engines
-                    for engine_name in ['vae_encoder', 'vae_decoder']:
+                    for engine_name in ["vae_encoder", "vae_decoder"]:
                         if hasattr(vae_engine, engine_name):
                             engine = getattr(vae_engine, engine_name)
-                            if hasattr(engine, 'engine') and hasattr(engine.engine, '__del__'):
+                            if hasattr(engine, "engine") and hasattr(engine.engine, "__del__"):
                                 try:
                                     engine.engine.__del__()
                                 except:
@@ -2375,12 +2452,12 @@ class StreamDiffusionWrapper:
                                 delattr(vae_engine, engine_name)
                             except:
                                 pass
-                    
+
                     del self.stream.vae
                     logger.info("   VAE engines cleanup completed")
-                
+
                 # Cleanup ControlNet engine pool if it exists
-                if hasattr(self.stream, 'controlnet_engine_pool'):
+                if hasattr(self.stream, "controlnet_engine_pool"):
                     logger.info("   Cleaning up ControlNet engine pool...")
                     try:
                         self.stream.controlnet_engine_pool.cleanup()
@@ -2388,76 +2465,78 @@ class StreamDiffusionWrapper:
                         logger.info("   ControlNet engine pool cleanup completed")
                     except:
                         pass
-                    
+
             except Exception as e:
                 logger.error(f"   TensorRT cleanup warning: {e}")
-        
+
         # Clear the entire stream object to free all models
-        if hasattr(self, 'stream'):
+        if hasattr(self, "stream"):
             try:
                 del self.stream
                 logger.info("   Cleared stream object")
             except:
                 pass
             self.stream = None
-        
+
         # Force multiple garbage collection cycles for thorough cleanup
         for i in range(3):
             gc.collect()
-        
+
         # Clear CUDA cache and cleanup IPC handles
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        
+
         # Force additional memory cleanup
         torch.cuda.ipc_collect()
-        
+
         # Get memory info
         allocated = torch.cuda.memory_allocated() / (1024**3)  # GB
-        cached = torch.cuda.memory_reserved() / (1024**3)     # GB
+        cached = torch.cuda.memory_reserved() / (1024**3)  # GB
         logger.info(f"   GPU Memory after cleanup: {allocated:.2f}GB allocated, {cached:.2f}GB cached")
-        
+
         logger.info("   Enhanced GPU memory cleanup complete")
 
     def check_gpu_memory_for_engine(self, engine_size_gb: float) -> bool:
         """
         Check if there's enough GPU memory to load a TensorRT engine.
-        
+
         Args:
             engine_size_gb: Expected engine size in GB
-            
+
         Returns:
             True if enough memory is available, False otherwise
         """
         if not torch.cuda.is_available():
             return True  # Assume OK if CUDA not available
-        
+
         try:
             # Get current memory status
             allocated = torch.cuda.memory_allocated() / (1024**3)
             cached = torch.cuda.memory_reserved() / (1024**3)
-            
+
             # Get total GPU memory
             total_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
             free_memory = total_memory - allocated
-            
+
             # Add 20% overhead for safety
             required_memory = engine_size_gb * 1.2
-            
-            logger.info(f"GPU Memory Check:")
+
+            logger.info("GPU Memory Check:")
             logger.info(f"   Total: {total_memory:.2f}GB")
-            logger.info(f"   Allocated: {allocated:.2f}GB") 
+            logger.info(f"   Allocated: {allocated:.2f}GB")
             logger.info(f"   Cached: {cached:.2f}GB")
             logger.info(f"   Free: {free_memory:.2f}GB")
             logger.info(f"   Required: {required_memory:.2f}GB (engine: {engine_size_gb:.2f}GB + 20% overhead)")
-            
+
             if free_memory >= required_memory:
-                logger.info(f"   Sufficient memory available")
+                logger.info("   Sufficient memory available")
                 return True
             else:
-                logger.error(f"   Insufficient memory! Need {required_memory:.2f}GB but only {free_memory:.2f}GB available")
+                logger.error(
+                    f"   Insufficient memory! Need {required_memory:.2f}GB but only {free_memory:.2f}GB available"
+                )
                 return False
-                
+
         except Exception as e:
             logger.error(f"   Memory check failed: {e}")
             return True  # Assume OK if check fails
@@ -2465,22 +2544,22 @@ class StreamDiffusionWrapper:
     def cleanup_engines_and_rebuild(self, reduce_batch_size: bool = True, reduce_resolution: bool = False) -> None:
         """
         Clean up TensorRT engines and rebuild with smaller settings to fix OOM issues.
-        
+
         Parameters:
         -----------
         reduce_batch_size : bool
             If True, reduce batch size to 1
-        reduce_resolution : bool  
+        reduce_resolution : bool
             If True, reduce resolution by half
         """
-        import shutil
         import os
-        
+        import shutil
+
         logger.info("Cleaning up engines and rebuilding with smaller settings...")
-        
+
         # Clean up GPU memory first
         self.cleanup_gpu_memory()
-        
+
         # Remove engines directory
         engines_dir = "engines"
         if os.path.exists(engines_dir):
@@ -2489,22 +2568,22 @@ class StreamDiffusionWrapper:
                 logger.info(f"   Removed engines directory: {engines_dir}")
             except Exception as e:
                 logger.error(f"   Failed to remove engines: {e}")
-        
+
         # Reduce settings
         if reduce_batch_size:
-            if hasattr(self, 'batch_size') and self.batch_size > 1:
+            if hasattr(self, "batch_size") and self.batch_size > 1:
                 old_batch = self.batch_size
                 self.batch_size = 1
                 logger.info(f"   Reduced batch size: {old_batch} -> {self.batch_size}")
-            
+
             # Also reduce frame buffer size if needed
-            if hasattr(self, 'frame_buffer_size') and self.frame_buffer_size > 1:
+            if hasattr(self, "frame_buffer_size") and self.frame_buffer_size > 1:
                 old_buffer = self.frame_buffer_size
-                self.frame_buffer_size = 1  
+                self.frame_buffer_size = 1
                 logger.info(f"   Reduced frame buffer size: {old_buffer} -> {self.frame_buffer_size}")
-        
+
         if reduce_resolution:
-            if hasattr(self, 'width') and hasattr(self, 'height'):
+            if hasattr(self, "width") and hasattr(self, "height"):
                 old_width, old_height = self.width, self.height
                 self.width = max(512, self.width // 2)
                 self.height = max(512, self.height // 2)
@@ -2512,5 +2591,5 @@ class StreamDiffusionWrapper:
                 self.width = (self.width // 64) * 64
                 self.height = (self.height // 64) * 64
                 logger.info(f"   Reduced resolution: {old_width}x{old_height} -> {self.width}x{self.height}")
-        
+
         logger.info("   Next model load will rebuild engines with these smaller settings")

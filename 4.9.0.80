@@ -1,0 +1,16 @@
+Looking in indexes: https://pypi.org/simple, https://pypi.ngc.nvidia.com
+Collecting opencv-python-headless
+  Downloading opencv_python_headless-4.13.0.92-cp37-abi3-win_amd64.whl.metadata (20 kB)
+Collecting numpy>=2 (from opencv-python-headless)
+  Downloading numpy-2.4.4-cp311-cp311-win_amd64.whl.metadata (6.6 kB)
+Downloading opencv_python_headless-4.13.0.92-cp37-abi3-win_amd64.whl (40.1 MB)
+   ---------------------------------------- 40.1/40.1 MB 4.4 MB/s  0:00:09
+Downloading numpy-2.4.4-cp311-cp311-win_amd64.whl (12.6 MB)
+   ---------------------------------------- 12.6/12.6 MB 5.8 MB/s  0:00:02
+Installing collected packages: numpy, opencv-python-headless
+  Attempting uninstall: numpy
+    Found existing installation: numpy 1.26.4
+    Uninstalling numpy-1.26.4:
+      Successfully uninstalled numpy-1.26.4
+
+Successfully installed numpy-2.4.4 opencv-python-headless-4.13.0.92

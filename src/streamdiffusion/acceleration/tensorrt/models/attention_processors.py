@@ -2,10 +2,10 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
-
 from diffusers.models.attention_processor import Attention
 from diffusers.utils import USE_PEFT_BACKEND
-    
+
+
 class CachedSTAttnProcessor2_0:
     r"""
     Processor for implementing scaled dot-product attention (enabled by default if you're using PyTorch 2.0).
@@ -14,7 +14,7 @@ class CachedSTAttnProcessor2_0:
     def __init__(self):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
-        
+
     def __call__(
         self,
         attn: Attention,
@@ -106,8 +106,8 @@ class CachedSTAttnProcessor2_0:
             hidden_states = hidden_states + residual
 
         hidden_states = hidden_states / attn.rescale_output_factor
-            
+
         if is_selfattn:
             kvo_cache = torch.stack([curr_key.unsqueeze(0), curr_value.unsqueeze(0)], dim=0)
-                
+
         return hidden_states, kvo_cache

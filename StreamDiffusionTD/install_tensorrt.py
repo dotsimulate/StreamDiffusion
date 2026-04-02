@@ -132,31 +132,16 @@ def install(cu: Optional[str] = None):
     if not is_installed("polygraphy"):
         print("Installing polygraphy...")
         run_pip(
-            "install polygraphy==0.49.24 --extra-index-url https://pypi.ngc.nvidia.com --no-cache-dir"
+            "install polygraphy --extra-index-url https://pypi.ngc.nvidia.com --no-cache-dir"
         )
     if not is_installed("onnx_graphsurgeon"):
         print("Installing onnx-graphsurgeon...")
         run_pip(
-            "install onnx-graphsurgeon==0.5.8 --extra-index-url https://pypi.ngc.nvidia.com --no-cache-dir"
+            "install onnx-graphsurgeon --extra-index-url https://pypi.ngc.nvidia.com --no-cache-dir"
         )
     if platform.system() == "Windows" and not is_installed("pywin32"):
         print("Installing pywin32...")
-        run_pip("install pywin32==306 --no-cache-dir")
-
-    # Pin onnx 1.18 + onnxruntime-gpu 1.24 together:
-    #   - onnx 1.18 exports IR 11; modelopt needs FLOAT4E2M1 added in 1.18
-    #   - onnx 1.19+ exports IR 12 (ORT 1.24 max) and removes float32_to_bfloat16 (onnx-gs needs it)
-    #   - onnxruntime-gpu 1.24 supports IR 11; never co-install CPU onnxruntime (shared files conflict)
-    print("Pinning onnx==1.18.0 + onnxruntime-gpu==1.24.3...")
-    run_pip("install onnx==1.18.0 onnxruntime-gpu==1.24.3 --no-cache-dir")
-
-    # FP8 quantization dependencies (CUDA 12 only)
-    # nvidia-modelopt requires cupy; pin cupy 13.x + numpy<2 for mediapipe compat
-    if cuda_major == "12":
-        print("Installing FP8 quantization dependencies (nvidia-modelopt, cupy, numpy)...")
-        run_pip(
-            'install "nvidia-modelopt[onnx]" "cupy-cuda12x==13.6.0" "numpy==1.26.4" --no-cache-dir'
-        )
+        run_pip("install pywin32 --no-cache-dir")
 
     print("TensorRT installation completed successfully!")
 
