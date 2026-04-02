@@ -143,10 +143,12 @@ def install(cu: Optional[str] = None):
         print("Installing pywin32...")
         run_pip("install pywin32==306 --no-cache-dir")
 
-    # Pin onnx to IR 10 — onnxruntime-gpu 1.22 max supported IR version is 10
-    # (onnx 1.18+ exports IR 11/12 which breaks polygraphy constant folding)
-    print("Pinning onnx==1.17.0 (IR 10 for onnxruntime-gpu 1.22 compatibility)...")
-    run_pip("install onnx==1.17.0 --no-cache-dir")
+    # Pin onnx 1.18 + onnxruntime-gpu 1.24 together:
+    #   - onnx 1.18 exports IR 11; modelopt needs FLOAT4E2M1 added in 1.18
+    #   - onnx 1.19+ exports IR 12 (ORT 1.24 max) and removes float32_to_bfloat16 (onnx-gs needs it)
+    #   - onnxruntime-gpu 1.24 supports IR 11; never co-install CPU onnxruntime (shared files conflict)
+    print("Pinning onnx==1.18.0 + onnxruntime-gpu==1.24.3...")
+    run_pip("install onnx==1.18.0 onnxruntime-gpu==1.24.3 --no-cache-dir")
 
     # FP8 quantization dependencies (CUDA 12 only)
     # nvidia-modelopt requires cupy; pin cupy 13.x + numpy<2 for mediapipe compat
