@@ -187,6 +187,15 @@ def quantize_onnx_fp8(
 
     _onnx.ModelProto.ByteSize = _safe_byte_size
 
+    # modelopt expects {name: ndarray} with calibration samples stacked along axis 0,
+    # not a list of dicts. Merge: [(name: shape)...] → {name: (N, *shape)}
+    if isinstance(calibration_data, list) and calibration_data:
+        merged = {}
+        for name in calibration_data[0]:
+            merged[name] = np.stack([batch[name] for batch in calibration_data if name in batch])
+        calibration_data = merged
+        logger.info(f"[FP8] Merged calibration data: {len(merged)} inputs, {next(iter(merged.values())).shape[0]} samples")
+
     quantize_kwargs = {
         "quantize_mode": "fp8",
         "output_path": onnx_fp8_path,
