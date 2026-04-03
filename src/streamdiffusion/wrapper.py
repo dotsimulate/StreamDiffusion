@@ -350,6 +350,11 @@ class StreamDiffusionWrapper:
             seed=seed,
         )
 
+        # Offload text encoders to CPU after initial encoding to free ~1.6 GB VRAM (SDXL).
+        # They are reloaded on-demand before each prompt re-encoding call.
+        if acceleration == "tensorrt":
+            self._offload_text_encoders()
+
         # Set wrapper reference on parameter updater so it can access pipeline structure
         self.stream._param_updater.wrapper = self
 
@@ -413,13 +418,17 @@ class StreamDiffusionWrapper:
         # Handle both single prompt and prompt blending
         if isinstance(prompt, str):
             # Single prompt mode (legacy interface)
-            self.stream.prepare(
-                prompt,
-                negative_prompt,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                delta=delta,
-            )
+            self._reload_text_encoders()
+            try:
+                self.stream.prepare(
+                    prompt,
+                    negative_prompt,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    delta=delta,
+                )
+            finally:
+                self._offload_text_encoders()
 
             # Apply seed blending if provided
             if seed_list is not None:
@@ -435,15 +444,20 @@ class StreamDiffusionWrapper:
 
             # Prepare with first prompt to initialize the pipeline
             first_prompt = prompt[0][0]
-            self.stream.prepare(
-                first_prompt,
-                negative_prompt,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                delta=delta,
-            )
+            self._reload_text_encoders()
+            try:
+                self.stream.prepare(
+                    first_prompt,
+                    negative_prompt,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    delta=delta,
+                )
+            finally:
+                self._offload_text_encoders()
 
             # Then apply prompt blending (and seed blending if provided)
+            # update_stream_params handles its own reload/offload
             self.update_stream_params(
                 prompt_list=prompt,
                 negative_prompt=negative_prompt,
@@ -454,6 +468,31 @@ class StreamDiffusionWrapper:
 
         else:
             raise TypeError(f"prepare: prompt must be str or List[Tuple[str, float]], got {type(prompt)}")
+
+    def _offload_text_encoders(self) -> None:
+        """Move text encoders to CPU to free VRAM (~1.6 GB for SDXL).
+
+        Called automatically after initial prepare() when using TRT acceleration.
+        Text encoders are reloaded to GPU before each prompt re-encoding call.
+        """
+        pipe = self.stream.pipe
+        if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+            if next(pipe.text_encoder.parameters(), None) is not None:
+                pipe.text_encoder = pipe.text_encoder.to("cpu")
+        if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+            if next(pipe.text_encoder_2.parameters(), None) is not None:
+                pipe.text_encoder_2 = pipe.text_encoder_2.to("cpu")
+        torch.cuda.empty_cache()
+        logger.debug("[VRAM] Text encoders offloaded to CPU")
+
+    def _reload_text_encoders(self) -> None:
+        """Move text encoders back to GPU before prompt re-encoding."""
+        pipe = self.stream.pipe
+        if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
+            pipe.text_encoder = pipe.text_encoder.to(self.device)
+        if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+            pipe.text_encoder_2 = pipe.text_encoder_2.to(self.device)
+        logger.debug("[VRAM] Text encoders reloaded to GPU")
 
     def update_prompt(
         self,
@@ -501,8 +540,12 @@ class StreamDiffusionWrapper:
                 # Clear the blending caches to avoid conflicts
                 self.stream._param_updater.clear_caches()
 
-            # Use the legacy single prompt update
-            self.stream.update_prompt(prompt)
+            # Reload text encoders to GPU for re-encoding, then offload when done.
+            self._reload_text_encoders()
+            try:
+                self.stream.update_prompt(prompt)
+            finally:
+                self._offload_text_encoders()
 
         elif isinstance(prompt, list):
             # Prompt blending mode
@@ -513,7 +556,7 @@ class StreamDiffusionWrapper:
             if len(current_prompts) <= 1 and warn_about_conflicts:
                 logger.warning("update_prompt: Switching from single prompt to prompt blending mode.")
 
-            # Apply prompt blending
+            # Apply prompt blending (update_stream_params handles reload/offload internally)
             self.update_stream_params(
                 prompt_list=prompt,
                 negative_prompt=negative_prompt,
@@ -598,29 +641,37 @@ class StreamDiffusionWrapper:
         safety_checker_threshold : Optional[float]
             The threshold for the safety checker.
         """
-        # Handle all parameters via parameter updater (including ControlNet)
-        self.stream._param_updater.update_stream_params(
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            delta=delta,
-            t_index_list=t_index_list,
-            seed=seed,
-            prompt_list=prompt_list,
-            negative_prompt=negative_prompt,
-            prompt_interpolation_method=prompt_interpolation_method,
-            seed_list=seed_list,
-            seed_interpolation_method=seed_interpolation_method,
-            normalize_prompt_weights=normalize_prompt_weights,
-            normalize_seed_weights=normalize_seed_weights,
-            controlnet_config=controlnet_config,
-            ipadapter_config=ipadapter_config,
-            image_preprocessing_config=image_preprocessing_config,
-            image_postprocessing_config=image_postprocessing_config,
-            latent_preprocessing_config=latent_preprocessing_config,
-            latent_postprocessing_config=latent_postprocessing_config,
-            cache_maxframes=cache_maxframes,
-            cache_interval=cache_interval,
-        )
+        # Reload text encoders to GPU if a new prompt needs encoding.
+        needs_encoding = prompt_list is not None or negative_prompt is not None
+        if needs_encoding:
+            self._reload_text_encoders()
+        try:
+            # Handle all parameters via parameter updater (including ControlNet)
+            self.stream._param_updater.update_stream_params(
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                delta=delta,
+                t_index_list=t_index_list,
+                seed=seed,
+                prompt_list=prompt_list,
+                negative_prompt=negative_prompt,
+                prompt_interpolation_method=prompt_interpolation_method,
+                seed_list=seed_list,
+                seed_interpolation_method=seed_interpolation_method,
+                normalize_prompt_weights=normalize_prompt_weights,
+                normalize_seed_weights=normalize_seed_weights,
+                controlnet_config=controlnet_config,
+                ipadapter_config=ipadapter_config,
+                image_preprocessing_config=image_preprocessing_config,
+                image_postprocessing_config=image_postprocessing_config,
+                latent_preprocessing_config=latent_preprocessing_config,
+                latent_postprocessing_config=latent_postprocessing_config,
+                cache_maxframes=cache_maxframes,
+                cache_interval=cache_interval,
+            )
+        finally:
+            if needs_encoding:
+                self._offload_text_encoders()
         if use_safety_checker is not None:
             self.use_safety_checker = use_safety_checker and (self._acceleration == "tensorrt")
         if safety_checker_threshold is not None:
