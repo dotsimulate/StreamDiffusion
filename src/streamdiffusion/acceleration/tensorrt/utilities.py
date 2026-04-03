@@ -31,6 +31,7 @@ import onnx_graphsurgeon as gs
 import tensorrt as trt
 import torch
 
+
 # cuda-python 13.x renamed 'cudart' to 'cuda.bindings.runtime'
 try:
     from cuda.bindings import runtime as cudart
@@ -242,8 +243,14 @@ class Engine:
         enable_all_tactics=False,
         timing_cache=None,
         workspace_size=0,
+        fp8=False,
     ):
         logger.info(f"Building TensorRT engine for {onnx_path}: {self.engine_path}")
+
+        if fp8:
+            self._build_fp8(onnx_path, input_profile, workspace_size, enable_all_tactics)
+            return
+
         p = Profile()
         if input_profile:
             for name, dims in input_profile.items():
@@ -273,6 +280,77 @@ class Engine:
             save_timing_cache=timing_cache,
         )
         save_engine(engine, path=self.engine_path)
+
+    def _build_fp8(self, onnx_path, input_profile, workspace_size, enable_all_tactics):
+        """
+        Build a TRT engine from a Q/DQ-annotated FP8 ONNX using the raw TRT builder API.
+
+        Polygraphy 0.49.26's CreateConfig does not support fp8=, so we use the raw
+        TensorRT Python API directly. The STRONGLY_TYPED network flag is required to
+        preserve the Q/DQ precision annotations inserted by nvidia-modelopt.
+
+        Args:
+            onnx_path: Path to *.fp8.onnx (Q/DQ-annotated by fp8_quantize.py).
+            input_profile: Dict of {name: (min, opt, max)} shapes.
+            workspace_size: TRT workspace limit in bytes.
+            enable_all_tactics: If True, allow all TRT tactic sources.
+        """
+        TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+
+        builder = trt.Builder(TRT_LOGGER)
+
+        # STRONGLY_TYPED: required for FP8. Tells TRT to use the data-type annotations
+        # from Q/DQ nodes rather than running its own precision heuristics.
+        network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
+        network = builder.create_network(network_flags)
+
+        parser = trt.OnnxParser(network, TRT_LOGGER)
+        success = parser.parse_from_file(onnx_path)
+        if not success:
+            errors = [parser.get_error(i) for i in range(parser.num_errors)]
+            raise RuntimeError(
+                f"TRT ONNX parser failed for FP8 engine: {onnx_path}\n"
+                + "\n".join(str(e) for e in errors)
+            )
+
+        config = builder.create_builder_config()
+        # TRT 10.12+ with STRONGLY_TYPED network: precision flags (FP8, FP16, TF32)
+        # must NOT be set — the Q/DQ node annotations dictate precision directly.
+        # Older TRT versions need both the BuilderFlag and the network flag.
+        if hasattr(trt.BuilderFlag, 'STRONGLY_TYPED'):
+            # TRT < 10.12: set all precision flags + STRONGLY_TYPED on config
+            config.set_flag(trt.BuilderFlag.FP8)
+            config.set_flag(trt.BuilderFlag.FP16)
+            config.set_flag(trt.BuilderFlag.TF32)
+            config.set_flag(trt.BuilderFlag.STRONGLY_TYPED)
+        else:
+            # TRT 10.12+: NetworkDefinitionCreationFlag.STRONGLY_TYPED (line 304)
+            # handles precision; setting FP8 flag causes API Usage Error.
+            pass
+
+        if workspace_size > 0:
+            config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size)
+
+        if input_profile:
+            profile = builder.create_optimization_profile()
+            for name, dims in input_profile.items():
+                assert len(dims) == 3, f"Expected (min, opt, max) for {name}"
+                profile.set_shape(name, min=dims[0], opt=dims[1], max=dims[2])
+            config.add_optimization_profile(profile)
+
+        logger.info(f"[FP8] Building TRT FP8 engine (STRONGLY_TYPED): {self.engine_path}")
+        serialized = builder.build_serialized_network(network, config)
+        if serialized is None:
+            raise RuntimeError(
+                f"TRT FP8 engine build failed for {onnx_path}. "
+                "Check TRT logs above for details."
+            )
+
+        with open(self.engine_path, "wb") as f:
+            f.write(serialized)
+
+        size_bytes = getattr(serialized, 'nbytes', None) or len(serialized)
+        logger.info(f"[FP8] Engine saved: {self.engine_path} ({size_bytes / 1024 / 1024:.0f} MB)")
 
     def load(self):
         logger.info(f"Loading TensorRT engine: {self.engine_path}")
@@ -516,6 +594,7 @@ def build_engine(
     build_dynamic_shape: bool = False,
     build_all_tactics: bool = False,
     build_enable_refit: bool = False,
+    fp8: bool = False,
 ):
     _, free_mem, _ = cudart.cudaMemGetInfo()
     GiB = 2**30
@@ -540,6 +619,7 @@ def build_engine(
         enable_refit=build_enable_refit,
         enable_all_tactics=build_all_tactics,
         workspace_size=max_workspace_size,
+        fp8=fp8,
     )
 
     return engine

@@ -21,6 +21,71 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _restore_dynamic_axes(onnx_fp8_path: str, model_data) -> None:
+    """Restore dynamic dim_param symbols in FP8 ONNX after ModelOpt quantization.
+
+    ModelOpt's override_shapes replaces dim_param with static dim_value for
+    calibration. TRT requires dynamic dims (dim_param) on inputs/outputs to
+    accept optimization profiles (min/opt/max ranges). This reads the original
+    dynamic_axes from model_data and restores them in the FP8 ONNX.
+
+    Uses load_external_data=False so only the small protobuf is loaded/modified,
+    leaving the ~23GB external weight file untouched.
+    """
+    import onnx
+
+    try:
+        dynamic_axes = model_data.get_dynamic_axes()
+    except Exception as e:
+        logger.warning(f"[FP8] Could not get dynamic_axes from model_data: {e}. Skipping restore.")
+        return
+
+    if not dynamic_axes:
+        logger.warning("[FP8] dynamic_axes is empty — skipping dynamic dim restore.")
+        return
+
+    model = onnx.load(onnx_fp8_path, load_external_data=False)
+
+    restored_count = 0
+    for graph_input in model.graph.input:
+        name = graph_input.name
+        if name not in dynamic_axes:
+            continue
+        axes = dynamic_axes[name]
+        dims = graph_input.type.tensor_type.shape.dim
+        for dim_idx, symbolic_name in axes.items():
+            if dim_idx < len(dims):
+                dim = dims[dim_idx]
+                dim.ClearField("dim_value")
+                dim.dim_param = symbolic_name
+                restored_count += 1
+
+    for graph_output in model.graph.output:
+        name = graph_output.name
+        if name not in dynamic_axes:
+            continue
+        axes = dynamic_axes[name]
+        dims = graph_output.type.tensor_type.shape.dim
+        for dim_idx, symbolic_name in axes.items():
+            if dim_idx < len(dims):
+                dim = dims[dim_idx]
+                dim.ClearField("dim_value")
+                dim.dim_param = symbolic_name
+                restored_count += 1
+
+    if restored_count == 0:
+        logger.warning("[FP8] No dynamic dimensions restored — graph inputs may already be dynamic.")
+        return
+
+    # Save only the protobuf (weight data stays in existing external file).
+    # load_external_data=False keeps tensor data_location=EXTERNAL references intact,
+    # so onnx.save() writes a small protobuf that still points to the existing _data file.
+    onnx.save(model, onnx_fp8_path)
+    logger.info(
+        f"[FP8] Restored {restored_count} dynamic dimensions in {os.path.basename(onnx_fp8_path)}"
+    )
+
+
 def generate_unet_calibration_data(
     model_data,
     opt_batch_size: int,
@@ -107,14 +172,19 @@ def generate_unet_calibration_data(
 
             elif name.startswith("kvo_cache_in_"):
                 # KVO cached attention inputs: float16
-                # shape = (2, cache_maxframes, effective_batch, seq_len, hidden_dim)
+                # shape = (2, cache_maxframes, kvo_calib_batch, seq_len, hidden_dim)
+                # dim[0]=2: K/V pair (must match ONNX trace, which always uses 2).
+                # dim[2]: Must equal sample's batch dimension (effective_batch = 2 * opt_batch_size)
+                # because both share the ONNX dynamic axis "2B". Using a different value
+                # causes Concat dimension mismatches in attention layers during calibration.
                 # Zeros = cold cache. Conservative but avoids over-fitting calibration
                 # ranges to cached-attention activation patterns.
                 idx = int(name.rsplit("_", 1)[-1])
                 if idx < len(kvo_cache_shapes):
                     seq_len, hidden_dim = kvo_cache_shapes[idx]
+                    kvo_calib_batch = effective_batch  # Must match sample batch (ONNX axis "2B")
                     batch_data[name] = np.zeros(
-                        (2, cache_maxframes, effective_batch, seq_len, hidden_dim),
+                        (2, cache_maxframes, kvo_calib_batch, seq_len, hidden_dim),
                         dtype=np.float16,
                     )
 
@@ -131,10 +201,14 @@ def generate_unet_calibration_data(
 def quantize_onnx_fp8(
     onnx_opt_path: str,
     onnx_fp8_path: str,
-    calibration_data: List[Dict[str, np.ndarray]],
-    quantize_mha: bool = True,
+    calibration_data: Optional[List[Dict[str, np.ndarray]]] = None,
+    quantize_mha: bool = False,
     percentile: float = 1.0,
     alpha: float = 0.8,
+    model_data=None,
+    opt_batch_size: int = 1,
+    opt_image_height: int = 512,
+    opt_image_width: int = 512,
 ) -> None:
     """
     Insert FP8 Q/DQ nodes into an optimized ONNX model via nvidia-modelopt.
@@ -147,7 +221,7 @@ def quantize_onnx_fp8(
     Args:
         onnx_opt_path: Input FP16 optimized ONNX path (*.opt.onnx).
         onnx_fp8_path: Output FP8 quantized ONNX path (*.fp8.onnx).
-        calibration_data: List of input dicts from generate_unet_calibration_data().
+        calibration_data: Unused. Kept for backward compatibility.
         quantize_mha: Enable FP8 quantization of multi-head attention ops.
                       Recommended: True. Requires TRT 10+ and compute 8.9+.
         percentile: Percentile for activation range calibration.
@@ -155,6 +229,11 @@ def quantize_onnx_fp8(
         alpha: SmoothQuant alpha — balances quantization difficulty between
                activations (alpha→0) and weights (alpha→1). 0.8 is optimal
                for transformer attention layers.
+        model_data: UNet BaseModel instance for building calibration_shapes.
+                    If None, RandomDataProvider defaults all dynamic dims to 1.
+        opt_batch_size: Optimal batch size from TRT profile.
+        opt_image_height: Optimal image height in pixels.
+        opt_image_width: Optimal image width in pixels.
     """
     try:
         from modelopt.onnx.quantization import quantize as modelopt_quantize
@@ -164,12 +243,21 @@ def quantize_onnx_fp8(
             "Install with: pip install 'nvidia-modelopt[onnx]'"
         ) from e
 
+    # Enable verbose ORT logging so Memcpy node details are visible before the
+    # summary warning. Severity 1 = INFO (shows per-node placement decisions).
+    try:
+        import onnxruntime as _ort
+        _ort.set_default_logger_severity(1)
+        logger.info("[FP8] ORT log_severity_level set to 1 (INFO) for Memcpy diagnostics")
+    except Exception:
+        pass
+
     input_size_mb = os.path.getsize(onnx_opt_path) / (1024 * 1024)
     logger.info(f"[FP8] Starting ONNX FP8 quantization")
     logger.info(f"[FP8]   Input:  {onnx_opt_path} ({input_size_mb:.0f} MB)")
     logger.info(f"[FP8]   Output: {onnx_fp8_path}")
     logger.info(f"[FP8]   Config: quantize_mha={quantize_mha}, percentile={percentile}, alpha={alpha}")
-    logger.info(f"[FP8]   Calibration batches: {len(calibration_data)}")
+    logger.info(f"[FP8]   Calibration: RandomDataProvider with calibration_shapes (model_data={'provided' if model_data is not None else 'none'})")
 
     # Patch ByteSize() for >2GB ONNX models: modelopt calls onnx_model.ByteSize()
     # to auto-detect external data format, but protobuf cannot serialize >2GB protos.
@@ -212,68 +300,161 @@ def quantize_onnx_fp8(
             os.environ["PATH"] = os.pathsep.join(_bin_dirs) + os.pathsep + os.environ.get("PATH", "")
             logger.info(f"[FP8] Added {len(_bin_dirs)} NVIDIA DLL dirs to PATH")
 
-    # modelopt's CalibrationDataProvider expects a single dict {name: ndarray} where
-    # each value has exactly the model's input rank. np.stack would add an extra
-    # calibration-sample dimension (rank+1), causing ORT "Invalid rank" errors.
-    # Use first batch — one batch with effective_batch samples is sufficient for FP8
-    # (wider dynamic range than INT8, less sensitive to calibration volume).
-    if isinstance(calibration_data, list) and calibration_data:
-        logger.info(f"[FP8] Using first calibration batch of {len(calibration_data)} ({len(calibration_data[0])} inputs)")
-        calibration_data = calibration_data[0]
+    # Build calibration_shapes string for modelopt's RandomDataProvider.
+    # RandomDataProvider calls _get_tensor_shape() which sets ALL dynamic dims to 1.
+    # For a 512x512 UNet, sample becomes (1,4,1,1) instead of (2,4,64,64), causing
+    # spatial dimension mismatches at UNet skip-connection Concat nodes (up_blocks).
+    # calibration_shapes overrides _get_tensor_shape() per input — only specified
+    # inputs bypass the default-to-1 fallback.
+    #
+    # Format: "input0:d0xd1x...,input1:d0xd1x..." (modelopt parse_shapes_spec format)
+    calibration_shapes_str: Optional[str] = None
+    if model_data is not None:
+        latent_h = opt_image_height // 8
+        latent_w = opt_image_width // 8
+        effective_batch = 2 * opt_batch_size
+        text_maxlen = getattr(model_data, "text_maxlen", 77)
+        embedding_dim = getattr(model_data, "embedding_dim", 2048)
+        # Use cache_maxframes=1 for calibration. The attention processor does:
+        #   kvo_cache[0] → (cache_maxframes, batch, S, H)
+        #   .transpose(0,1).flatten(1,2) → (batch, cache_maxframes*S, H)
+        # With cache_maxframes=4, ONNX shape-computation nodes create Concat ops
+        # that mix dim=4 (cache_maxframes) with dim=2 (batch), causing Concat axis
+        # mismatch errors in ORT. cache_maxframes=1 is valid (within TRT profile
+        # min range) and avoids the conflict. FP8 only needs valid activation ranges.
+        calib_cache_maxframes = 1
+        kvo_cache_shapes = getattr(model_data, "kvo_cache_shapes", [])
+        num_ip_layers = getattr(model_data, "num_ip_layers", 1)
+        control_inputs = getattr(model_data, "control_inputs", {})
+        kvo_calib_batch = effective_batch  # Must match sample batch (ONNX axis "2B")
+
+        shape_parts = []
+        try:
+            input_names = model_data.get_input_names()
+        except Exception:
+            input_names = []
+
+        for name in input_names:
+            if name == "sample":
+                shape_parts.append(f"{name}:{effective_batch}x4x{latent_h}x{latent_w}")
+            elif name == "timestep":
+                shape_parts.append(f"{name}:{effective_batch}")
+            elif name == "encoder_hidden_states":
+                shape_parts.append(f"{name}:{effective_batch}x{text_maxlen}x{embedding_dim}")
+            elif name == "ipadapter_scale":
+                shape_parts.append(f"{name}:{num_ip_layers}")
+            elif name.startswith("input_control_") and name in control_inputs:
+                spec = control_inputs[name]
+                shape_parts.append(
+                    f"{name}:{effective_batch}x{spec['channels']}x{spec['height']}x{spec['width']}"
+                )
+            elif name.startswith("kvo_cache_in_"):
+                idx = int(name.rsplit("_", 1)[-1])
+                if idx < len(kvo_cache_shapes):
+                    seq_len, hidden_dim = kvo_cache_shapes[idx]
+                    shape_parts.append(
+                        f"{name}:2x{calib_cache_maxframes}x{kvo_calib_batch}x{seq_len}x{hidden_dim}"
+                    )
+
+        if shape_parts:
+            calibration_shapes_str = ",".join(shape_parts)
+            logger.info(
+                f"[FP8] calibration_shapes: {len(shape_parts)} inputs "
+                f"(sample={effective_batch}x4x{latent_h}x{latent_w}, "
+                f"kvo={len([p for p in shape_parts if 'kvo_cache_in' in p])} caches "
+                f"calib_frames={calib_cache_maxframes})"
+            )
+    else:
+        logger.warning(
+            "[FP8] model_data not provided — RandomDataProvider will default all "
+            "dynamic dims to 1. UNet Concat nodes may fail for non-trivial models."
+        )
 
     quantize_kwargs = {
         "quantize_mode": "fp8",
         "output_path": onnx_fp8_path,
-        "calibration_data": calibration_data,
         "calibration_method": "percentile",
         "percentile": percentile,
         "alpha": alpha,
         "use_external_data_format": True,
+        # override_shapes replaces dynamic dims in the ONNX model itself with static
+        # values BEFORE any ORT sessions (MHA analysis or calibration) are created.
+        # Without this, ORT's internal shape inference with dynamic dims causes
+        # Concat failures (e.g. KVO cache dims vs sample batch dims).
+        # calibration_shapes additionally tells RandomDataProvider what shapes to
+        # generate for the calibration data.
+        "override_shapes": calibration_shapes_str,
+        "calibration_shapes": calibration_shapes_str,
+        # Use default EPs ["cpu","cuda:0","trt"] — CPU-only would fail on this FP16 SDXL
+        # model because ORT's mandatory CastFloat16Transformer inserts Cast nodes that
+        # conflict with existing Cast nodes in the upsampler conv.
+        # disable_mha_qdq controls modelopt's MHA analysis. When True, MHA MatMul
+        # nodes are excluded from FP8 quantization WITHOUT running ORT inference.
+        # Non-MHA ops (Conv, Linear, LayerNorm) still get FP8 Q/DQ nodes.
+        "disable_mha_qdq": not quantize_mha,
     }
-    if quantize_mha:
-        quantize_kwargs["quantize_mha"] = True
 
     try:
         modelopt_quantize(onnx_opt_path, **quantize_kwargs)
     except TypeError as e:
-        # Older nvidia-modelopt versions may not support alpha / quantize_mha.
+        # Older nvidia-modelopt versions may not support alpha/disable_mha_qdq.
         # Retry with base parameters only.
-        logger.warning(f"[FP8] Retrying without alpha/quantize_mha (TypeError: {e})")
+        logger.warning(f"[FP8] Retrying without alpha/disable_mha_qdq (TypeError: {e})")
         quantize_kwargs.pop("alpha", None)
-        quantize_kwargs.pop("quantize_mha", None)
+        quantize_kwargs.pop("disable_mha_qdq", None)
         modelopt_quantize(onnx_opt_path, **quantize_kwargs)
     except Exception as e:
-        # quantize_mha=True requires an ORT inference run to analyze MHA patterns.
-        # This can fail with rank mismatches (KVO caches have custom shapes) or
-        # when CUDA EP is unavailable. Retry with quantize_mha disabled.
-        if quantize_kwargs.pop("quantize_mha", None):
+        # MHA analysis (disable_mha_qdq=False) requires an ORT inference run that
+        # fails with KVO cached attention models. Retry with disable_mha_qdq=True
+        # to skip the ORT session entirely — MHA layers use FP16, rest uses FP8.
+        if not quantize_kwargs.get("disable_mha_qdq", True):
             # Delete intermediate files written during the failed attempt to free
             # disk space before the retry (each set is ~23GB for SDXL-scale models).
-            _eng_dir = os.path.dirname(onnx_opt_path)
             _base = os.path.splitext(onnx_opt_path)[0]  # strip .onnx
             for _suffix in (
+                "_static.onnx", "_static.onnx_data",          # from override_shapes
                 "_named.onnx", "_named.onnx_data",
                 "_named_extended.onnx", "_named_extended.onnx_data",
                 "_ir10.onnx", "_ir10.onnx_data",
+                "_static_named.onnx", "_static_named.onnx_data",
+                "_static_ir10.onnx", "_static_ir10.onnx_data",
             ):
                 _f = _base + _suffix
                 if os.path.exists(_f):
                     os.remove(_f)
                     logger.info(f"[FP8] Cleaned up intermediate: {os.path.basename(_f)}")
             logger.warning(
-                f"[FP8] quantize_mha=True failed ({type(e).__name__}: {e}). "
-                "Retrying with quantize_mha disabled (MHA layers will use default precision)."
+                f"[FP8] MHA analysis failed ({type(e).__name__}: {e}). "
+                "Retrying with disable_mha_qdq=True (MHA layers will use FP16 precision)."
             )
+            quantize_kwargs["disable_mha_qdq"] = True
             modelopt_quantize(onnx_opt_path, **quantize_kwargs)
         else:
             raise
     finally:
         _onnx.ModelProto.ByteSize = _orig_byte_size  # Restore original method
+        try:
+            import onnxruntime as _ort
+            _ort.set_default_logger_severity(2)  # Restore to WARNING
+        except Exception:
+            pass
 
     if not os.path.exists(onnx_fp8_path):
         raise RuntimeError(
             f"[FP8] Quantization completed but output file not found: {onnx_fp8_path}"
         )
+
+    # --- Restore dynamic axes ---
+    # ModelOpt's override_shapes baked static dim_value into graph inputs for calibration.
+    # TRT needs dynamic dim_param on inputs/outputs to accept optimization profiles.
+    if model_data is not None:
+        try:
+            _restore_dynamic_axes(onnx_fp8_path, model_data)
+        except Exception as restore_err:
+            logger.warning(
+                f"[FP8] Failed to restore dynamic axes: {restore_err}. "
+                "TRT engine build may fail with static shape profile mismatch."
+            )
 
     output_size_mb = os.path.getsize(onnx_fp8_path) / (1024 * 1024)
     ratio = output_size_mb / input_size_mb if input_size_mb > 0 else 0

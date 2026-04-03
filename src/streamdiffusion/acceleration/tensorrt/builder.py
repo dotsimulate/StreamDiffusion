@@ -1,5 +1,6 @@
 import gc
 import json
+import logging
 import os
 import time
 from datetime import datetime, timezone
@@ -15,7 +16,7 @@ from .utilities import (
     optimize_onnx,
 )
 
-import logging
+
 _build_logger = logging.getLogger(__name__)
 
 
@@ -70,6 +71,8 @@ class EngineBuilder:
         force_engine_build: bool = False,
         force_onnx_export: bool = False,
         force_onnx_optimize: bool = False,
+        fp8: bool = False,
+        calibration_data_fn=None,
     ):
         build_total_start = time.perf_counter()
         engine_name = Path(engine_path).parent.name
@@ -145,6 +148,49 @@ class EngineBuilder:
             )
         _build_logger.info(f"Verified ONNX opt file: {onnx_opt_path} ({opt_file_size / (1024**2):.1f} MB)")
 
+        # --- FP8 Quantization (if enabled) ---
+        # Inserts Q/DQ nodes into the optimized ONNX and replaces onnx_opt_path with
+        # the FP8-annotated ONNX for the TRT build step below.
+        onnx_trt_input = onnx_opt_path  # default: use FP16 opt ONNX
+        fp8_trt = fp8  # may be set to False below if FP8 quantization fails
+        if fp8:
+            onnx_fp8_path = onnx_opt_path.replace(".opt.onnx", ".fp8.onnx")
+            if not os.path.exists(onnx_fp8_path):
+                _build_logger.warning(f"[BUILD] FP8 quantization starting...")
+                t0 = time.perf_counter()
+                from .fp8_quantize import quantize_onnx_fp8
+                try:
+                    quantize_onnx_fp8(
+                        onnx_opt_path,
+                        onnx_fp8_path,
+                        model_data=self.model,
+                        opt_batch_size=opt_batch_size,
+                        opt_image_height=opt_image_height,
+                        opt_image_width=opt_image_width,
+                    )
+                    elapsed = time.perf_counter() - t0
+                    stats["stages"]["fp8_quantize"] = {"status": "built", "elapsed_s": round(elapsed, 2)}
+                    _build_logger.warning(f"[BUILD] FP8 quantization ({engine_filename}): {elapsed:.1f}s")
+                    onnx_trt_input = onnx_fp8_path
+                except Exception as fp8_err:
+                    elapsed = time.perf_counter() - t0
+                    _build_logger.warning(
+                        f"[BUILD] FP8 quantization failed after {elapsed:.1f}s: {fp8_err}. "
+                        f"Falling back to FP16 TensorRT engine (onnx_trt_input unchanged)."
+                    )
+                    stats["stages"]["fp8_quantize"] = {
+                        "status": "failed_fallback_fp16",
+                        "elapsed_s": round(elapsed, 2),
+                        "error": str(fp8_err),
+                    }
+                    # onnx_trt_input remains onnx_opt_path (FP16 ONNX)
+                    # Disable FP8 engine build path (avoids STRONGLY_TYPED flag)
+                    fp8_trt = False
+            else:
+                _build_logger.info(f"[BUILD] Found cached FP8 ONNX: {onnx_fp8_path}")
+                stats["stages"]["fp8_quantize"] = {"status": "cached"}
+                onnx_trt_input = onnx_fp8_path
+
         # --- TRT Engine Build ---
         if not force_engine_build and os.path.exists(engine_path):
             print(f"Found cached engine: {engine_path}")
@@ -153,7 +199,7 @@ class EngineBuilder:
             t0 = time.perf_counter()
             build_engine(
                 engine_path=engine_path,
-                onnx_opt_path=onnx_opt_path,
+                onnx_opt_path=onnx_trt_input,
                 model_data=self.model,
                 opt_image_height=opt_image_height,
                 opt_image_width=opt_image_width,
@@ -162,14 +208,16 @@ class EngineBuilder:
                 build_dynamic_shape=build_dynamic_shape,
                 build_all_tactics=build_all_tactics,
                 build_enable_refit=build_enable_refit,
+                fp8=fp8_trt,
             )
             elapsed = time.perf_counter() - t0
             stats["stages"]["trt_build"] = {"status": "built", "elapsed_s": round(elapsed, 2)}
             _build_logger.warning(f"[BUILD] TRT engine build ({engine_filename}): {elapsed:.1f}s")
 
-        # Cleanup ONNX artifacts — tolerate Windows file-lock failures (Issue #4)
+        # Cleanup ONNX artifacts — preserve .fp8.onnx alongside .engine for re-use
+        # Tolerate Windows file-lock failures (Issue #4)
         for file in os.listdir(os.path.dirname(engine_path)):
-            if file.endswith('.engine'):
+            if file.endswith(".engine") or file.endswith(".fp8.onnx"):
                 continue
             try:
                 os.remove(os.path.join(os.path.dirname(engine_path), file))
