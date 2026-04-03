@@ -558,6 +558,8 @@ class UNet(BaseModel):
                 base_axes[name] = {0: "2B", 2: f"H_{spatial_suffix}", 3: f"W_{spatial_suffix}"}
         if self.use_cached_attn:
             # hardcoded resolution for now due to VRAM limitations
+            # NOTE: dim[0]=2 (K/V pair) must stay static — attention Gather nodes
+            # index into it at idx=0 and idx=1, so dim[0]<2 causes OOB errors.
             for i in range(self.kvo_cache_count):
                 base_axes[f"kvo_cache_in_{i}"] = {1: "C", 2: "2B"}
                 base_axes[f"kvo_cache_out_{i}"] = {2: "2B"}
@@ -692,7 +694,7 @@ class UNet(BaseModel):
 
         if self.use_cached_attn:
             for in_name, out_name, shape in zip(
-                self.get_kvo_cache_names("in"), self.get_kvo_cache_names("out"), self.get_kvo_cache_shapes
+                self.get_kvo_cache_names("in"), self.get_kvo_cache_names("out"), self.kvo_cache_shapes
             ):
                 shape_dict[in_name] = (2, self.cache_maxframes, batch_size, shape[0], shape[1])
                 shape_dict[out_name] = (2, 1, batch_size, shape[0], shape[1])

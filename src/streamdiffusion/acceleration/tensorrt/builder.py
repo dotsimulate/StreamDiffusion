@@ -152,26 +152,44 @@ class EngineBuilder:
         # Inserts Q/DQ nodes into the optimized ONNX and replaces onnx_opt_path with
         # the FP8-annotated ONNX for the TRT build step below.
         onnx_trt_input = onnx_opt_path  # default: use FP16 opt ONNX
+        fp8_trt = fp8  # may be set to False below if FP8 quantization fails
         if fp8:
             onnx_fp8_path = onnx_opt_path.replace(".opt.onnx", ".fp8.onnx")
             if not os.path.exists(onnx_fp8_path):
-                if calibration_data_fn is None:
-                    raise ValueError(
-                        "fp8=True requires calibration_data_fn to generate calibration data. "
-                        "Pass a callable that returns List[Dict[str, np.ndarray]]."
-                    )
                 _build_logger.warning(f"[BUILD] FP8 quantization starting...")
                 t0 = time.perf_counter()
                 from .fp8_quantize import quantize_onnx_fp8
-                calibration_data = calibration_data_fn()
-                quantize_onnx_fp8(onnx_opt_path, onnx_fp8_path, calibration_data)
-                elapsed = time.perf_counter() - t0
-                stats["stages"]["fp8_quantize"] = {"status": "built", "elapsed_s": round(elapsed, 2)}
-                _build_logger.warning(f"[BUILD] FP8 quantization ({engine_filename}): {elapsed:.1f}s")
+                try:
+                    quantize_onnx_fp8(
+                        onnx_opt_path,
+                        onnx_fp8_path,
+                        model_data=self.model,
+                        opt_batch_size=opt_batch_size,
+                        opt_image_height=opt_image_height,
+                        opt_image_width=opt_image_width,
+                    )
+                    elapsed = time.perf_counter() - t0
+                    stats["stages"]["fp8_quantize"] = {"status": "built", "elapsed_s": round(elapsed, 2)}
+                    _build_logger.warning(f"[BUILD] FP8 quantization ({engine_filename}): {elapsed:.1f}s")
+                    onnx_trt_input = onnx_fp8_path
+                except Exception as fp8_err:
+                    elapsed = time.perf_counter() - t0
+                    _build_logger.warning(
+                        f"[BUILD] FP8 quantization failed after {elapsed:.1f}s: {fp8_err}. "
+                        f"Falling back to FP16 TensorRT engine (onnx_trt_input unchanged)."
+                    )
+                    stats["stages"]["fp8_quantize"] = {
+                        "status": "failed_fallback_fp16",
+                        "elapsed_s": round(elapsed, 2),
+                        "error": str(fp8_err),
+                    }
+                    # onnx_trt_input remains onnx_opt_path (FP16 ONNX)
+                    # Disable FP8 engine build path (avoids STRONGLY_TYPED flag)
+                    fp8_trt = False
             else:
                 _build_logger.info(f"[BUILD] Found cached FP8 ONNX: {onnx_fp8_path}")
                 stats["stages"]["fp8_quantize"] = {"status": "cached"}
-            onnx_trt_input = onnx_fp8_path
+                onnx_trt_input = onnx_fp8_path
 
         # --- TRT Engine Build ---
         if not force_engine_build and os.path.exists(engine_path):
@@ -190,7 +208,7 @@ class EngineBuilder:
                 build_dynamic_shape=build_dynamic_shape,
                 build_all_tactics=build_all_tactics,
                 build_enable_refit=build_enable_refit,
-                fp8=fp8,
+                fp8=fp8_trt,
             )
             elapsed = time.perf_counter() - t0
             stats["stages"]["trt_build"] = {"status": "built", "elapsed_s": round(elapsed, 2)}

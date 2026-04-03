@@ -314,10 +314,19 @@ class Engine:
             )
 
         config = builder.create_builder_config()
-        config.set_flag(trt.BuilderFlag.FP8)
-        config.set_flag(trt.BuilderFlag.FP16)   # FP16 fallback for non-quantized ops
-        config.set_flag(trt.BuilderFlag.TF32)
-        config.set_flag(trt.BuilderFlag.STRONGLY_TYPED)
+        # TRT 10.12+ with STRONGLY_TYPED network: precision flags (FP8, FP16, TF32)
+        # must NOT be set — the Q/DQ node annotations dictate precision directly.
+        # Older TRT versions need both the BuilderFlag and the network flag.
+        if hasattr(trt.BuilderFlag, 'STRONGLY_TYPED'):
+            # TRT < 10.12: set all precision flags + STRONGLY_TYPED on config
+            config.set_flag(trt.BuilderFlag.FP8)
+            config.set_flag(trt.BuilderFlag.FP16)
+            config.set_flag(trt.BuilderFlag.TF32)
+            config.set_flag(trt.BuilderFlag.STRONGLY_TYPED)
+        else:
+            # TRT 10.12+: NetworkDefinitionCreationFlag.STRONGLY_TYPED (line 304)
+            # handles precision; setting FP8 flag causes API Usage Error.
+            pass
 
         if workspace_size > 0:
             config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size)
@@ -340,7 +349,8 @@ class Engine:
         with open(self.engine_path, "wb") as f:
             f.write(serialized)
 
-        logger.info(f"[FP8] Engine saved: {self.engine_path} ({len(serialized) / 1024 / 1024:.0f} MB)")
+        size_bytes = getattr(serialized, 'nbytes', None) or len(serialized)
+        logger.info(f"[FP8] Engine saved: {self.engine_path} ({size_bytes / 1024 / 1024:.0f} MB)")
 
     def load(self):
         logger.info(f"Loading TensorRT engine: {self.engine_path}")
