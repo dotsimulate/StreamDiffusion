@@ -375,7 +375,8 @@ def set_trt_persistent_cache(unet, persist_mb: int = L2_PERSIST_MB) -> bool:
     if not hasattr(context, "persistent_cache_limit"):
         return False
 
-    persist_bytes = persist_mb * 1024 * 1024
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    persist_bytes = min(persist_mb * 1024 * 1024, props.L2_cache_size // 2)
     try:
         context.persistent_cache_limit = persist_bytes
         actual = context.persistent_cache_limit
