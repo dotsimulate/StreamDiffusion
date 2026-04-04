@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from diffusers.models.attention_processor import Attention
 from diffusers.utils import USE_PEFT_BACKEND
-    
+
 class CachedSTAttnProcessor2_0:
     r"""
     Processor for implementing scaled dot-product attention (enabled by default if you're using PyTorch 2.0).
@@ -14,7 +14,37 @@ class CachedSTAttnProcessor2_0:
     def __init__(self):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
-        
+
+        # Pre-allocated buffers for zero-alloc hot path (lazy init on first call).
+        # _use_prealloc is False by default so ONNX export tracing uses the original
+        # clone/contiguous path. Set to True by wrapper.py after engine build.
+        self._curr_key_buf: Optional[torch.Tensor] = None
+        self._curr_value_buf: Optional[torch.Tensor] = None
+        self._cached_key_tr_buf: Optional[torch.Tensor] = None    # transposed cache key
+        self._cached_value_tr_buf: Optional[torch.Tensor] = None  # transposed cache value
+        self._kvo_out_buf: Optional[torch.Tensor] = None          # (2, 1, B, S, H)
+        self._use_prealloc: bool = False
+
+    def _ensure_buffers(
+        self,
+        key: torch.Tensor,
+        cached_key: Optional[torch.Tensor],
+    ) -> None:
+        """Lazy-allocate or re-allocate buffers if tensor shapes changed."""
+        if self._curr_key_buf is None or self._curr_key_buf.shape != key.shape:
+            B, S, H = key.shape
+            self._curr_key_buf = torch.empty_like(key)
+            self._curr_value_buf = torch.empty_like(key)
+            self._kvo_out_buf = torch.empty(2, 1, B, S, H, dtype=key.dtype, device=key.device)
+
+        if cached_key is not None:
+            # cached_key shape: (maxframes, batch, seq_len, hidden_dim)
+            # transposed target shape: (batch, maxframes, seq_len, hidden_dim)
+            tr_shape = (cached_key.shape[1], cached_key.shape[0], cached_key.shape[2], cached_key.shape[3])
+            if self._cached_key_tr_buf is None or self._cached_key_tr_buf.shape != tr_shape:
+                self._cached_key_tr_buf = torch.empty(tr_shape, dtype=cached_key.dtype, device=cached_key.device)
+                self._cached_value_tr_buf = torch.empty(tr_shape, dtype=cached_key.dtype, device=cached_key.device)
+
     def __call__(
         self,
         attn: Attention,
@@ -68,14 +98,34 @@ class CachedSTAttnProcessor2_0:
             cached_key, cached_value = None, None
 
         if is_selfattn:
-            curr_key = key.clone()
-            curr_value = value.clone()
+            if self._use_prealloc:
+                # Zero-alloc hot path: copy into pre-allocated buffers
+                self._ensure_buffers(key, cached_key)
 
-            if cached_key is not None:
-                cached_key_reshaped = cached_key.transpose(0, 1).contiguous().flatten(1, 2)
-                cached_value_reshaped = cached_value.transpose(0, 1).contiguous().flatten(1, 2)
-                key = torch.cat([curr_key, cached_key_reshaped], dim=1)
-                value = torch.cat([curr_value, cached_value_reshaped], dim=1)
+                self._curr_key_buf.copy_(key)
+                self._curr_value_buf.copy_(value)
+                curr_key = self._curr_key_buf
+                curr_value = self._curr_value_buf
+
+                if cached_key is not None:
+                    # transpose(0,1) makes non-contiguous; copy into contiguous buffer
+                    self._cached_key_tr_buf.copy_(cached_key.transpose(0, 1))
+                    self._cached_value_tr_buf.copy_(cached_value.transpose(0, 1))
+                    # flatten is a free view on already-contiguous buffer
+                    cached_key_reshaped = self._cached_key_tr_buf.flatten(1, 2)
+                    cached_value_reshaped = self._cached_value_tr_buf.flatten(1, 2)
+                    key = torch.cat([curr_key, cached_key_reshaped], dim=1)
+                    value = torch.cat([curr_value, cached_value_reshaped], dim=1)
+            else:
+                # Original path — used during ONNX export tracing
+                curr_key = key.clone()
+                curr_value = value.clone()
+
+                if cached_key is not None:
+                    cached_key_reshaped = cached_key.transpose(0, 1).contiguous().flatten(1, 2)
+                    cached_value_reshaped = cached_value.transpose(0, 1).contiguous().flatten(1, 2)
+                    key = torch.cat([curr_key, cached_key_reshaped], dim=1)
+                    value = torch.cat([curr_value, cached_value_reshaped], dim=1)
 
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads
@@ -106,8 +156,14 @@ class CachedSTAttnProcessor2_0:
             hidden_states = hidden_states + residual
 
         hidden_states = hidden_states / attn.rescale_output_factor
-            
+
         if is_selfattn:
-            kvo_cache = torch.stack([curr_key.unsqueeze(0), curr_value.unsqueeze(0)], dim=0)
-                
+            if self._use_prealloc:
+                # Write curr K/V into pre-allocated output buffer — zero alloc
+                self._kvo_out_buf[0, 0].copy_(curr_key)
+                self._kvo_out_buf[1, 0].copy_(curr_value)
+                kvo_cache = self._kvo_out_buf
+            else:
+                kvo_cache = torch.stack([curr_key.unsqueeze(0), curr_value.unsqueeze(0)], dim=0)
+
         return hidden_states, kvo_cache

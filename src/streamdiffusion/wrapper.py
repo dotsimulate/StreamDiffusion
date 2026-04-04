@@ -1757,6 +1757,12 @@ class StreamDiffusionWrapper:
                         if name.endswith("attn1.processor") and not isinstance(processor, CachedSTAttnProcessor2_0):
                             processors[name] = CachedSTAttnProcessor2_0()
                     stream.unet.set_attn_processor(processors)
+                    # Enable pre-allocated buffers for runtime — ONNX export already completed above,
+                    # so the original clone/contiguous path was used for tracing. From here on, the
+                    # processors run only at Python runtime (non-TRT paths) and buffer reuse is safe.
+                    for proc in stream.unet.attn_processors.values():
+                        if isinstance(proc, CachedSTAttnProcessor2_0):
+                            proc._use_prealloc = True
 
                 # Compile VAE decoder engine using EngineManager
                 vae_decoder_model = VAE(
