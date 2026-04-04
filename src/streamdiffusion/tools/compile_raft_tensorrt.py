@@ -144,7 +144,7 @@ def build_tensorrt_engine(
     
     try:
         builder = trt.Builder(trt.Logger(trt.Logger.INFO))
-        network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+        network = builder.create_network()  # EXPLICIT_BATCH deprecated/ignored in TRT 10.x
         parser = trt.OnnxParser(network, trt.Logger(trt.Logger.WARNING))
         
         logger.info("Parsing ONNX model...")

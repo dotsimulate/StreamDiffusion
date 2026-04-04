@@ -307,7 +307,7 @@ class RealESRGANProcessor(BasePreprocessor):
         try:
             # Create builder and network
             builder = trt.Builder(trt.Logger(trt.Logger.WARNING))
-            network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+            network = builder.create_network()  # EXPLICIT_BATCH deprecated/ignored in TRT 10.x
             parser = trt.OnnxParser(network, trt.Logger(trt.Logger.WARNING))
             
             # Parse ONNX model
