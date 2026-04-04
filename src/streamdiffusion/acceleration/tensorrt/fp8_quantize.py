@@ -223,9 +223,10 @@ def quantize_onnx_fp8(
         onnx_fp8_path: Output FP8 quantized ONNX path (*.fp8.onnx).
         calibration_data: Unused. Kept for backward compatibility.
         quantize_mha: Enable FP8 quantization of multi-head attention ops.
-                      Recommended: True. Requires TRT 10+ and compute 8.9+.
-        percentile: Percentile for activation range calibration.
-                    1.0 = no clipping (safest for first run).
+                      Kept False — MHA analysis via ORT inference adds ~3 hours to build.
+                      Non-MHA ops (Conv, Gemm, MatMul outside MHA) are still FP8.
+        percentile: Unused. Kept for backward compatibility (entropy calibration
+                    does not use percentile clipping).
         alpha: SmoothQuant alpha — balances quantization difficulty between
                activations (alpha→0) and weights (alpha→1). 0.8 is optimal
                for transformer attention layers.
@@ -256,7 +257,7 @@ def quantize_onnx_fp8(
     logger.info(f"[FP8] Starting ONNX FP8 quantization")
     logger.info(f"[FP8]   Input:  {onnx_opt_path} ({input_size_mb:.0f} MB)")
     logger.info(f"[FP8]   Output: {onnx_fp8_path}")
-    logger.info(f"[FP8]   Config: quantize_mha={quantize_mha}, percentile={percentile}, alpha={alpha}")
+    logger.info(f"[FP8]   Config: quantize_mha={quantize_mha}, calibration=entropy, alpha={alpha}")
     logger.info(f"[FP8]   Calibration: RandomDataProvider with calibration_shapes (model_data={'provided' if model_data is not None else 'none'})")
 
     # Patch ByteSize() for >2GB ONNX models: modelopt calls onnx_model.ByteSize()
@@ -373,8 +374,10 @@ def quantize_onnx_fp8(
     quantize_kwargs = {
         "quantize_mode": "fp8",
         "output_path": onnx_fp8_path,
-        "calibration_method": "percentile",
-        "percentile": percentile,
+        # entropy: minimizes KL divergence to find optimal clipping point for each tensor.
+        # Better than percentile=1.0 (no clipping) which allows outliers to stretch the
+        # quantization range, reducing precision for the bulk of activations.
+        "calibration_method": "entropy",
         "alpha": alpha,
         "use_external_data_format": True,
         # override_shapes replaces dynamic dims in the ONNX model itself with static
@@ -388,20 +391,23 @@ def quantize_onnx_fp8(
         # Use default EPs ["cpu","cuda:0","trt"] — CPU-only would fail on this FP16 SDXL
         # model because ORT's mandatory CastFloat16Transformer inserts Cast nodes that
         # conflict with existing Cast nodes in the upsampler conv.
-        # disable_mha_qdq controls modelopt's MHA analysis. When True, MHA MatMul
-        # nodes are excluded from FP8 quantization WITHOUT running ORT inference.
-        # Non-MHA ops (Conv, Linear, LayerNorm) still get FP8 Q/DQ nodes.
+        # disable_mha_qdq=True: skip MHA pattern analysis (avoids 3-hour ORT inference
+        # pass over the full model graph). Non-MHA ops (Conv, Gemm, MatMul outside MHA)
+        # still get FP8 Q/DQ nodes via the normal KGEN/CASK path.
         "disable_mha_qdq": not quantize_mha,
+        # calibrate_per_node: calibrate one node at a time to reduce peak VRAM during
+        # calibration. Essential for large UNets (83 inputs, 7993 nodes) to avoid OOM.
+        "calibrate_per_node": True,
     }
 
     try:
         modelopt_quantize(onnx_opt_path, **quantize_kwargs)
     except TypeError as e:
-        # Older nvidia-modelopt versions may not support alpha/disable_mha_qdq.
-        # Retry with base parameters only.
-        logger.warning(f"[FP8] Retrying without alpha/disable_mha_qdq (TypeError: {e})")
-        quantize_kwargs.pop("alpha", None)
-        quantize_kwargs.pop("disable_mha_qdq", None)
+        # Older nvidia-modelopt versions may not support newer kwargs.
+        # Strip down to base parameters and retry.
+        logger.warning(f"[FP8] Retrying with reduced kwargs (TypeError: {e})")
+        for _k in ("alpha", "disable_mha_qdq", "calibrate_per_node"):
+            quantize_kwargs.pop(_k, None)
         modelopt_quantize(onnx_opt_path, **quantize_kwargs)
     except Exception as e:
         # MHA analysis (disable_mha_qdq=False) requires an ORT inference run that

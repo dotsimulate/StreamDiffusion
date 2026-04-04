@@ -22,7 +22,9 @@ import gc
 
 # Set up logger for this module
 import logging
+import os
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Optional, Union
 
 import numpy as np
@@ -40,14 +42,7 @@ except ImportError:
 from PIL import Image
 from polygraphy import cuda
 from polygraphy.backend.common import bytes_from_path
-from polygraphy.backend.trt import (
-    CreateConfig,
-    Profile,
-    engine_from_bytes,
-    engine_from_network,
-    network_from_onnx_path,
-    save_engine,
-)
+from polygraphy.backend.trt import engine_from_bytes
 
 from .models.models import CLIP, VAE, BaseModel, UNet, VAEEncoder
 
@@ -57,6 +52,244 @@ logger = logging.getLogger(__name__)
 TRT_LOGGER = trt.Logger(trt.Logger.ERROR)
 
 from ...model_detection import detect_model
+
+
+# ---------------------------------------------------------------------------
+# GPU Hardware Profile — hardware-aware TRT builder configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GPUBuildProfile:
+    """
+    Hardware-aware TRT builder configuration derived from CUDA device properties.
+
+    All parameters are auto-selected based on GPU architecture tier:
+      - Ampere  (CC 8.0–8.8): Conservative — small L2, preserve VRAM
+      - Ada     (CC 8.9):      Balanced   — large L2, benefit from deeper tiling/opt
+      - Blackwell (CC 12.0+):  Aggressive — massive L2, max search depth
+    """
+    gpu_name: str
+    compute_capability: tuple
+    l2_cache_bytes: int
+    vram_bytes: int
+    sm_count: int
+    tier: str  # "ampere", "ada", "blackwell", "unknown"
+
+    # IBuilderConfig parameters
+    builder_optimization_level: int     # 0–5; higher = better kernels, longer build
+    tiling_optimization_level: str      # "NONE"/"FAST"/"MODERATE"/"FULL"
+    l2_limit_for_tiling: int            # bytes; target L2 budget for tiling
+    max_aux_streams: int                # reserved; NOT applied (TRT heuristic is better)
+    sparse_weights: bool                # examine weights for 2:4 sparsity (Ampere+)
+    enable_runtime_activation_resize: bool  # RUNTIME_ACTIVATION_RESIZE_10_10
+    max_workspace_cap_bytes: int        # hard cap on workspace (before free-mem calc)
+
+
+def detect_gpu_profile(device: int = 0) -> GPUBuildProfile:
+    """
+    Detect the current GPU and return hardware-optimal TRT builder parameters.
+
+    Called once at the start of every engine build so that all IBuilderConfig
+    settings are tuned to the exact GPU running the build.
+
+    Tiers and rationale
+    -------------------
+    Ampere (CC 8.0–8.8, e.g. RTX 3090 — 6 MiB L2, 82 SMs):
+      - Opt level 4: always compiles dynamic kernels (better than level-3 heuristics)
+      - Tiling FAST (static shapes only): small L2 gains little from deep search
+      - 8 GiB workspace cap: conserve VRAM on 24 GB cards
+
+    Ada Lovelace (CC 8.9, e.g. RTX 4090 — 72 MiB L2, 128 SMs):
+      - Opt level 4: dynamic kernels without level-5 profiling OOM risk
+      - Tiling MODERATE (static shapes only): 12× more L2 makes tiling worthwhile
+      - 12 GiB workspace cap
+
+    Blackwell (CC 12.0+, e.g. RTX 5090 — 128 MiB L2, ~170 SMs):
+      - Opt level 4: same rationale — level 5 causes OOM during tactic profiling
+      - Tiling FULL (static shapes only): massive L2 warrants widest search
+      - 16 GiB workspace cap
+
+    Note: tiling_optimization_level and l2_limit_for_tiling are only effective for
+    static-shape engines. TRT confirms: "Graph contains symbolic shape, l2tc doesn't
+    take effect." For dynamic-shape builds (our default), these are skipped entirely
+    to avoid warning spam and wasted build time.
+
+    max_aux_streams is NOT set — TRT's own heuristic is better than a fixed value.
+    Setting it explicitly causes "[MS] Multi stream is disabled" warnings on simple
+    models (VAE) without proven benefit on complex ones (UNet).
+    """
+    try:
+        props = torch.cuda.get_device_properties(device)
+    except Exception as e:
+        logger.warning(f"[TRT Build] Could not query GPU properties: {e} — using fallback profile")
+        return _fallback_profile()
+
+    cc = (props.major, props.minor)
+    l2 = props.L2_cache_size
+    vram = props.total_memory
+    sms = props.multi_processor_count
+
+    # --- Tier selection ---
+    # opt_level=4 for all tiers: always compiles dynamic kernels (better than
+    # level-3 heuristics) without level-5's "compare dynamic vs static" extra pass
+    # which OOMs during tactic profiling on dynamic-shape engines (160 GiB request).
+    if cc >= (12, 0):
+        tier = "blackwell"
+        opt_level = 4
+        tiling = "FULL"
+        max_ws_cap = 16 * (2 ** 30)   # 16 GiB cap
+    elif cc >= (8, 9):                 # Ada Lovelace (8.9 exactly)
+        tier = "ada"
+        opt_level = 4
+        tiling = "MODERATE"
+        max_ws_cap = 12 * (2 ** 30)   # 12 GiB cap
+    elif cc >= (8, 0):                 # Ampere (8.0 – 8.8)
+        tier = "ampere"
+        opt_level = 4
+        tiling = "FAST"
+        max_ws_cap = 8 * (2 ** 30)    # 8 GiB cap
+    else:
+        # Pre-Ampere or unknown — use conservative defaults
+        tier = "unknown"
+        opt_level = 3
+        tiling = "NONE"
+        max_ws_cap = 8 * (2 ** 30)
+
+    profile = GPUBuildProfile(
+        gpu_name=props.name,
+        compute_capability=cc,
+        l2_cache_bytes=l2,
+        vram_bytes=vram,
+        sm_count=sms,
+        tier=tier,
+        builder_optimization_level=opt_level,
+        tiling_optimization_level=tiling,
+        l2_limit_for_tiling=l2,        # use full L2 as tiling budget (static builds only)
+        max_aux_streams=0,              # 0 = let TRT decide (avoids "[MS] disabled" spam)
+        sparse_weights=True,            # always examine; no downside if not sparse
+        enable_runtime_activation_resize=True,
+        max_workspace_cap_bytes=max_ws_cap,
+    )
+
+    logger.info(
+        f"[TRT Build] GPU detected: {props.name} | "
+        f"CC {cc[0]}.{cc[1]} | Tier: {tier} | "
+        f"L2: {l2 // (1024 * 1024)} MiB | VRAM: {vram // (1024 ** 3)} GiB | "
+        f"opt_level={opt_level}"
+    )
+    return profile
+
+
+def _fallback_profile() -> GPUBuildProfile:
+    """Conservative fallback when GPU detection fails."""
+    return GPUBuildProfile(
+        gpu_name="unknown",
+        compute_capability=(8, 0),
+        l2_cache_bytes=6 * 1024 * 1024,
+        vram_bytes=24 * (2 ** 30),
+        sm_count=82,
+        tier="unknown",
+        builder_optimization_level=3,
+        tiling_optimization_level="NONE",
+        l2_limit_for_tiling=6 * 1024 * 1024,
+        max_aux_streams=0,              # reserved; NOT applied
+        sparse_weights=False,
+        enable_runtime_activation_resize=True,
+        max_workspace_cap_bytes=8 * (2 ** 30),
+    )
+
+
+def _apply_gpu_profile_to_config(
+    config: "trt.IBuilderConfig",
+    gpu_profile: Optional[GPUBuildProfile],
+    dynamic_shapes: bool = True,
+) -> None:
+    """
+    Apply hardware-aware IBuilderConfig parameters that Polygraphy does not expose.
+
+    Called for both FP16 and FP8 builds after the config object is created.
+    All settings gracefully degrade if the TRT version doesn't support a feature.
+
+    Args:
+        config: TRT IBuilderConfig to modify.
+        gpu_profile: Hardware-detected build parameters from detect_gpu_profile().
+        dynamic_shapes: Whether this engine uses dynamic input shapes.
+            - True  (default): tiling and l2_limit skipped — TRT confirms these have
+              no effect on symbolic-shape graphs and only produce warning spam.
+            - False (static): tiling and l2_limit applied for full L2 cache benefit.
+    """
+    if gpu_profile is None:
+        return
+
+    # builder_optimization_level (0–5):
+    #   4 = always compiles dynamic kernels (better than level-3 heuristics)
+    #   5 = additionally compares dynamic vs static kernels — causes OOM during
+    #       tactic profiling on dynamic-shape engines (160 GiB requests observed).
+    # We use level 4 for all tiers to get the dynamic-kernel benefit without the
+    # level-5 exhaustive comparison that OOMs.
+    try:
+        config.builder_optimization_level = gpu_profile.builder_optimization_level
+        logger.info(f"[TRT Config] builder_optimization_level={gpu_profile.builder_optimization_level}")
+    except AttributeError:
+        logger.debug("[TRT Config] builder_optimization_level not supported — skipping")
+
+    # tiling_optimization_level + l2_limit_for_tiling:
+    # TRT's L2 tiling cache optimization requires static/concrete shapes to work.
+    # For dynamic-shape engines, TRT emits: "Graph contains symbolic shape, l2tc
+    # doesn't take effect" for every applicable layer — pure warning spam with zero
+    # benefit. Skipped when dynamic_shapes=True.
+    if not dynamic_shapes and gpu_profile.tiling_optimization_level != "NONE":
+        try:
+            tiling_map = {
+                "NONE": trt.TilingOptimizationLevel.NONE,
+                "FAST": trt.TilingOptimizationLevel.FAST,
+                "MODERATE": trt.TilingOptimizationLevel.MODERATE,
+                "FULL": trt.TilingOptimizationLevel.FULL,
+            }
+            tiling_level = tiling_map.get(gpu_profile.tiling_optimization_level, trt.TilingOptimizationLevel.NONE)
+            config.tiling_optimization_level = tiling_level
+            logger.info(f"[TRT Config] tiling_optimization_level={gpu_profile.tiling_optimization_level}")
+        except AttributeError:
+            logger.debug("[TRT Config] tiling_optimization_level not supported — skipping")
+
+        try:
+            if gpu_profile.l2_limit_for_tiling > 0:
+                config.l2_limit_for_tiling = gpu_profile.l2_limit_for_tiling
+                logger.info(
+                    f"[TRT Config] l2_limit_for_tiling={gpu_profile.l2_limit_for_tiling // (1024 * 1024)} MiB"
+                )
+        except AttributeError:
+            logger.debug("[TRT Config] l2_limit_for_tiling not supported — skipping")
+    elif dynamic_shapes:
+        logger.debug(
+            "[TRT Config] tiling_optimization_level/l2_limit skipped — dynamic shapes "
+            "(would produce '[l2tc] VALIDATE FAIL' warnings with no effect)"
+        )
+
+    # max_aux_streams: NOT SET — let TRT use its own heuristic.
+    # Setting an explicit value causes "[MS] Multi stream is disabled" warnings on
+    # any model where TRT can't assign that many streams (e.g. VAE decoder which is
+    # too sequential). TRT's heuristic silently chooses the right value per model.
+
+    # SPARSE_WEIGHTS: let TRT examine weight tensors for structured 2:4 sparsity
+    # and use Sparse Tensor Core kernels if suitable. Zero downside for dense weights.
+    if gpu_profile.sparse_weights:
+        try:
+            config.set_flag(trt.BuilderFlag.SPARSE_WEIGHTS)
+            logger.info("[TRT Config] SPARSE_WEIGHTS enabled")
+        except Exception:
+            logger.debug("[TRT Config] SPARSE_WEIGHTS not supported — skipping")
+
+    # RUNTIME_ACTIVATION_RESIZE_10_10: allows update_device_memory_size_for_shapes()
+    # to shrink activation memory when actual input shapes are smaller than max profile
+    # dims. Our engines use dynamic shapes (min 256 → max 1024), so running at 512x512
+    # can save ~50–75% of peak activation VRAM compared to always allocating for 1024.
+    if gpu_profile.enable_runtime_activation_resize:
+        try:
+            config.set_preview_feature(trt.PreviewFeature.RUNTIME_ACTIVATION_RESIZE_10_10, True)
+            logger.info("[TRT Config] RUNTIME_ACTIVATION_RESIZE_10_10 enabled")
+        except Exception:
+            logger.debug("[TRT Config] RUNTIME_ACTIVATION_RESIZE_10_10 not supported — skipping")
 
 
 # Map of numpy dtype -> torch dtype
@@ -244,42 +477,116 @@ class Engine:
         timing_cache=None,
         workspace_size=0,
         fp8=False,
+        gpu_profile: Optional["GPUBuildProfile"] = None,
+        dynamic_shapes: bool = True,
     ):
         logger.info(f"Building TensorRT engine for {onnx_path}: {self.engine_path}")
 
         if fp8:
-            self._build_fp8(onnx_path, input_profile, workspace_size, enable_all_tactics)
+            self._build_fp8(
+                onnx_path, input_profile, workspace_size, enable_all_tactics,
+                timing_cache=timing_cache, gpu_profile=gpu_profile,
+                dynamic_shapes=dynamic_shapes,
+            )
             return
 
-        p = Profile()
-        if input_profile:
-            for name, dims in input_profile.items():
-                assert len(dims) == 3
-                p.add(name, min=dims[0], opt=dims[1], max=dims[2])
+        # --- Build using raw TRT API for full IBuilderConfig access ---
+        # Polygraphy's CreateConfig does not expose: tiling_optimization_level,
+        # l2_limit_for_tiling, max_aux_streams, builder_optimization_level,
+        # set_preview_feature, or SPARSE_WEIGHTS. We use the raw API (same as
+        # the FP8 path) so all parameters are available for both precision paths.
 
-        config_kwargs = {}
+        build_logger = trt.Logger(trt.Logger.WARNING)
+        builder = trt.Builder(build_logger)
 
+        network_flags = 0
+        network = builder.create_network(network_flags)
+
+        parser = trt.OnnxParser(network, build_logger)
+        parser.set_flag(trt.OnnxParserFlag.NATIVE_INSTANCENORM)
+        success = parser.parse_from_file(onnx_path)
+        if not success:
+            errors = [parser.get_error(i) for i in range(parser.num_errors)]
+            raise RuntimeError(
+                f"TRT ONNX parser failed for FP16 engine: {onnx_path}\n"
+                + "\n".join(str(e) for e in errors)
+            )
+
+        config = builder.create_builder_config()
+
+        # Precision flags
+        if fp16:
+            config.set_flag(trt.BuilderFlag.FP16)
+        config.set_flag(trt.BuilderFlag.TF32)
+
+        if enable_refit:
+            config.set_flag(trt.BuilderFlag.REFIT)
+
+        # Workspace
         if workspace_size > 0:
-            config_kwargs["memory_pool_limits"] = {trt.MemoryPoolType.WORKSPACE: workspace_size}
-        # tactic_sources restriction removed: TacticSource.CUBLAS (deprecated TRT 10.0)
-        # and CUBLAS_LT (deprecated TRT 9.0) are no longer meaningful on TRT 10.x.
-        # TRT uses its default tactic selection for all builds regardless of enable_all_tactics.
+            config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size)
 
-        engine = engine_from_network(
-            network_from_onnx_path(onnx_path, flags=[trt.OnnxParserFlag.NATIVE_INSTANCENORM]),
-            config=CreateConfig(
-                fp16=fp16,
-                tf32=True,
-                refittable=enable_refit,
-                profiles=[p],
-                load_timing_cache=timing_cache,
-                **config_kwargs,
-            ),
-            save_timing_cache=timing_cache,
-        )
-        save_engine(engine, path=self.engine_path)
+        # Optimization profile
+        if input_profile:
+            profile = builder.create_optimization_profile()
+            for name, dims in input_profile.items():
+                assert len(dims) == 3, f"Expected (min, opt, max) for {name}"
+                profile.set_shape(name, min=dims[0], opt=dims[1], max=dims[2])
+            config.add_optimization_profile(profile)
 
-    def _build_fp8(self, onnx_path, input_profile, workspace_size, enable_all_tactics):
+        # Timing cache — load existing or create fresh
+        cache_data = b""
+        if timing_cache and os.path.exists(timing_cache):
+            try:
+                with open(timing_cache, "rb") as f:
+                    cache_data = f.read()
+                logger.info(f"[TRT Build] Loaded timing cache: {timing_cache} ({len(cache_data) // 1024} KB)")
+            except Exception as e:
+                logger.warning(f"[TRT Build] Could not load timing cache {timing_cache}: {e} — starting fresh")
+                cache_data = b""
+        trt_cache = config.create_timing_cache(cache_data)
+        config.set_timing_cache(trt_cache, ignore_mismatch=False)
+
+        # Apply hardware-aware profile parameters
+        _apply_gpu_profile_to_config(config, gpu_profile, dynamic_shapes=dynamic_shapes)
+
+        # Build and serialize
+        logger.info(f"[TRT Build] Building FP16 engine (raw API): {self.engine_path}")
+        serialized = builder.build_serialized_network(network, config)
+        if serialized is None:
+            raise RuntimeError(
+                f"TRT FP16 engine build failed for {onnx_path}. "
+                "Check TRT logs above for details."
+            )
+
+        with open(self.engine_path, "wb") as f:
+            f.write(serialized)
+
+        # Save timing cache for next build
+        if timing_cache:
+            try:
+                updated_cache = config.get_timing_cache()
+                if updated_cache is not None:
+                    os.makedirs(os.path.dirname(timing_cache), exist_ok=True)
+                    with open(timing_cache, "wb") as f:
+                        f.write(updated_cache.serialize())
+                    logger.info(f"[TRT Build] Saved timing cache: {timing_cache}")
+            except Exception as e:
+                logger.warning(f"[TRT Build] Could not save timing cache: {e}")
+
+        size_bytes = getattr(serialized, 'nbytes', None) or len(serialized)
+        logger.info(f"[TRT Build] FP16 engine saved: {self.engine_path} ({size_bytes / 1024 / 1024:.0f} MB)")
+
+    def _build_fp8(
+        self,
+        onnx_path,
+        input_profile,
+        workspace_size,
+        enable_all_tactics,
+        timing_cache=None,
+        gpu_profile: Optional["GPUBuildProfile"] = None,
+        dynamic_shapes: bool = True,
+    ):
         """
         Build a TRT engine from a Q/DQ-annotated FP8 ONNX using the raw TRT builder API.
 
@@ -292,17 +599,23 @@ class Engine:
             input_profile: Dict of {name: (min, opt, max)} shapes.
             workspace_size: TRT workspace limit in bytes.
             enable_all_tactics: If True, allow all TRT tactic sources.
+            timing_cache: Path to timing cache file for load/save.
+            gpu_profile: Hardware-aware build parameters from detect_gpu_profile().
+            dynamic_shapes: Whether the engine uses dynamic input shapes.
         """
-        TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+        build_logger = trt.Logger(trt.Logger.WARNING)
 
-        builder = trt.Builder(TRT_LOGGER)
+        builder = trt.Builder(build_logger)
 
         # STRONGLY_TYPED: required for FP8. Tells TRT to use the data-type annotations
         # from Q/DQ nodes rather than running its own precision heuristics.
         network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
         network = builder.create_network(network_flags)
 
-        parser = trt.OnnxParser(network, TRT_LOGGER)
+        parser = trt.OnnxParser(network, build_logger)
+        # NATIVE_INSTANCENORM: use TRT's fused InstanceNorm/GroupNorm kernel instead
+        # of decomposing into primitive ops. Diffusion UNets use GroupNorm heavily.
+        parser.set_flag(trt.OnnxParserFlag.NATIVE_INSTANCENORM)
         success = parser.parse_from_file(onnx_path)
         if not success:
             errors = [parser.get_error(i) for i in range(parser.num_errors)]
@@ -313,9 +626,9 @@ class Engine:
 
         config = builder.create_builder_config()
         # BuilderFlag.STRONGLY_TYPED was removed in TRT 10.12; the network-level flag
-        # (NetworkDefinitionCreationFlag.STRONGLY_TYPED, line ~304) is now the only
-        # mechanism. On older TRT versions where BuilderFlag.STRONGLY_TYPED still exists,
-        # we also set precision flags on the config so the builder considers FP8/FP16 kernels.
+        # (NetworkDefinitionCreationFlag.STRONGLY_TYPED, set on network creation above)
+        # is now the only mechanism. On older TRT versions where BuilderFlag.STRONGLY_TYPED
+        # still exists, we also set precision flags on the config.
         if hasattr(trt.BuilderFlag, 'STRONGLY_TYPED'):
             # TRT < 10.12: BuilderFlag.STRONGLY_TYPED exists — set precision flags and
             # the builder-level STRONGLY_TYPED flag alongside the network-level flag.
@@ -336,6 +649,22 @@ class Engine:
                 profile.set_shape(name, min=dims[0], opt=dims[1], max=dims[2])
             config.add_optimization_profile(profile)
 
+        # Timing cache — load existing or create fresh
+        cache_data = b""
+        if timing_cache and os.path.exists(timing_cache):
+            try:
+                with open(timing_cache, "rb") as f:
+                    cache_data = f.read()
+                logger.info(f"[FP8] Loaded timing cache: {timing_cache} ({len(cache_data) // 1024} KB)")
+            except Exception as e:
+                logger.warning(f"[FP8] Could not load timing cache {timing_cache}: {e} — starting fresh")
+                cache_data = b""
+        trt_cache = config.create_timing_cache(cache_data)
+        config.set_timing_cache(trt_cache, ignore_mismatch=False)
+
+        # Apply hardware-aware profile parameters
+        _apply_gpu_profile_to_config(config, gpu_profile, dynamic_shapes=dynamic_shapes)
+
         logger.info(f"[FP8] Building TRT FP8 engine (STRONGLY_TYPED): {self.engine_path}")
         serialized = builder.build_serialized_network(network, config)
         if serialized is None:
@@ -346,6 +675,18 @@ class Engine:
 
         with open(self.engine_path, "wb") as f:
             f.write(serialized)
+
+        # Save timing cache for next build
+        if timing_cache:
+            try:
+                updated_cache = config.get_timing_cache()
+                if updated_cache is not None:
+                    os.makedirs(os.path.dirname(timing_cache), exist_ok=True)
+                    with open(timing_cache, "wb") as f:
+                        f.write(updated_cache.serialize())
+                    logger.info(f"[FP8] Saved timing cache: {timing_cache}")
+            except Exception as e:
+                logger.warning(f"[FP8] Could not save timing cache: {e}")
 
         size_bytes = getattr(serialized, 'nbytes', None) or len(serialized)
         logger.info(f"[FP8] Engine saved: {self.engine_path} ({size_bytes / 1024 / 1024:.0f} MB)")
@@ -386,7 +727,16 @@ class Engine:
             else:
                 shape = self.engine.get_tensor_shape(name)
 
-            dtype_np = trt.nptype(self.engine.get_tensor_dtype(name))
+            trt_dtype = self.engine.get_tensor_dtype(name)
+            try:
+                dtype_np = trt.nptype(trt_dtype)
+                torch_dtype = numpy_to_torch_dtype_dict[dtype_np]
+            except TypeError:
+                # FP8 (FLOAT8E4M3FN) has no numpy equivalent — map directly to torch
+                if trt_dtype == trt.DataType.FP8:
+                    torch_dtype = torch.float8_e4m3fn
+                else:
+                    raise
             mode = self.engine.get_tensor_mode(name)
 
             if mode == trt.TensorIOMode.INPUT:
@@ -395,7 +745,7 @@ class Engine:
                         f"TensorRT: set_input_shape failed for '{name}' with shape {shape}"
                     )
 
-            tensor = torch.empty(tuple(shape), dtype=numpy_to_torch_dtype_dict[dtype_np]).to(device=device)
+            tensor = torch.empty(tuple(shape), dtype=torch_dtype).to(device=device)
             self.tensors[name] = tensor
 
         # Cache allocation parameters for reuse check
@@ -600,14 +950,31 @@ def build_engine(
     build_enable_refit: bool = False,
     fp8: bool = False,
 ):
+    # --- Step 0: Detect GPU and select hardware-optimal build parameters ---
+    gpu_profile = detect_gpu_profile(device=torch.cuda.current_device())
+
+    # --- Workspace sizing: leave 2 GiB for activations, cap per GPU tier ---
     _, free_mem, _ = cudart.cudaMemGetInfo()
-    GiB = 2**30
+    GiB = 2 ** 30
     if free_mem > 6 * GiB:
         activation_carveout = 2 * GiB
-        max_workspace_size = min(free_mem - activation_carveout, 8 * GiB)
+        max_workspace_size = min(
+            free_mem - activation_carveout,
+            gpu_profile.max_workspace_cap_bytes,
+        )
     else:
         max_workspace_size = 0
-    logger.info(f"TRT workspace: free_mem={free_mem / GiB:.1f}GiB, max_workspace={max_workspace_size / GiB:.1f}GiB")
+    logger.info(
+        f"[TRT Build] Workspace: free={free_mem / GiB:.1f} GiB, "
+        f"cap={gpu_profile.max_workspace_cap_bytes / GiB:.1f} GiB, "
+        f"allocated={max_workspace_size / GiB:.1f} GiB"
+    )
+
+    # --- Timing cache: shared per engine directory ---
+    # Cache is stored alongside the engine files so it persists across rebuilds.
+    engine_dir = os.path.dirname(engine_path)
+    timing_cache_path = os.path.join(engine_dir, "timing.cache")
+
     engine = Engine(engine_path)
     input_profile = model_data.get_input_profile(
         opt_batch_size,
@@ -622,8 +989,11 @@ def build_engine(
         input_profile=input_profile,
         enable_refit=build_enable_refit,
         enable_all_tactics=build_all_tactics,
+        timing_cache=timing_cache_path,
         workspace_size=max_workspace_size,
         fp8=fp8,
+        gpu_profile=gpu_profile,
+        dynamic_shapes=build_dynamic_shape,
     )
 
     return engine

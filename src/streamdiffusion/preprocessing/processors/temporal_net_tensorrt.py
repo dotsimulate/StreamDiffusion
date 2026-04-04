@@ -77,8 +77,18 @@ class TensorRTEngine:
         for idx in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(idx)
             shape = self.context.get_tensor_shape(name)
-            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
-            
+            trt_dtype = self.engine.get_tensor_dtype(name)
+            try:
+                dtype_np = trt.nptype(trt_dtype)
+                torch_dtype = numpy_to_torch_dtype_dict[dtype_np]
+            except TypeError:
+                # FP8 (FLOAT8E4M3FN) has no numpy equivalent — map directly to torch
+                if trt_dtype == trt.DataType.FP8:
+                    torch_dtype = torch.float8_e4m3fn
+                else:
+                    raise
+
+
             if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
                 # For dynamic shapes, use provided input_shape
                 if input_shape is not None and any(dim == -1 for dim in shape):
@@ -96,10 +106,8 @@ class TensorRTEngine:
                     f"Tensor '{name}' still has dynamic dimensions {shape} after setting input shapes. "
                     f"Please provide input_shape parameter to allocate_buffers()."
                 )
-            
-            tensor = torch.empty(
-                tuple(shape), dtype=numpy_to_torch_dtype_dict[dtype]
-            ).to(device=device)
+
+            tensor = torch.empty(tuple(shape), dtype=torch_dtype).to(device=device)
             self.tensors[name] = tensor
 
     def infer(self, feed_dict, stream=None):
