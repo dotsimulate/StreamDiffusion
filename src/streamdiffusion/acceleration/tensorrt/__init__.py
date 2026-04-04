@@ -113,6 +113,12 @@ def compile_unet(
     opt_batch_size: int = 1,
     engine_build_options: dict = {},
 ):
+    # Extract FP8-specific options before passing the rest to EngineBuilder.build().
+    # These are not valid kwargs for build_engine() and must be handled here.
+    build_options = dict(engine_build_options)
+    fp8 = build_options.pop("fp8", False)
+    calibration_data_fn = build_options.pop("calibration_data_fn", None)
+
     unet = unet.to(torch.device("cuda"), dtype=torch.float16)
     builder = EngineBuilder(model_data, unet, device=torch.device("cuda"))
     builder.build(
@@ -120,7 +126,9 @@ def compile_unet(
         onnx_opt_path,
         engine_path,
         opt_batch_size=opt_batch_size,
-        **engine_build_options,
+        fp8=fp8,
+        calibration_data_fn=calibration_data_fn,
+        **build_options,
     )
 
 

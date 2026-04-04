@@ -122,6 +122,7 @@ class StreamDiffusionWrapper:
         cache_interval: int = 1,
         min_cache_maxframes: int = 1,
         max_cache_maxframes: int = 4,
+        fp8: bool = False,
     ):
         """
         Initializes the StreamDiffusionWrapper.
@@ -296,6 +297,7 @@ class StreamDiffusionWrapper:
         self.set_nsfw_fallback_img(height, width)
         self.safety_checker_fallback_type = safety_checker_fallback_type
         self.safety_checker_threshold = safety_checker_threshold
+        self.fp8 = fp8
 
         self.stream: StreamDiffusion = self._load_model(
             model_id_or_path=model_id_or_path,
@@ -328,6 +330,7 @@ class StreamDiffusionWrapper:
             cache_interval=cache_interval,
             min_cache_maxframes=min_cache_maxframes,
             max_cache_maxframes=max_cache_maxframes,
+            fp8=fp8,
         )
 
         # Store skip_diffusion on wrapper for execution flow control
@@ -1054,6 +1057,7 @@ class StreamDiffusionWrapper:
         cache_interval: int = 1,
         min_cache_maxframes: int = 1,
         max_cache_maxframes: int = 4,
+        fp8: bool = False,
     ) -> StreamDiffusion:
         """
         Loads the model.
@@ -1517,6 +1521,7 @@ class StreamDiffusionWrapper:
                     is_faceid=is_faceid if use_ipadapter_trt else None,
                     use_cached_attn=use_cached_attn,
                     use_controlnet=use_controlnet_trt,
+                    fp8=fp8,
                 )
                 vae_encoder_path = engine_manager.get_engine_path(
                     EngineType.VAE_ENCODER,
@@ -1829,6 +1834,7 @@ class StreamDiffusionWrapper:
                             'opt_image_height': self.height,
                             'opt_image_width': self.width,
                             'build_all_tactics': True,
+                            'fp8': fp8,
                         }
                     )
                     if load_engine:

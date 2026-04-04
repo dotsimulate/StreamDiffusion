@@ -106,7 +106,8 @@ class EngineManager:
                        controlnet_model_id: Optional[str] = None,
                        is_faceid: Optional[bool] = None,
                        use_cached_attn: bool = False,
-                       use_controlnet: bool = False
+                       use_controlnet: bool = False,
+                       fp8: bool = False
                        ) -> Path:
         """
         Generate engine path using wrapper.py's current logic.
@@ -151,6 +152,8 @@ class EngineManager:
                 prefix += f"--use_cached_attn-{use_cached_attn}"
                 if use_controlnet:
                     prefix += "--controlnet"
+                if fp8:
+                    prefix += "--fp8"
 
             prefix += f"--mode-{mode}"
             
