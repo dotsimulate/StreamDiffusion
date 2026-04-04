@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 torch.set_grad_enabled(False)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
 
 
 class StreamDiffusionWrapper:
