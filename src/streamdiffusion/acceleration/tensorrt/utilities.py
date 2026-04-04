@@ -732,6 +732,15 @@ def export_onnx(
                 )
                 logger.info("Converted to external data format with weights in weights.pb")
 
+                # Delete individual tensor files left by torch.onnx.export (~4 GB for SDXL)
+                # They are now consolidated into weights.pb and no longer needed
+                for f in os.listdir(onnx_dir):
+                    if f.startswith("onnx__"):
+                        try:
+                            os.remove(os.path.join(onnx_dir, f))
+                        except OSError:
+                            pass  # Caught by builder.py final cleanup if still present
+
             del onnx_model
     del wrapped_model
     gc.collect()

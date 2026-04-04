@@ -214,17 +214,7 @@ class EngineBuilder:
             stats["stages"]["trt_build"] = {"status": "built", "elapsed_s": round(elapsed, 2)}
             _build_logger.warning(f"[BUILD] TRT engine build ({engine_filename}): {elapsed:.1f}s")
 
-        # Cleanup ONNX artifacts — preserve .fp8.onnx alongside .engine for re-use
-        # Tolerate Windows file-lock failures (Issue #4)
-        for file in os.listdir(os.path.dirname(engine_path)):
-            if file.endswith(".engine") or file.endswith(".fp8.onnx"):
-                continue
-            try:
-                os.remove(os.path.join(os.path.dirname(engine_path), file))
-            except OSError as cleanup_err:
-                _build_logger.warning(f"[BUILD] Could not delete temp file {file}: {cleanup_err}")
-
-        # Record totals
+        # Record totals (before cleanup so build_stats.json is preserved)
         total_elapsed = time.perf_counter() - build_total_start
         stats["total_elapsed_s"] = round(total_elapsed, 2)
         stats["build_end"] = datetime.now(timezone.utc).isoformat()
@@ -236,5 +226,46 @@ class EngineBuilder:
         _build_logger.warning(f"[BUILD] {engine_filename} complete: {total_elapsed:.1f}s total")
         _write_build_stats(engine_path, stats)
 
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Cleanup ONNX artifacts — preserve .engine, .fp8.onnx, and build_stats.json
+        # Two-pass deletion to handle Windows file locks (gc.collect releases Python handles)
+        _keep_suffixes = (".engine", ".fp8.onnx")
+        _keep_exact = {"build_stats.json"}
+        engine_dir = os.path.dirname(engine_path)
+        _to_delete = []
+        for file in os.listdir(engine_dir):
+            if file in _keep_exact or any(file.endswith(s) for s in _keep_suffixes):
+                continue
+            _to_delete.append(os.path.join(engine_dir, file))
+
+        if _to_delete:
+            _failed = []
+            for fpath in _to_delete:
+                try:
+                    os.remove(fpath)
+                except OSError:
+                    _failed.append(fpath)
+
+            # Release Python-held file handles (ONNX model refs), retry failures
+            if _failed:
+                gc.collect()
+                torch.cuda.empty_cache()
+                time.sleep(0.5)
+                _still_failed = []
+                for fpath in _failed:
+                    try:
+                        os.remove(fpath)
+                    except OSError as cleanup_err:
+                        _still_failed.append(os.path.basename(fpath))
+                        _build_logger.warning(f"[BUILD] Could not delete temp file {os.path.basename(fpath)}: {cleanup_err}")
+                if _still_failed:
+                    _build_logger.warning(
+                        f"[BUILD] {len(_still_failed)} intermediate files could not be cleaned. "
+                        f"Manual cleanup: delete all files except *.engine and *.fp8.onnx from {engine_dir}"
+                    )
+                cleaned = len(_to_delete) - len(_still_failed)
+            else:
+                cleaned = len(_to_delete)
+            _build_logger.info(f"[BUILD] Cleaned {cleaned}/{len(_to_delete)} intermediate files")
+        else:
+            gc.collect()
+            torch.cuda.empty_cache()
