@@ -205,6 +205,13 @@ def warning_format(message, category, filename, lineno, file=None, line=None):
 
 warnings.formatwarning = warning_format
 
+# ─── CUDA / PyTorch env var defaults (set before any torch import) ───
+# Only set if not already provided by the launch script or environment
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
+if "CUDA_MODULE_LOADING" not in os.environ:
+    os.environ["CUDA_MODULE_LOADING"] = "LAZY"
+
 # Loading animation
 print("\033[38;5;80mLoading StreamDiffusionTD", end="", flush=True)
 for _ in range(3):
