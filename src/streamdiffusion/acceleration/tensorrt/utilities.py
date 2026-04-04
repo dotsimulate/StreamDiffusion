@@ -261,11 +261,9 @@ class Engine:
 
         if workspace_size > 0:
             config_kwargs["memory_pool_limits"] = {trt.MemoryPoolType.WORKSPACE: workspace_size}
-        if not enable_all_tactics:
-            config_kwargs["tactic_sources"] = [
-                1 << int(trt.TacticSource.CUBLAS),
-                1 << int(trt.TacticSource.CUBLAS_LT),
-            ]
+        # tactic_sources restriction removed: TacticSource.CUBLAS (deprecated TRT 10.0)
+        # and CUBLAS_LT (deprecated TRT 9.0) are no longer meaningful on TRT 10.x.
+        # TRT uses its default tactic selection for all builds regardless of enable_all_tactics.
 
         engine = engine_from_network(
             network_from_onnx_path(onnx_path, flags=[trt.OnnxParserFlag.NATIVE_INSTANCENORM]),
@@ -314,19 +312,19 @@ class Engine:
             )
 
         config = builder.create_builder_config()
-        # TRT 10.12+ with STRONGLY_TYPED network: precision flags (FP8, FP16, TF32)
-        # must NOT be set — the Q/DQ node annotations dictate precision directly.
-        # Older TRT versions need both the BuilderFlag and the network flag.
+        # BuilderFlag.STRONGLY_TYPED was removed in TRT 10.12; the network-level flag
+        # (NetworkDefinitionCreationFlag.STRONGLY_TYPED, line ~304) is now the only
+        # mechanism. On older TRT versions where BuilderFlag.STRONGLY_TYPED still exists,
+        # we also set precision flags on the config so the builder considers FP8/FP16 kernels.
         if hasattr(trt.BuilderFlag, 'STRONGLY_TYPED'):
-            # TRT < 10.12: set all precision flags + STRONGLY_TYPED on config
+            # TRT < 10.12: BuilderFlag.STRONGLY_TYPED exists — set precision flags and
+            # the builder-level STRONGLY_TYPED flag alongside the network-level flag.
             config.set_flag(trt.BuilderFlag.FP8)
             config.set_flag(trt.BuilderFlag.FP16)
             config.set_flag(trt.BuilderFlag.TF32)
             config.set_flag(trt.BuilderFlag.STRONGLY_TYPED)
-        else:
-            # TRT 10.12+: NetworkDefinitionCreationFlag.STRONGLY_TYPED (line 304)
-            # handles precision; setting FP8 flag causes API Usage Error.
-            pass
+        # else: TRT 10.12+ — NetworkDefinitionCreationFlag.STRONGLY_TYPED (set on network
+        # creation above) is sufficient; Q/DQ node annotations dictate precision directly.
 
         if workspace_size > 0:
             config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size)
@@ -392,7 +390,10 @@ class Engine:
             mode = self.engine.get_tensor_mode(name)
 
             if mode == trt.TensorIOMode.INPUT:
-                self.context.set_input_shape(name, shape)
+                if not self.context.set_input_shape(name, shape):
+                    raise RuntimeError(
+                        f"TensorRT: set_input_shape failed for '{name}' with shape {shape}"
+                    )
 
             tensor = torch.empty(tuple(shape), dtype=numpy_to_torch_dtype_dict[dtype_np]).to(device=device)
             self.tensors[name] = tensor
@@ -481,7 +482,10 @@ class Engine:
             self.tensors[name].copy_(buf)
 
         for name, tensor in self.tensors.items():
-            self.context.set_tensor_address(name, tensor.data_ptr())
+            if not self.context.set_tensor_address(name, tensor.data_ptr()):
+                raise RuntimeError(
+                    f"TensorRT: set_tensor_address failed for '{name}'"
+                )
 
         if use_cuda_graph:
             if self.cuda_graph_instance is not None:
