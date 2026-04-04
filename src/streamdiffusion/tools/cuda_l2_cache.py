@@ -313,6 +313,10 @@ def pin_hot_unet_weights(
         if not tier1_ok:
             return 0
 
+    # TRT engine objects don't expose PyTorch parameters — skip Tier 2 gracefully
+    if not hasattr(unet, "named_parameters"):
+        return 0
+
     # Tier 2: Set access policy on hot attention weights
     # Target: to_q, to_k, to_v, to_out weights in hot transformer blocks.
     # These are small-to-medium GEMMs that benefit most from L2 hits.
@@ -341,15 +345,64 @@ def pin_hot_unet_weights(
     return pinned_count
 
 
-def setup_l2_persistence(unet: torch.nn.Module) -> bool:
+def set_trt_persistent_cache(unet, persist_mb: int = L2_PERSIST_MB) -> bool:
+    """
+    Enable TRT activation caching in L2 for a TensorRT UNet engine.
+
+    Sets IExecutionContext.persistent_cache_limit so TRT retains intermediate
+    activations in the L2 persisting region already reserved by Tier 1.
+
+    TRT checks the current cudaLimitPersistingL2CacheSize at assignment time
+    (not at context creation), so calling this after reserve_l2_persisting_cache()
+    is correct — no reordering of engine initialization is needed.
+
+    Args:
+        unet: UNet2DConditionModelEngine (must have .engine.context attribute).
+        persist_mb: Target L2 budget in MB. Uses Tier 1 reservation size (L2/2),
+                    which is guaranteed <= persistingL2CacheMaxSize on Ampere+.
+
+    Returns:
+        True if activation caching was enabled successfully.
+    """
+    if not L2_PERSIST_ENABLED:
+        return False
+
+    try:
+        context = unet.engine.context
+    except AttributeError:
+        return False
+
+    if not hasattr(context, "persistent_cache_limit"):
+        return False
+
+    persist_bytes = persist_mb * 1024 * 1024
+    try:
+        context.persistent_cache_limit = persist_bytes
+        actual = context.persistent_cache_limit
+        print(
+            f"[L2] TRT UNet activation caching: {actual / (1024 * 1024):.0f}MB "
+            f"of L2 persisting region allocated for activation persistence"
+        )
+        return actual > 0
+    except Exception as e:
+        print(f"[L2] TRT persistent_cache_limit failed: {e}")
+        return False
+
+
+def setup_l2_persistence(unet) -> bool:
     """
     Main entry point: set up L2 cache persistence for UNet inference.
 
-    Call this AFTER model is loaded and BEFORE torch.compile.
-    For best results with frozen weights, call AFTER torch.compile with freezing=True.
+    Dispatches between two strategies based on UNet type:
+    - PyTorch UNet (nn.Module): pin hot attention weight tensors via
+      cudaStreamSetAttribute access policy windows (Tier 2).
+    - TRT UNet engine: enable TRT's native activation caching in L2 via
+      IExecutionContext.persistent_cache_limit.
+
+    Both paths share Tier 1 (cudaDeviceSetLimit L2 reservation).
 
     Args:
-        unet: The UNet model on CUDA.
+        unet: The UNet model — either a PyTorch nn.Module or a TRT engine wrapper.
 
     Returns:
         True if at least Tier 1 (L2 reservation) succeeded.
@@ -363,12 +416,16 @@ def setup_l2_persistence(unet: torch.nn.Module) -> bool:
     tier1_ok = reserve_l2_persisting_cache(L2_PERSIST_MB)
 
     if tier1_ok:
-        # Tier 2: per-tensor access policy (best-effort)
-        pinned = pin_hot_unet_weights(unet, persist_mb=0)  # Tier 1 already reserved
-        if pinned == 0:
-            print(
-                "[L2] Tier 2 access policy skipped (call pin_hot_unet_weights() "
-                "after compile+freeze for per-tensor control)"
-            )
+        if hasattr(unet, "named_parameters"):
+            # PyTorch path: pin hot attention weight tensors in L2
+            pinned = pin_hot_unet_weights(unet, persist_mb=0)  # Tier 1 already reserved
+            if pinned == 0:
+                print(
+                    "[L2] Tier 2 access policy skipped (call pin_hot_unet_weights() "
+                    "after compile+freeze for per-tensor control)"
+                )
+        else:
+            # TRT engine path: use TRT's native activation caching instead
+            set_trt_persistent_cache(unet, persist_mb=L2_PERSIST_MB)
 
     return tier1_ok
