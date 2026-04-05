@@ -2095,6 +2095,8 @@ class StreamDiffusionWrapper:
                                     use_cuda_graph=False,
                                     unet=None,
                                     model_path=cfg["model_id"],
+                                    opt_image_height=self.height,
+                                    opt_image_width=self.width,
                                     load_engine=load_engine,
                                     conditioning_channels=cfg.get("conditioning_channels", 3),
                                 )
