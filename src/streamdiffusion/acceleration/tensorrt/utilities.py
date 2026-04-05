@@ -291,6 +291,17 @@ def _apply_gpu_profile_to_config(
         except Exception:
             logger.debug("[TRT Config] RUNTIME_ACTIVATION_RESIZE_10_10 not supported — skipping")
 
+    # avg_timing_iterations: number of timing runs averaged per tactic candidate.
+    # Default 1 produces noisy measurements — occasional slow GPU clocks or cache
+    # miss can unfairly disqualify the best kernel. Value of 4 gives stable rankings
+    # with minimal extra build time (4× timing overhead, which is tiny vs. compilation).
+    # TRT 10.12 confirmed to support this property.
+    try:
+        config.avg_timing_iterations = 4
+        logger.info("[TRT Config] avg_timing_iterations=4")
+    except AttributeError:
+        logger.debug("[TRT Config] avg_timing_iterations not supported — skipping")
+
 
 # Map of numpy dtype -> torch dtype
 numpy_to_torch_dtype_dict = {
@@ -473,7 +484,6 @@ class Engine:
         fp16,
         input_profile=None,
         enable_refit=False,
-        enable_all_tactics=False,
         timing_cache=None,
         workspace_size=0,
         fp8=False,
@@ -484,7 +494,7 @@ class Engine:
 
         if fp8:
             self._build_fp8(
-                onnx_path, input_profile, workspace_size, enable_all_tactics,
+                onnx_path, input_profile, workspace_size,
                 timing_cache=timing_cache, gpu_profile=gpu_profile,
                 dynamic_shapes=dynamic_shapes,
             )
@@ -582,7 +592,6 @@ class Engine:
         onnx_path,
         input_profile,
         workspace_size,
-        enable_all_tactics,
         timing_cache=None,
         gpu_profile: Optional["GPUBuildProfile"] = None,
         dynamic_shapes: bool = True,
@@ -598,7 +607,6 @@ class Engine:
             onnx_path: Path to *.fp8.onnx (Q/DQ-annotated by fp8_quantize.py).
             input_profile: Dict of {name: (min, opt, max)} shapes.
             workspace_size: TRT workspace limit in bytes.
-            enable_all_tactics: If True, allow all TRT tactic sources.
             timing_cache: Path to timing cache file for load/save.
             gpu_profile: Hardware-aware build parameters from detect_gpu_profile().
             dynamic_shapes: Whether the engine uses dynamic input shapes.
@@ -946,7 +954,6 @@ def build_engine(
     opt_batch_size: int,
     build_static_batch: bool = False,
     build_dynamic_shape: bool = False,
-    build_all_tactics: bool = False,
     build_enable_refit: bool = False,
     fp8: bool = False,
 ):
@@ -988,7 +995,6 @@ def build_engine(
         fp16=True,
         input_profile=input_profile,
         enable_refit=build_enable_refit,
-        enable_all_tactics=build_all_tactics,
         timing_cache=timing_cache_path,
         workspace_size=max_workspace_size,
         fp8=fp8,

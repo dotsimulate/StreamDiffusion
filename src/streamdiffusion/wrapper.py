@@ -1510,6 +1510,7 @@ class StreamDiffusionWrapper:
                     use_cached_attn=use_cached_attn,
                     use_controlnet=use_controlnet_trt,
                     fp8=fp8,
+                    resolution=(self.height, self.width),
                 )
                 vae_encoder_path = engine_manager.get_engine_path(
                     EngineType.VAE_ENCODER,
@@ -1522,6 +1523,7 @@ class StreamDiffusionWrapper:
                     ipadapter_scale=ipadapter_scale,
                     ipadapter_tokens=ipadapter_tokens,
                     is_faceid=is_faceid if use_ipadapter_trt else None,
+                    resolution=(self.height, self.width),
                 )
                 vae_decoder_path = engine_manager.get_engine_path(
                     EngineType.VAE_DECODER,
@@ -1534,6 +1536,7 @@ class StreamDiffusionWrapper:
                     ipadapter_scale=ipadapter_scale,
                     ipadapter_tokens=ipadapter_tokens,
                     is_faceid=is_faceid if use_ipadapter_trt else None,
+                    resolution=(self.height, self.width),
                 )
 
                 # Check if all required engines exist
@@ -1786,10 +1789,7 @@ class StreamDiffusionWrapper:
                     engine_build_options={
                         "opt_image_height": self.height,
                         "opt_image_width": self.width,
-                        "build_dynamic_shape": True,
-                        "min_image_resolution": 384,
-                        "max_image_resolution": 1024,
-                        "build_all_tactics": True,
+                        "build_dynamic_shape": False,
                     },
                 )
 
@@ -1812,10 +1812,7 @@ class StreamDiffusionWrapper:
                     engine_build_options={
                         "opt_image_height": self.height,
                         "opt_image_width": self.width,
-                        "build_dynamic_shape": True,
-                        "min_image_resolution": 384,
-                        "max_image_resolution": 1024,
-                        "build_all_tactics": True,
+                        "build_dynamic_shape": False,
                     },
                 )
 
@@ -1830,7 +1827,7 @@ class StreamDiffusionWrapper:
                     _unet_build_opts = {
                         "opt_image_height": self.height,
                         "opt_image_width": self.width,
-                        "build_all_tactics": True,
+                        "build_dynamic_shape": False,
                     }
                     if fp8:
                         from streamdiffusion.acceleration.tensorrt.fp8_quantize import (

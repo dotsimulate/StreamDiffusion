@@ -112,6 +112,7 @@ class EngineManager:
         use_cached_attn: bool = False,
         use_controlnet: bool = False,
         fp8: bool = False,
+        resolution: Optional[tuple] = None,
     ) -> Path:
         """
         Generate engine path using wrapper.py's current logic.
@@ -129,10 +130,10 @@ class EngineManager:
             # Convert model_id to directory name format (replace "/" with "_")
             model_dir_name = controlnet_model_id.replace("/", "_")
 
-            # Use ControlNetEnginePool naming convention: dynamic engines with 384-1024 range
-            prefix = (
-                f"controlnet_{model_dir_name}--min_batch-{min_batch_size}--max_batch-{max_batch_size}--dyn-384-1024"
-            )
+            if resolution is not None:
+                prefix = f"controlnet_{model_dir_name}--min_batch-{min_batch_size}--max_batch-{max_batch_size}--res-{resolution[0]}x{resolution[1]}"
+            else:
+                prefix = f"controlnet_{model_dir_name}--min_batch-{min_batch_size}--max_batch-{max_batch_size}--dyn-384-1024"
             return self.engine_dir / prefix / filename
         else:
             # Standard engines use the unified prefix format
@@ -162,6 +163,9 @@ class EngineManager:
                     prefix += "--fp8"
 
             prefix += f"--mode-{mode}"
+
+            if resolution is not None:
+                prefix += f"--res-{resolution[0]}x{resolution[1]}"
 
             return self.engine_dir / prefix / filename
 
@@ -215,17 +219,23 @@ class EngineManager:
 
         return pytorch_model, controlnet_model
 
-    def _get_default_controlnet_build_options(self) -> Dict:
+    def _get_default_controlnet_build_options(
+        self,
+        opt_image_height: int = 704,
+        opt_image_width: int = 704,
+        build_dynamic_shape: bool = False,
+    ) -> Dict:
         """Get default engine build options for ControlNet engines."""
-        return {
-            "opt_image_height": 704,  # Dynamic optimal resolution
-            "opt_image_width": 704,
-            "build_dynamic_shape": True,
-            "min_image_resolution": 384,
-            "max_image_resolution": 1024,
+        opts = {
+            "opt_image_height": opt_image_height,
+            "opt_image_width": opt_image_width,
+            "build_dynamic_shape": build_dynamic_shape,
             "build_static_batch": False,
-            "build_all_tactics": True,
         }
+        if build_dynamic_shape:
+            opts["min_image_resolution"] = 384
+            opts["max_image_resolution"] = 1024
+        return opts
 
     def compile_and_load_engine(
         self, engine_type: EngineType, engine_path: Path, load_engine: bool = True, **kwargs
@@ -322,6 +332,8 @@ class EngineManager:
         unet=None,
         model_path: str = "",
         conditioning_channels: int = 3,
+        opt_image_height: int = 704,
+        opt_image_width: int = 704,
     ) -> Any:
         """
         Get or load ControlNet engine, providing unified interface for ControlNet management.
@@ -337,6 +349,7 @@ class EngineManager:
             mode="",  # Not used for ControlNet
             use_tiny_vae=False,  # Not used for ControlNet
             controlnet_model_id=model_id,
+            resolution=(opt_image_height, opt_image_width),
         )
 
         # Compile and load ControlNet engine
@@ -354,5 +367,8 @@ class EngineManager:
             unet=unet,
             model_path=model_path,
             conditioning_channels=conditioning_channels,
-            engine_build_options=self._get_default_controlnet_build_options(),
+            engine_build_options=self._get_default_controlnet_build_options(
+                opt_image_height=opt_image_height,
+                opt_image_width=opt_image_width,
+            ),
         )

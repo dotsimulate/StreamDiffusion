@@ -150,12 +150,8 @@ class BaseModel:
         return (latent_height, latent_width)
 
     def get_minmax_dims(self, batch_size, image_height, image_width, static_batch, static_shape):
-        # Following ComfyUI TensorRT approach: ensure proper min ≤ opt ≤ max constraints
-        # Even with static_batch=True, we need different min/max to avoid TensorRT constraint violations
-
         if static_batch:
-            # For static batch, still provide range to avoid min=opt=max constraint violation
-            min_batch = max(1, batch_size - 1)  # At least 1, but allow some range
+            min_batch = max(1, batch_size - 1)
             max_batch = batch_size
         else:
             min_batch = self.min_batch
@@ -164,16 +160,23 @@ class BaseModel:
         latent_height = image_height // 8
         latent_width = image_width // 8
 
-        # Force dynamic shapes for height/width to enable runtime resolution changes
-        # Always use 384-1024 range regardless of static_shape flag
-        min_image_height = self.min_image_shape
-        max_image_height = self.max_image_shape
-        min_image_width = self.min_image_shape
-        max_image_width = self.max_image_shape
-        min_latent_height = self.min_latent_shape
-        max_latent_height = self.max_latent_shape
-        min_latent_width = self.min_latent_shape
-        max_latent_width = self.max_latent_shape
+        if static_shape:
+            # Static: min=opt=max — TRT selects geometry-specific kernels,
+            # enables L2 tiling, and CUDA graphs avoid worst-case allocation.
+            min_image_height = max_image_height = image_height
+            min_image_width = max_image_width = image_width
+            min_latent_height = max_latent_height = latent_height
+            min_latent_width = max_latent_width = latent_width
+        else:
+            # Dynamic: full range for runtime resolution flexibility
+            min_image_height = self.min_image_shape
+            max_image_height = self.max_image_shape
+            min_image_width = self.min_image_shape
+            max_image_width = self.max_image_shape
+            min_latent_height = self.min_latent_shape
+            max_latent_height = self.max_latent_shape
+            min_latent_width = self.min_latent_shape
+            max_latent_width = self.max_latent_shape
 
         return (
             min_batch,
@@ -586,23 +589,29 @@ class UNet(BaseModel):
         opt_latent_height = min(max(latent_height, min_latent_height), max_latent_height)
         opt_latent_width = min(max(latent_width, min_latent_width), max_latent_width)
 
-        # Ensure no dimension equality that causes constraint violations
-        if opt_latent_height == min_latent_height and min_latent_height < max_latent_height:
-            opt_latent_height = min(min_latent_height + 8, max_latent_height)  # Add 8 pixels for separation
-        if opt_latent_width == min_latent_width and min_latent_width < max_latent_width:
-            opt_latent_width = min(min_latent_width + 8, max_latent_width)
+        # For dynamic shapes, ensure opt != min to satisfy TRT constraint (min < opt <= max).
+        # For static shapes min == opt == max is correct and intentional — skip separation.
+        if not static_shape:
+            if opt_latent_height == min_latent_height and min_latent_height < max_latent_height:
+                opt_latent_height = min(min_latent_height + 8, max_latent_height)
+            if opt_latent_width == min_latent_width and min_latent_width < max_latent_width:
+                opt_latent_width = min(min_latent_width + 8, max_latent_width)
 
         # Image dimensions for ControlNet inputs
-        min_image_h, max_image_h = self.min_image_shape, self.max_image_shape
-        min_image_w, max_image_w = self.min_image_shape, self.max_image_shape
-        opt_image_height = min(max(image_height, min_image_h), max_image_h)
-        opt_image_width = min(max(image_width, min_image_w), max_image_w)
-
-        # Ensure image dimension separation as well
-        if opt_image_height == min_image_h and min_image_h < max_image_h:
-            opt_image_height = min(min_image_h + 64, max_image_h)  # Add 64 pixels for separation
-        if opt_image_width == min_image_w and min_image_w < max_image_w:
-            opt_image_width = min(min_image_w + 64, max_image_w)
+        if static_shape:
+            min_image_h = max_image_h = image_height
+            min_image_w = max_image_w = image_width
+            opt_image_height = image_height
+            opt_image_width = image_width
+        else:
+            min_image_h, max_image_h = self.min_image_shape, self.max_image_shape
+            min_image_w, max_image_w = self.min_image_shape, self.max_image_shape
+            opt_image_height = min(max(image_height, min_image_h), max_image_h)
+            opt_image_width = min(max(image_width, min_image_w), max_image_w)
+            if opt_image_height == min_image_h and min_image_h < max_image_h:
+                opt_image_height = min(min_image_h + 64, max_image_h)
+            if opt_image_width == min_image_w and min_image_w < max_image_w:
+                opt_image_width = min(min_image_w + 64, max_image_w)
 
         profile = {
             "sample": [
@@ -641,18 +650,22 @@ class UNet(BaseModel):
                 control_height = shape_spec["height"]
                 control_width = shape_spec["width"]
 
-                # Create optimization profile with proper spatial dimension scaling
-                # Scale the spatial dimensions proportionally with the main latent dimensions
-                scale_h = opt_latent_height / latent_height if latent_height > 0 else 1.0
-                scale_w = opt_latent_width / latent_width if latent_width > 0 else 1.0
+                if static_shape:
+                    # Static: all three identical — exact resolution, no padding
+                    min_control_h = max_control_h = opt_control_h = control_height
+                    min_control_w = max_control_w = opt_control_w = control_width
+                else:
+                    # Dynamic: scale proportionally with latent range
+                    scale_h = opt_latent_height / latent_height if latent_height > 0 else 1.0
+                    scale_w = opt_latent_width / latent_width if latent_width > 0 else 1.0
 
-                min_control_h = max(1, int(control_height * min_latent_height / latent_height))
-                max_control_h = max(min_control_h + 1, int(control_height * max_latent_height / latent_height))
-                opt_control_h = max(min_control_h, min(int(control_height * scale_h), max_control_h))
+                    min_control_h = max(1, int(control_height * min_latent_height / latent_height))
+                    max_control_h = max(min_control_h + 1, int(control_height * max_latent_height / latent_height))
+                    opt_control_h = max(min_control_h, min(int(control_height * scale_h), max_control_h))
 
-                min_control_w = max(1, int(control_width * min_latent_width / latent_width))
-                max_control_w = max(min_control_w + 1, int(control_width * max_latent_width / latent_width))
-                opt_control_w = max(min_control_w, min(int(control_width * scale_w), max_control_w))
+                    min_control_w = max(1, int(control_width * min_latent_width / latent_width))
+                    max_control_w = max(min_control_w + 1, int(control_width * max_latent_width / latent_width))
+                    opt_control_w = max(min_control_w, min(int(control_width * scale_w), max_control_w))
 
                 profile[name] = [
                     (min_batch, channels, min_control_h, min_control_w),  # min
