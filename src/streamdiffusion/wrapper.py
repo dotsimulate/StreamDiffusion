@@ -1790,6 +1790,7 @@ class StreamDiffusionWrapper:
                         "opt_image_height": self.height,
                         "opt_image_width": self.width,
                         "build_dynamic_shape": False,
+                        "build_static_batch": True,
                     },
                 )
 
@@ -1813,6 +1814,7 @@ class StreamDiffusionWrapper:
                         "opt_image_height": self.height,
                         "opt_image_width": self.width,
                         "build_dynamic_shape": False,
+                        "build_static_batch": True,
                     },
                 )
 
@@ -1828,6 +1830,7 @@ class StreamDiffusionWrapper:
                         "opt_image_height": self.height,
                         "opt_image_width": self.width,
                         "build_dynamic_shape": False,
+                        "build_static_batch": True,
                     }
                     if fp8:
                         from streamdiffusion.acceleration.tensorrt.fp8_quantize import (
