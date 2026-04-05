@@ -127,10 +127,6 @@ class TouchDesignerManager:
         # OSC notification flags
         self._sent_processed_cn_name = False
 
-        # Async GPU→CPU output transfer (eliminates full GPU sync on every output frame)
-        self._pinned_output_buf: Optional[torch.Tensor] = None
-        self._output_copy_event: Optional[torch.cuda.Event] = None
-
         # Mode tracking (img2img or txt2img)
         self.mode = self.config.get("mode", "img2img")
         logger.info(f"Initialized in {self.mode} mode")
@@ -540,10 +536,16 @@ class TouchDesignerManager:
                     instantaneous_fps = (
                         1.0 / frame_interval if frame_interval > 0 else 0.0
                     )
-                    self.current_fps = (
-                        self.current_fps * self.fps_smoothing
-                        + instantaneous_fps * (1 - self.fps_smoothing)
-                    )
+                    # Smooth the FPS calculation.
+                    # Seed EMA with first measurement so display doesn't slowly
+                    # climb from 0.0 during ramp-up.
+                    if self.current_fps == 0.0:
+                        self.current_fps = instantaneous_fps
+                    else:
+                        self.current_fps = (
+                            self.current_fps * self.fps_smoothing
+                            + instantaneous_fps * (1 - self.fps_smoothing)
+                        )
                 self.last_frame_output_time = frame_output_time
 
                 # Inference FPS: only frames that actually ran GPU inference (similar filter skips excluded)
@@ -682,23 +684,7 @@ class TouchDesignerManager:
             if isinstance(output_image, Image.Image):
                 frame_np = np.array(output_image)
             elif isinstance(output_image, torch.Tensor):
-                if output_image.is_cuda:
-                    # Async GPU→CPU via pinned memory: eliminates full stream sync (saves 1-3ms/frame)
-                    if (
-                        self._pinned_output_buf is None
-                        or self._pinned_output_buf.shape != output_image.shape
-                        or self._pinned_output_buf.dtype != output_image.dtype
-                    ):
-                        self._pinned_output_buf = torch.empty(
-                            output_image.shape, dtype=output_image.dtype, pin_memory=True
-                        )
-                        self._output_copy_event = torch.cuda.Event()
-                    self._pinned_output_buf.copy_(output_image, non_blocking=True)
-                    self._output_copy_event.record()
-                    self._output_copy_event.synchronize()  # wait only for this transfer
-                    frame_np = self._pinned_output_buf.numpy()
-                else:
-                    frame_np = output_image.numpy()
+                frame_np = output_image.cpu().numpy()
                 if frame_np.shape[0] == 3:  # CHW -> HWC
                     frame_np = np.transpose(frame_np, (1, 2, 0))
             else:
