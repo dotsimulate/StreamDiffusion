@@ -354,10 +354,6 @@ class StreamDiffusionWrapper:
             seed=seed,
         )
 
-        # Offload text encoders to CPU after initial encoding to free ~1.6 GB VRAM (SDXL).
-        # They are reloaded on-demand before each prompt re-encoding call.
-        if acceleration == "tensorrt":
-            self._offload_text_encoders()
 
         # Set wrapper reference on parameter updater so it can access pipeline structure
         self.stream._param_updater.wrapper = self
@@ -478,10 +474,23 @@ class StreamDiffusionWrapper:
             raise TypeError(f"prepare: prompt must be str or List[Tuple[str, float]], got {type(prompt)}")
 
     def _offload_text_encoders(self) -> None:
-        """Move text encoders to CPU to free VRAM (~1.6 GB for SDXL).
+        """No-op during inference: text encoders kept on GPU.
 
-        Called automatically after initial prepare() when using TRT acceleration.
-        Text encoders are reloaded to GPU before each prompt re-encoding call.
+        Prompts change during inference while UNet/VAE/ControlNet are constant.
+        The ~1.6GB text encoder VRAM fits comfortably alongside other components
+        on a 24GB GPU, so the offload-reload cycle is pure overhead.
+        For maximum-VRAM scenarios (engine building, FP8 quantization),
+        use _force_offload_text_encoders() explicitly instead.
+        """
+
+    def _reload_text_encoders(self) -> None:
+        """No-op: text encoders remain on GPU (never offloaded during inference)."""
+
+    def _force_offload_text_encoders(self) -> None:
+        """Force-offload text encoders to CPU. Use during engine building or FP8 quantization only.
+
+        Frees ~1.6GB VRAM for maximum headroom during one-time build processes.
+        Call _force_reload_text_encoders() afterwards to restore state.
         """
         pipe = self.stream.pipe
         if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
@@ -490,20 +499,17 @@ class StreamDiffusionWrapper:
         if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
             if next(pipe.text_encoder_2.parameters(), None) is not None:
                 pipe.text_encoder_2 = pipe.text_encoder_2.to("cpu")
-        # NOTE: torch.cuda.empty_cache() removed — it forces a full CUDA sync
-        # that stalls the GPU pipeline, causing visible stutters during prompt
-        # changes. The freed VRAM stays in PyTorch's allocator cache and gets
-        # reused automatically without the sync penalty.
-        logger.debug("[VRAM] Text encoders offloaded to CPU")
+        torch.cuda.empty_cache()
+        logger.debug("[VRAM] Text encoders force-offloaded to CPU (engine build/quantization)")
 
-    def _reload_text_encoders(self) -> None:
-        """Move text encoders back to GPU before prompt re-encoding."""
+    def _force_reload_text_encoders(self) -> None:
+        """Force-reload text encoders to GPU after engine building or FP8 quantization."""
         pipe = self.stream.pipe
         if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
             pipe.text_encoder = pipe.text_encoder.to(self.device)
         if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
             pipe.text_encoder_2 = pipe.text_encoder_2.to(self.device)
-        logger.debug("[VRAM] Text encoders reloaded to GPU")
+        logger.debug("[VRAM] Text encoders force-reloaded to GPU")
 
     def update_prompt(
         self,
