@@ -356,6 +356,10 @@ class StreamDiffusionWrapper:
         self._acceleration = acceleration
         self._engine_dir = engine_dir
 
+        # Prompt change tracking: skip text encoder reload when text is identical
+        self._last_prompt_texts: Optional[List[str]] = None
+        self._last_negative_prompt: Optional[str] = None
+
         if device_ids is not None:
             self.stream.unet = torch.nn.DataParallel(self.stream.unet, device_ids=device_ids)
 
@@ -632,9 +636,26 @@ class StreamDiffusionWrapper:
         safety_checker_threshold : Optional[float]
             The threshold for the safety checker.
         """
-        # Reload text encoders to GPU if a new prompt needs encoding.
-        needs_encoding = prompt_list is not None or negative_prompt is not None
+        # Reload text encoders to GPU only when prompt text actually changed.
+        # OSC sends prompt updates at ~60 Hz even with identical text, so comparing
+        # against the last encoded texts avoids repeated ~1.6 GB CPU↔GPU transfers.
+        _new_prompt_texts = (
+            [p for p, _w in prompt_list] if prompt_list is not None else None
+        )
+        _texts_changed = (
+            _new_prompt_texts is not None
+            and _new_prompt_texts != self._last_prompt_texts
+        )
+        _neg_changed = (
+            negative_prompt is not None
+            and negative_prompt != self._last_negative_prompt
+        )
+        needs_encoding = _texts_changed or _neg_changed
         if needs_encoding:
+            if _new_prompt_texts is not None:
+                self._last_prompt_texts = _new_prompt_texts
+            if negative_prompt is not None:
+                self._last_negative_prompt = negative_prompt
             self._reload_text_encoders()
         try:
             # Handle all parameters via parameter updater (including ControlNet)
