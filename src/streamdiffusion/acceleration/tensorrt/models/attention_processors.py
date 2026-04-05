@@ -18,6 +18,10 @@ class CachedSTAttnProcessor2_0:
         self._curr_key_buf: Optional[torch.Tensor] = None
         self._curr_value_buf: Optional[torch.Tensor] = None
         self._kv_out_buf: Optional[torch.Tensor] = None  # shape: (2, 1, B, seq, inner_dim)
+        # When False (default): ONNX-safe .clone() path — used during torch.onnx.export() tracing.
+        # When True: zero-alloc .copy_() path — set after ONNX export for non-TRT runtime inference.
+        # NOTE: aten::copy has no ONNX symbolic and cannot be traced; never set True before export.
+        self._use_prealloc: bool = False
 
         # Pre-allocated buffers for zero-alloc hot path (lazy init on first call).
         # _use_prealloc is False by default so ONNX export tracing uses the original
