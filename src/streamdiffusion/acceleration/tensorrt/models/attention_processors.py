@@ -14,6 +14,10 @@ class CachedSTAttnProcessor2_0:
     def __init__(self):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
+        # Per-layer pre-allocated buffers (lazy-init on first call — shape is model-dependent)
+        self._curr_key_buf: Optional[torch.Tensor] = None
+        self._curr_value_buf: Optional[torch.Tensor] = None
+        self._kv_out_buf: Optional[torch.Tensor] = None  # shape: (2, 1, B, seq, inner_dim)
 
     def __call__(
         self,
@@ -68,8 +72,16 @@ class CachedSTAttnProcessor2_0:
             cached_key, cached_value = None, None
 
         if is_selfattn:
-            curr_key = key.clone()
-            curr_value = value.clone()
+            # Lazy-init per-layer buffers (shape is model-dependent, known only on first call)
+            if self._curr_key_buf is None or self._curr_key_buf.shape != key.shape:
+                self._curr_key_buf = torch.empty_like(key)
+                self._curr_value_buf = torch.empty_like(value)
+                self._kv_out_buf = torch.empty((2, 1, *key.shape), dtype=key.dtype, device=key.device)
+            # In-place copy: eliminates 2 clone() mallocs per layer per denoising step
+            self._curr_key_buf.copy_(key)
+            self._curr_value_buf.copy_(value)
+            curr_key = self._curr_key_buf
+            curr_value = self._curr_value_buf
 
             if cached_key is not None:
                 cached_key_reshaped = cached_key.transpose(0, 1).contiguous().flatten(1, 2)
@@ -108,6 +120,9 @@ class CachedSTAttnProcessor2_0:
         hidden_states = hidden_states / attn.rescale_output_factor
 
         if is_selfattn:
-            kvo_cache = torch.stack([curr_key.unsqueeze(0), curr_value.unsqueeze(0)], dim=0)
+            # In-place fill pre-allocated output buffer: eliminates torch.stack malloc per layer
+            self._kv_out_buf[0, 0].copy_(curr_key)
+            self._kv_out_buf[1, 0].copy_(curr_value)
+            kvo_cache = self._kv_out_buf
 
         return hidden_states, kvo_cache

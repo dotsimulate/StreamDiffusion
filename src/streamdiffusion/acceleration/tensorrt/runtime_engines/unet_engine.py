@@ -24,6 +24,7 @@ class UNet2DConditionModelEngine:
         self.use_cuda_graph = use_cuda_graph
         self.use_control = False  # Will be set to True by wrapper if engine has ControlNet support
         self._cached_dummy_controlnet_inputs = None
+        self._cached_dummy_controlnet_tensors: Optional[Dict[str, torch.Tensor]] = None  # pre-alloc zero tensors
 
         # Enable VRAM monitoring only if explicitly requested (defaults to False for performance)
         self.debug_vram = os.getenv("STREAMDIFFUSION_DEBUG_VRAM", "").lower() in ("1", "true")
@@ -137,6 +138,7 @@ class UNet2DConditionModelEngine:
                                 latent_model_input
                             )
                             self._cached_latent_dims = (current_latent_height, current_latent_width)
+                            self._cached_dummy_controlnet_tensors = None  # invalidate tensor cache
                         except RuntimeError:
                             self._cached_dummy_controlnet_inputs = None
 
@@ -244,29 +246,38 @@ class UNet2DConditionModelEngine:
         self, dummy_inputs: Dict, latent_model_input: torch.Tensor, shape_dict: Dict, input_dict: Dict
     ):
         """
-        Add cached dummy inputs to the shape dictionary and input dictionary
+        Add dummy ControlNet zero tensors to shape/input dicts.
+        Tensors are pre-allocated once and reused — no per-call torch.zeros() malloc.
 
         Args:
             dummy_inputs: Dictionary containing dummy input specifications
-            latent_model_input: The main latent input tensor (used for device/dtype reference)
+            latent_model_input: The main latent input tensor (used for device/dtype/batch reference)
             shape_dict: Shape dictionary to update
             input_dict: Input dictionary to update
         """
-        for input_name, shape_spec in dummy_inputs.items():
-            channels = shape_spec["channels"]
-            height = shape_spec["height"]
-            width = shape_spec["width"]
+        batch_size = latent_model_input.shape[0]
 
-            # Create zero tensor with appropriate shape
-            zero_tensor = torch.zeros(
-                latent_model_input.shape[0],
-                channels,
-                height,
-                width,
-                dtype=latent_model_input.dtype,
-                device=latent_model_input.device,
-            )
+        # Invalidate cache if batch size or dtype changed (rare; only on pipeline reconfigure)
+        if self._cached_dummy_controlnet_tensors is not None:
+            first = next(iter(self._cached_dummy_controlnet_tensors.values()))
+            if first.shape[0] != batch_size or first.dtype != latent_model_input.dtype:
+                self._cached_dummy_controlnet_tensors = None
 
+        # Build cache on first call (or after invalidation)
+        if self._cached_dummy_controlnet_tensors is None:
+            self._cached_dummy_controlnet_tensors = {
+                input_name: torch.zeros(
+                    batch_size,
+                    shape_spec["channels"],
+                    shape_spec["height"],
+                    shape_spec["width"],
+                    dtype=latent_model_input.dtype,
+                    device=latent_model_input.device,
+                )
+                for input_name, shape_spec in dummy_inputs.items()
+            }
+
+        for input_name, zero_tensor in self._cached_dummy_controlnet_tensors.items():
             shape_dict[input_name] = zero_tensor.shape
             input_dict[input_name] = zero_tensor
 
