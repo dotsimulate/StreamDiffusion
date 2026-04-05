@@ -110,6 +110,13 @@ class StreamDiffusion:
         self._noise_buf = None  # pre-allocated buffer for per-step noise in TCD non-batched path
         self._image_decode_buf = None  # pre-allocated buffer for VAE decode output (avoids .clone())
         self._prev_image_buf = None  # pre-allocated buffer for skip-frame image cache
+        self._combined_latent_buf = None  # pre-allocated: avoids torch.cat in predict_x0_batch
+        self._alpha_next = None  # pre-computed: cat([alpha_prod_t_sqrt[1:], ones[0:1]])
+        self._beta_next = None   # pre-computed: cat([beta_prod_t_sqrt[1:], ones[0:1]])
+        self._init_noise_rotated = None  # pre-computed: cat([init_noise[1:], init_noise[0:1]])
+        self._unet_kwargs: dict = {"return_dict": False}  # pre-allocated: avoids per-frame dict creation
+        self._cfg_latent_buf = None  # pre-allocated: avoids torch.concat for CFG latent doubling
+        self._cfg_t_buf = None       # pre-allocated: avoids torch.concat for CFG timestep doubling
 
         self.pipe = pipe
         self.image_processor = VaeImageProcessor(pipe.vae_scale_factor)
@@ -531,6 +538,46 @@ class StreamDiffusion:
         self.c_skip = self.c_skip.to(self.device)
         self.c_out = self.c_out.to(self.device)
 
+        # Pre-compute shifted alpha/beta/init_noise (eliminates 5 mallocs + 8 kernel launches per frame)
+        if self.use_denoising_batch and (self.cfg_type == "self" or self.cfg_type == "initialize"):
+            self._alpha_next = torch.cat(
+                [self.alpha_prod_t_sqrt[1:], torch.ones_like(self.alpha_prod_t_sqrt[0:1])], dim=0
+            )
+            self._beta_next = torch.cat(
+                [self.beta_prod_t_sqrt[1:], torch.ones_like(self.beta_prod_t_sqrt[0:1])], dim=0
+            )
+            self._init_noise_rotated = torch.cat([self.init_noise[1:], self.init_noise[0:1]], dim=0)
+        else:
+            self._alpha_next = None
+            self._beta_next = None
+            self._init_noise_rotated = None
+
+        # Pre-allocate combined latent buffer (eliminates 1 malloc + copy kernel per frame)
+        if self.denoising_steps_num > 1:
+            self._combined_latent_buf = torch.empty(
+                (self.batch_size, 4, self.latent_height, self.latent_width),
+                dtype=self.dtype,
+                device=self.device,
+            )
+        else:
+            self._combined_latent_buf = None
+
+        # Pre-allocate CFG expansion buffers (eliminates torch.concat mallocs for latent/timestep doubling)
+        if self.guidance_scale > 1.0 and (self.cfg_type == "initialize" or self.cfg_type == "full"):
+            cfg_batch = (1 + self.batch_size) if self.cfg_type == "initialize" else (2 * self.batch_size)
+            self._cfg_latent_buf = torch.empty(
+                (cfg_batch, 4, self.latent_height, self.latent_width),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._cfg_t_buf = torch.empty(cfg_batch, dtype=self.sub_timesteps_tensor.dtype, device=self.device)
+        else:
+            self._cfg_latent_buf = None
+            self._cfg_t_buf = None
+
+        # Seed _unet_kwargs with the constant key so per-frame code only updates values
+        self._unet_kwargs = {"return_dict": False}
+
     def _get_scheduler_scalings(self, timestep):
         """Get LCM/TCD-specific scaling factors for boundary conditions."""
         if isinstance(self.scheduler, LCMScheduler):
@@ -620,21 +667,28 @@ class StreamDiffusion:
         idx: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
-            x_t_latent_plus_uc = torch.concat([x_t_latent[0:1], x_t_latent], dim=0)
-            t_list = torch.concat([t_list[0:1], t_list], dim=0)
+            # Pre-allocated buf avoids torch.concat malloc for CFG latent doubling
+            self._cfg_latent_buf[:1].copy_(x_t_latent[0:1])
+            self._cfg_latent_buf[1:].copy_(x_t_latent)
+            x_t_latent_plus_uc = self._cfg_latent_buf
+            self._cfg_t_buf[:1].copy_(t_list[0:1])
+            self._cfg_t_buf[1:].copy_(t_list)
+            t_list = self._cfg_t_buf
         elif self.guidance_scale > 1.0 and (self.cfg_type == "full"):
-            x_t_latent_plus_uc = torch.concat([x_t_latent, x_t_latent], dim=0)
-            t_list = torch.concat([t_list, t_list], dim=0)
+            self._cfg_latent_buf[:len(x_t_latent)].copy_(x_t_latent)
+            self._cfg_latent_buf[len(x_t_latent):].copy_(x_t_latent)
+            x_t_latent_plus_uc = self._cfg_latent_buf
+            self._cfg_t_buf[:len(t_list)].copy_(t_list)
+            self._cfg_t_buf[len(t_list):].copy_(t_list)
+            t_list = self._cfg_t_buf
         else:
             x_t_latent_plus_uc = x_t_latent
 
-        # Prepare UNet call arguments
-        unet_kwargs = {
-            "sample": x_t_latent_plus_uc,
-            "timestep": t_list,
-            "encoder_hidden_states": self.prompt_embeds,
-            "return_dict": False,
-        }
+        # Prepare UNet call arguments (update pre-allocated dict in-place: avoids per-frame dict malloc)
+        self._unet_kwargs["sample"] = x_t_latent_plus_uc
+        self._unet_kwargs["timestep"] = t_list
+        self._unet_kwargs["encoder_hidden_states"] = self.prompt_embeds
+        unet_kwargs = self._unet_kwargs
 
         # Add SDXL-specific conditioning if this is an SDXL model
         if self.is_sdxl and hasattr(self, "add_text_embeds") and hasattr(self, "add_time_ids"):
@@ -784,9 +838,7 @@ class StreamDiffusion:
 
         if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
             noise_pred_text = model_pred[1:]
-            self.stock_noise = torch.concat(
-                [model_pred[0:1], self.stock_noise[1:]], dim=0
-            )  # ここコメントアウトでself out cfg
+            self.stock_noise[0:1].copy_(model_pred[0:1])  # in-place: eliminates 1 malloc + copy kernel
         elif self.guidance_scale > 1.0 and (self.cfg_type == "full"):
             noise_pred_uncond, noise_pred_text = model_pred.chunk(2)
         else:
@@ -807,24 +859,9 @@ class StreamDiffusion:
             if self.cfg_type == "self" or self.cfg_type == "initialize":
                 scaled_noise = self.beta_prod_t_sqrt * self.stock_noise
                 delta_x = self.scheduler_step_batch(model_pred, scaled_noise, idx)
-                alpha_next = torch.concat(
-                    [
-                        self.alpha_prod_t_sqrt[1:],
-                        torch.ones_like(self.alpha_prod_t_sqrt[0:1]),
-                    ],
-                    dim=0,
-                )
-                delta_x = alpha_next * delta_x
-                beta_next = torch.concat(
-                    [
-                        self.beta_prod_t_sqrt[1:],
-                        torch.ones_like(self.beta_prod_t_sqrt[0:1]),
-                    ],
-                    dim=0,
-                )
-                delta_x = delta_x / beta_next
-                init_noise = torch.concat([self.init_noise[1:], self.init_noise[0:1]], dim=0)
-                self.stock_noise = init_noise + delta_x
+                delta_x = self._alpha_next * delta_x
+                delta_x = delta_x / self._beta_next
+                self.stock_noise = self._init_noise_rotated + delta_x
 
         else:
             # denoised_batch = self.scheduler.step(model_pred, t_list[0], x_t_latent).denoised
@@ -842,8 +879,10 @@ class StreamDiffusion:
 
         # Circular buffer: overwrite the oldest slot without shifting or cloning.
         # The attention processor reads all slots as an unordered K/V bag, so slot order is irrelevant.
+        # Use self.cache_maxframes (not tensor shape) so that when the buffer is allocated at
+        # max_cache_maxframes but the logical window is smaller, writes stay within the active range.
         for i, new_kv in enumerate(kvo_cache_out):
-            cache_size = self.kvo_cache[i].shape[1]
+            cache_size = self.cache_maxframes
             write_slot = (self.frame_idx // self.cache_interval - 1) % cache_size
             self.kvo_cache[i][:, write_slot].copy_(new_kv.squeeze(1))
 
@@ -875,7 +914,10 @@ class StreamDiffusion:
         if self.use_denoising_batch and isinstance(self.scheduler, LCMScheduler):
             t_list = self.sub_timesteps_tensor
             if self.denoising_steps_num > 1:
-                x_t_latent = torch.cat((x_t_latent, prev_latent_batch), dim=0)
+                # Copy into pre-allocated buffer: eliminates 1 malloc + copy kernel vs torch.cat
+                self._combined_latent_buf[:self.frame_bff_size].copy_(x_t_latent)
+                self._combined_latent_buf[self.frame_bff_size:].copy_(prev_latent_batch)
+                x_t_latent = self._combined_latent_buf
                 self.stock_noise = torch.cat((self.init_noise[0:1], self.stock_noise[:-1]), dim=0)
             x_0_pred_batch, model_pred = self.unet_step(x_t_latent, t_list)
 

@@ -370,24 +370,26 @@ class StreamParameterUpdater(OrchestratorUser):
 
                 if cache_maxframes is not None:
                     old_cache_maxframes = self.stream.cache_maxframes
-                    self.stream.cache_maxframes = cache_maxframes
                     if old_cache_maxframes != cache_maxframes:
-                        for i, cache_tensor in enumerate(self.stream.kvo_cache):
-                            current_shape = cache_tensor.shape
-                            new_shape = (current_shape[0], cache_maxframes, current_shape[2], current_shape[3], current_shape[4])
-                            new_cache_tensor = torch.zeros(
-                                new_shape,
-                                dtype=cache_tensor.dtype,
-                                device=cache_tensor.device
+                        # KVO cache tensors are allocated at max_cache_maxframes and never resized at
+                        # runtime — resizing one-at-a-time races with TRT inference (causes "Dimensions
+                        # with name C must be equal" errors). cache_maxframes is a logical write window.
+                        actual_cache_size = (
+                            self.stream.kvo_cache[0].shape[1]
+                            if self.stream.kvo_cache
+                            else cache_maxframes
+                        )
+                        if cache_maxframes > actual_cache_size:
+                            logger.warning(
+                                f"update_stream_params: Requested cache_maxframes={cache_maxframes} "
+                                f"exceeds allocated buffer size={actual_cache_size}. Clamping."
                             )
-                    
-                            if cache_maxframes > old_cache_maxframes:
-                                new_cache_tensor[:, :old_cache_maxframes] = cache_tensor
-                            else:
-                                new_cache_tensor[:, :] = cache_tensor[:, -cache_maxframes:]
-                            
-                            self.stream.kvo_cache[i] = new_cache_tensor
-                        logger.info(f"update_stream_params: Cache maxframes updated from {old_cache_maxframes} to {cache_maxframes}, kvo_cache tensors resized")
+                            cache_maxframes = actual_cache_size
+                        self.stream.cache_maxframes = cache_maxframes
+                        logger.info(
+                            f"update_stream_params: Cache maxframes {old_cache_maxframes} -> "
+                            f"{cache_maxframes} (buffer size: {actual_cache_size}, no tensor resize)"
+                        )
                     else:
                         logger.info(f"update_stream_params: Cache maxframes set to {cache_maxframes}")
 
@@ -736,6 +738,12 @@ class StreamParameterUpdater(OrchestratorUser):
 
         # Reset stock_noise to match the new init_noise
         self.stream.stock_noise = torch.zeros_like(self.stream.init_noise)
+
+        # Keep pre-computed rotation in sync with new init_noise
+        if self.stream._init_noise_rotated is not None:
+            self.stream._init_noise_rotated = torch.cat(
+                [self.stream.init_noise[1:], self.stream.init_noise[0:1]], dim=0
+            )
 
     def _get_scheduler_scalings(self, timestep):
         """Get LCM/TCD-specific scaling factors for boundary conditions."""

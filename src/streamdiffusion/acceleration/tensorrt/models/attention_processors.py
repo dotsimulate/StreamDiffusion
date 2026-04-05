@@ -14,6 +14,10 @@ class CachedSTAttnProcessor2_0:
     def __init__(self):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
+        # Per-layer pre-allocated buffers (lazy-init on first call — shape is model-dependent)
+        self._curr_key_buf: Optional[torch.Tensor] = None
+        self._curr_value_buf: Optional[torch.Tensor] = None
+        self._kv_out_buf: Optional[torch.Tensor] = None  # shape: (2, 1, B, seq, inner_dim)
 
         # Pre-allocated buffers for zero-alloc hot path (lazy init on first call).
         # _use_prealloc is False by default so ONNX export tracing uses the original
