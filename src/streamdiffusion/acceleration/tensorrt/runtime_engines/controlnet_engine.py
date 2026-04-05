@@ -145,6 +145,13 @@ class ControlNetModelEngine:
 
         return down_blocks, mid_block
 
+    def dump_profile(self, last_n: int = 10) -> None:
+        """Delegate per-layer profiling summary to the underlying TRT Engine.
+
+        No-op when STREAMDIFFUSION_PROFILE_TRT is not set.
+        """
+        self.engine.dump_profile(last_n)
+
     def _extract_controlnet_outputs(self, outputs: Dict[str, torch.Tensor]) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """Extract and organize ControlNet outputs from engine results"""
         down_blocks = []

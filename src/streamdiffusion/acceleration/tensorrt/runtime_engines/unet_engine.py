@@ -319,6 +319,13 @@ class UNet2DConditionModelEngine:
 
         return temp_unet.get_control(image_height, image_width)
 
+    def dump_profile(self, last_n: int = 10) -> None:
+        """Delegate per-layer profiling summary to the underlying TRT Engine.
+
+        No-op when STREAMDIFFUSION_PROFILE_TRT is not set.
+        """
+        self.engine.dump_profile(last_n)
+
     def to(self, *args, **kwargs):
         pass
 
@@ -385,6 +392,14 @@ class AutoencoderKLEngine:
             use_cuda_graph=self.use_cuda_graph,
         )["images"]
         return DecoderOutput(sample=images)
+
+    def dump_profile(self, last_n: int = 10) -> None:
+        """Delegate per-layer profiling summary to encoder and decoder TRT Engines.
+
+        No-op when STREAMDIFFUSION_PROFILE_TRT is not set.
+        """
+        self.encoder.dump_profile(last_n)
+        self.decoder.dump_profile(last_n)
 
     def to(self, *args, **kwargs):
         pass
