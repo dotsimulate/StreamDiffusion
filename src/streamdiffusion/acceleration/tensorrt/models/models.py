@@ -151,7 +151,9 @@ class BaseModel:
 
     def get_minmax_dims(self, batch_size, image_height, image_width, static_batch, static_shape):
         if static_batch:
-            min_batch = max(1, batch_size - 1)
+            # Fully static: min=opt=max so TRT sees no symbolic batch dim.
+            # Required for l2tc (L2 tiling) which checks that ALL dims are concrete.
+            min_batch = batch_size
             max_batch = batch_size
         else:
             min_batch = self.min_batch

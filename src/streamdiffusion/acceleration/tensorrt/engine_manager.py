@@ -230,7 +230,7 @@ class EngineManager:
             "opt_image_height": opt_image_height,
             "opt_image_width": opt_image_width,
             "build_dynamic_shape": build_dynamic_shape,
-            "build_static_batch": False,
+            "build_static_batch": True,
         }
         if build_dynamic_shape:
             opts["min_image_resolution"] = 384
