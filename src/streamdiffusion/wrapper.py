@@ -490,7 +490,10 @@ class StreamDiffusionWrapper:
         if hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
             if next(pipe.text_encoder_2.parameters(), None) is not None:
                 pipe.text_encoder_2 = pipe.text_encoder_2.to("cpu")
-        torch.cuda.empty_cache()
+        # NOTE: torch.cuda.empty_cache() removed — it forces a full CUDA sync
+        # that stalls the GPU pipeline, causing visible stutters during prompt
+        # changes. The freed VRAM stays in PyTorch's allocator cache and gets
+        # reused automatically without the sync penalty.
         logger.debug("[VRAM] Text encoders offloaded to CPU")
 
     def _reload_text_encoders(self) -> None:
