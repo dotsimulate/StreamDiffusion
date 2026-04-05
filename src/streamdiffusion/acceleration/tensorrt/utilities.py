@@ -336,6 +336,84 @@ def CUASSERT(cuda_ret):
     return None
 
 
+class TRTProfiler(trt.IProfiler):
+    """
+    Per-layer TRT timing profiler.
+
+    Activated by setting the STREAMDIFFUSION_PROFILE_TRT environment variable.
+    Attach to Engine.context after create_execution_context(); TRT will call
+    report_layer_time() once per layer per inference pass.
+
+    NOTE: Attaching a profiler disables CUDA graph replay for that engine
+    (IProfiler cannot report per-layer times through a captured graph).
+    Production inference always runs without profiler — zero overhead.
+
+    Usage:
+        set STREAMDIFFUSION_PROFILE_TRT=1
+        python td_main.py
+        # After N iterations, call engine.dump_profile()
+
+    Nsight Systems workflow (standalone .engine files):
+        # Build with profilingVerbosity=DETAILED (done automatically at build time)
+        # Profile with trtexec:
+        trtexec --loadEngine=unet.engine --noDataTransfers --useSpinWait \\
+                --warmUp=0 --duration=0 --iterations=50 \\
+                --profilingVerbosity=detailed --dumpProfile --separateProfileRun
+        # For CUDA graph per-kernel view, add --useCudaGraph --cuda-graph-trace=node
+        # and wrap with: nsys profile --capture-range cudaProfilerApi trtexec ...
+    """
+
+    def __init__(self, name: str = ""):
+        super().__init__()
+        self.name = name
+        self._runs: list = []        # list of lists: [[( layer_name, ms ), ...], ...]
+        self._current: list = []     # accumulator for the in-progress inference
+
+    def report_layer_time(self, layer_name: str, ms: float) -> None:  # noqa: N802
+        self._current.append((layer_name, ms))
+
+    def start_run(self) -> None:
+        self._current = []
+
+    def end_run(self) -> None:
+        if self._current:
+            self._runs.append(self._current)
+        self._current = []
+
+    def get_summary(self, last_n: int = 10) -> str:
+        if not self._runs:
+            return f"[{self.name}] No profiling data collected yet."
+
+        runs = self._runs[-last_n:]
+        from collections import defaultdict
+        totals: dict = defaultdict(list)
+        for run in runs:
+            for layer_name, ms in run:
+                totals[layer_name].append(ms)
+
+        # Sort by median descending
+        def _median(v):
+            s = sorted(v)
+            return s[len(s) // 2]
+
+        sorted_layers = sorted(totals.items(), key=lambda x: _median(x[1]), reverse=True)
+        total_ms = sum(_median(v) for _, v in sorted_layers)
+
+        lines = [
+            f"[{self.name}] Layer Profile — {len(runs)} runs, "
+            f"{total_ms:.2f} ms total (median per layer):"
+        ]
+        for layer_name, times in sorted_layers[:25]:
+            med = _median(times)
+            pct = (med / total_ms * 100) if total_ms > 0 else 0
+            lines.append(f"  {med:8.3f} ms  {pct:5.1f}%  {layer_name}")
+        remaining = len(sorted_layers) - 25
+        if remaining > 0:
+            rest_ms = sum(_median(v) for _, v in sorted_layers[25:])
+            lines.append(f"  ... {remaining} more layers  ({rest_ms:.2f} ms)")
+        return "\n".join(lines)
+
+
 class Engine:
     def __init__(
         self,
@@ -524,6 +602,13 @@ class Engine:
 
         config = builder.create_builder_config()
 
+        # Embed layer names + tactic IDs in the engine for runtime IProfiler support.
+        # Zero runtime cost — only affects engine metadata size (a few KB).
+        try:
+            config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
+        except AttributeError:
+            pass
+
         # Precision flags
         if fp16:
             config.set_flag(trt.BuilderFlag.FP16)
@@ -633,6 +718,13 @@ class Engine:
             )
 
         config = builder.create_builder_config()
+
+        # Embed layer names + tactic IDs in the engine for runtime IProfiler support.
+        try:
+            config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
+        except AttributeError:
+            pass
+
         # BuilderFlag.STRONGLY_TYPED was removed in TRT 10.12; the network-level flag
         # (NetworkDefinitionCreationFlag.STRONGLY_TYPED, set on network creation above)
         # is now the only mechanism. On older TRT versions where BuilderFlag.STRONGLY_TYPED
@@ -709,6 +801,16 @@ class Engine:
             self.context.device_memory = reuse_device_memory
         else:
             self.context = self.engine.create_execution_context()
+
+        # Attach per-layer profiler when STREAMDIFFUSION_PROFILE_TRT is set.
+        # Requires engines built with profiling_verbosity=DETAILED for meaningful names.
+        # NOTE: profiler presence disables CUDA graph replay in infer() — IProfiler
+        # cannot report per-layer times through a captured graph.
+        self.profiler: Optional[TRTProfiler] = None
+        if os.environ.get("STREAMDIFFUSION_PROFILE_TRT"):
+            self.profiler = TRTProfiler(name=os.path.basename(self.engine_path))
+            self.context.profiler = self.profiler
+            logger.info(f"[TRTProfiler] Attached to {os.path.basename(self.engine_path)} (CUDA graphs disabled)")
 
     def allocate_buffers(self, shape_dict=None, device="cuda"):
         # Check if we can reuse existing buffers (OPTIMIZATION)
@@ -811,6 +913,12 @@ class Engine:
             self.graph = None
 
     def infer(self, feed_dict, stream, use_cuda_graph=False):
+        # IProfiler cannot report per-layer times through CUDA graph replay — disable graphs
+        # when profiler is attached. This is automatically set when STREAMDIFFUSION_PROFILE_TRT
+        # is set in activate(), so callers do not need to change anything.
+        if self.profiler is not None:
+            use_cuda_graph = False
+
         # Filter inputs to only those the engine actually exposes to avoid binding errors
         # _allowed_inputs is cached on first call — IO tensor names are immutable after engine build
         if self._allowed_inputs is None:
@@ -835,6 +943,9 @@ class Engine:
                         sorted(list(self._allowed_inputs)),
                     )
             feed_dict = filtered_feed_dict
+
+        if self.profiler is not None:
+            self.profiler.start_run()
 
         for name, buf in feed_dict.items():
             self.tensors[name].copy_(buf)
@@ -868,7 +979,21 @@ class Engine:
             if not noerror:
                 raise ValueError("ERROR: inference failed.")
 
+        if self.profiler is not None:
+            # Synchronize to ensure all IProfiler.report_layer_time() callbacks have fired
+            # before end_run() stores the accumulated per-layer data.
+            stream.synchronize()
+            self.profiler.end_run()
+
         return self.tensors
+
+    def dump_profile(self, last_n: int = 10) -> None:
+        """Log a per-layer timing summary for the last N profiled inference runs.
+
+        No-op when STREAMDIFFUSION_PROFILE_TRT is not set (profiler is None).
+        """
+        if self.profiler is not None:
+            logger.info(self.profiler.get_summary(last_n))
 
 
 def decode_images(images: torch.Tensor):
