@@ -130,22 +130,24 @@ def detect_gpu_profile(device: int = 0) -> GPUBuildProfile:
     sms = props.multi_processor_count
 
     # --- Tier selection ---
-    # opt_level=4 for all tiers: always compiles dynamic kernels (better than
-    # level-3 heuristics) without level-5's "compare dynamic vs static" extra pass
-    # which OOMs during tactic profiling on dynamic-shape engines (160 GiB request).
+    # opt_level=3 for all tiers: level-4's "always compile dynamic kernels" is
+    # unnecessary with fully static shapes (build_static_batch + build_dynamic_shape=False)
+    # and triggers tactic 0x3e9 "Assertion g.nodes.size() == 0" failures in TRT 10.12.
+    # Level-3 heuristic selection produces equivalent results for static profiles.
+    # Level-5 still avoided — causes OOM during tactic profiling (160 GiB requests).
     if cc >= (12, 0):
         tier = "blackwell"
-        opt_level = 4
+        opt_level = 3
         tiling = "FULL"
         max_ws_cap = 16 * (2 ** 30)   # 16 GiB cap
     elif cc >= (8, 9):                 # Ada Lovelace (8.9 exactly)
         tier = "ada"
-        opt_level = 4
+        opt_level = 3
         tiling = "MODERATE"
         max_ws_cap = 12 * (2 ** 30)   # 12 GiB cap
     elif cc >= (8, 0):                 # Ampere (8.0 – 8.8)
         tier = "ampere"
-        opt_level = 4
+        opt_level = 3
         tiling = "FAST"
         max_ws_cap = 8 * (2 ** 30)    # 8 GiB cap
     else:
@@ -222,11 +224,12 @@ def _apply_gpu_profile_to_config(
         return
 
     # builder_optimization_level (0–5):
-    #   4 = always compiles dynamic kernels (better than level-3 heuristics)
-    #   5 = additionally compares dynamic vs static kernels — causes OOM during
-    #       tactic profiling on dynamic-shape engines (160 GiB requests observed).
-    # We use level 4 for all tiers to get the dynamic-kernel benefit without the
-    # level-5 exhaustive comparison that OOMs.
+    #   3 = heuristic-based tactic selection — optimal for fully static shapes
+    #   4 = always compiles dynamic kernels — unnecessary with static shapes,
+    #       triggers tactic 0x3e9 assertion failures in TRT 10.12
+    #   5 = compares dynamic vs static kernels — OOMs during tactic profiling
+    # Level 3 used for all tiers: static builds (build_dynamic_shape=False) don't
+    # benefit from dynamic-kernel compilation, and level 4 causes spurious errors.
     try:
         config.builder_optimization_level = gpu_profile.builder_optimization_level
         logger.info(f"[TRT Config] builder_optimization_level={gpu_profile.builder_optimization_level}")
