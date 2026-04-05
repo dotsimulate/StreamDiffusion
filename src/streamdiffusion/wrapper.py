@@ -2062,7 +2062,7 @@ class StreamDiffusionWrapper:
                                     max_batch_size=self.max_batch_size,
                                     min_batch_size=self.min_batch_size,
                                     cuda_stream=cuda_stream,
-                                    use_cuda_graph=False,
+                                    use_cuda_graph=True,
                                     unet=None,
                                     model_path=cfg["model_id"],
                                     opt_image_height=self.height,
