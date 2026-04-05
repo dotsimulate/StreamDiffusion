@@ -18,6 +18,10 @@ class CachedSTAttnProcessor2_0:
         self._curr_key_buf: Optional[torch.Tensor] = None
         self._curr_value_buf: Optional[torch.Tensor] = None
         self._kv_out_buf: Optional[torch.Tensor] = None  # shape: (2, 1, B, seq, inner_dim)
+        # When False (default): ONNX-safe .clone() path — used during torch.onnx.export() tracing.
+        # When True: zero-alloc .copy_() path — set after ONNX export for non-TRT runtime inference.
+        # NOTE: aten::copy has no ONNX symbolic and cannot be traced; never set True before export.
+        self._use_prealloc: bool = False
 
     def __call__(
         self,
@@ -72,16 +76,21 @@ class CachedSTAttnProcessor2_0:
             cached_key, cached_value = None, None
 
         if is_selfattn:
-            # Lazy-init per-layer buffers (shape is model-dependent, known only on first call)
-            if self._curr_key_buf is None or self._curr_key_buf.shape != key.shape:
-                self._curr_key_buf = torch.empty_like(key)
-                self._curr_value_buf = torch.empty_like(value)
-                self._kv_out_buf = torch.empty((2, 1, *key.shape), dtype=key.dtype, device=key.device)
-            # In-place copy: eliminates 2 clone() mallocs per layer per denoising step
-            self._curr_key_buf.copy_(key)
-            self._curr_value_buf.copy_(value)
-            curr_key = self._curr_key_buf
-            curr_value = self._curr_value_buf
+            if self._use_prealloc:
+                # Zero-alloc path: .copy_() into pre-allocated buffers eliminates 2 mallocs per layer.
+                # NOT ONNX-traceable — only active after export (aten::copy has no ONNX symbolic).
+                if self._curr_key_buf is None or self._curr_key_buf.shape != key.shape:
+                    self._curr_key_buf = torch.empty_like(key)
+                    self._curr_value_buf = torch.empty_like(value)
+                    self._kv_out_buf = torch.empty((2, 1, *key.shape), dtype=key.dtype, device=key.device)
+                self._curr_key_buf.copy_(key)
+                self._curr_value_buf.copy_(value)
+                curr_key = self._curr_key_buf
+                curr_value = self._curr_value_buf
+            else:
+                # ONNX-safe path: .clone() exports cleanly to aten::clone (has ONNX symbolic).
+                curr_key = key.clone()
+                curr_value = value.clone()
 
             if cached_key is not None:
                 cached_key_reshaped = cached_key.transpose(0, 1).contiguous().flatten(1, 2)
@@ -120,9 +129,13 @@ class CachedSTAttnProcessor2_0:
         hidden_states = hidden_states / attn.rescale_output_factor
 
         if is_selfattn:
-            # In-place fill pre-allocated output buffer: eliminates torch.stack malloc per layer
-            self._kv_out_buf[0, 0].copy_(curr_key)
-            self._kv_out_buf[1, 0].copy_(curr_value)
-            kvo_cache = self._kv_out_buf
+            if self._use_prealloc:
+                # In-place fill pre-allocated output buffer: eliminates torch.stack malloc per layer.
+                self._kv_out_buf[0, 0].copy_(curr_key)
+                self._kv_out_buf[1, 0].copy_(curr_value)
+                kvo_cache = self._kv_out_buf
+            else:
+                # ONNX-safe fallback: torch.stack is exportable.
+                kvo_cache = torch.stack([curr_key.unsqueeze(0), curr_value.unsqueeze(0)])
 
         return hidden_states, kvo_cache
