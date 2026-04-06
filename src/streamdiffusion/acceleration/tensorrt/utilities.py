@@ -130,9 +130,11 @@ def detect_gpu_profile(device: int = 0) -> GPUBuildProfile:
     sms = props.multi_processor_count
 
     # --- Tier selection ---
-    # opt_level=4 for all tiers: always compiles dynamic kernels (better than
-    # level-3 heuristics) without level-5's "compare dynamic vs static" extra pass
-    # which OOMs during tactic profiling on dynamic-shape engines (160 GiB request).
+    # opt_level=4 for all tiers: always compiles dynamic kernels (better kernel
+    # selection than level-3 heuristics, even for static shapes). Level 5 avoided —
+    # causes OOM during tactic profiling (160 GiB requests observed).
+    # NOTE: tactic 0x3e9 "Assertion g.nodes.size() == 0" errors in TRT 10.12 are
+    # a known TRT bug — benign, the tactic is skipped and build succeeds.
     if cc >= (12, 0):
         tier = "blackwell"
         opt_level = 4
