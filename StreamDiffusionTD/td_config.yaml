@@ -2,7 +2,7 @@
 model_id: "stabilityai/sdxl-turbo"
 
 # Core StreamDiffusion parameters
-t_index_list: [9, 32]
+t_index_list: [12, 22]
 width: 512
 height: 512
 device: "cuda"
@@ -23,7 +23,7 @@ mode: "img2img"  # Always use img2img engines (mode switching handled at runtime
 frame_buffer_size: 1
 use_denoising_batch: true
 use_tiny_vae: true
-acceleration: "tensorrt"
+acceleration: "none"
 fp8: true
 cfg_type: "self"
 do_add_noise: true
@@ -39,7 +39,7 @@ sampler: "normal"
 
 # StreamV2V Cached Attention (Cattenable enables, Cattmaxframes/Cattinterval tune)
 use_cached_attn: true
-cache_maxframes: 3
+cache_maxframes: 4
 cache_interval: 1
 
 # Image filtering (similar frame skip)
@@ -53,8 +53,13 @@ hf_cache: ""
 # TensorRT engine directory
 engine_dir: "D:/Users/alexk/FORKNI/STREAM_DIFFUSION/STREAM_DIFFUSION_LIVEPEER/StreamDiffusion/engines/td"
 
-# ControlNet configuration (disabled)
-use_controlnet: false
+# ControlNet configuration
+use_controlnet: true
+controlnets:
+  - model_id: "xinsir/controlnet-canny-sdxl-1.0"
+    conditioning_scale: 0.536
+    preprocessor: "canny"
+    enabled: true
 
 # IPAdapter configuration (disabled)
 use_ipadapter: false

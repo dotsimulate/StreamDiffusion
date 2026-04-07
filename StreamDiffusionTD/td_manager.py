@@ -534,16 +534,11 @@ class TouchDesignerManager:
                     instantaneous_fps = (
                         1.0 / frame_interval if frame_interval > 0 else 0.0
                     )
-                    # Smooth the FPS calculation.
-                    # Seed EMA with first measurement so display doesn't slowly
-                    # climb from 0.0 during ramp-up.
-                    if self.current_fps == 0.0:
-                        self.current_fps = instantaneous_fps
-                    else:
-                        self.current_fps = (
-                            self.current_fps * self.fps_smoothing
-                            + instantaneous_fps * (1 - self.fps_smoothing)
-                        )
+                    # Smooth the FPS calculation
+                    self.current_fps = (
+                        self.current_fps * self.fps_smoothing
+                        + instantaneous_fps * (1 - self.fps_smoothing)
+                    )
                 self.last_frame_output_time = frame_output_time
 
                 # Update frame counters

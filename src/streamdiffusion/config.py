@@ -411,6 +411,9 @@ def _validate_config(config: Dict[str, Any]) -> None:
         raise ValueError("_validate_config: Missing required field: model_id")
 
     if "controlnets" in config:
+        # YAML `controlnets:` with no value parses as None — normalize to empty list
+        if config["controlnets"] is None:
+            config["controlnets"] = []
         if not isinstance(config["controlnets"], list):
             raise ValueError("_validate_config: 'controlnets' must be a list")
 
@@ -431,6 +434,9 @@ def _validate_config(config: Dict[str, Any]) -> None:
 
     # Validate ipadapters if present
     if "ipadapters" in config:
+        # YAML `ipadapters:` with no value parses as None — normalize to empty list
+        if config["ipadapters"] is None:
+            config["ipadapters"] = []
         if not isinstance(config["ipadapters"], list):
             raise ValueError("_validate_config: 'ipadapters' must be a list")
 
