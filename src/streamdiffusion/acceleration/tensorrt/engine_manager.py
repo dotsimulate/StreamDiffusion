@@ -160,9 +160,22 @@ class EngineManager:
                 if use_controlnet:
                     prefix += "--controlnet"
                 if fp8:
-                    prefix += "--fp8"
+                    prefix += "--fp8v2"
 
             prefix += f"--mode-{mode}"
+
+            # Embed TRT version + compute capability so upgrading TRT invalidates
+            # stale engines automatically. Old engine dirs are orphaned (not deleted),
+            # keeping them available for rollback. Fails silently if tensorrt isn't
+            # installed yet (e.g. during a partial install).
+            try:
+                import tensorrt as _trt
+                import torch as _torch
+
+                _cc = _torch.cuda.get_device_capability(0)
+                prefix += f"--trt{_trt.__version__}--cc{_cc[0]}{_cc[1]}"
+            except Exception:
+                pass
 
             if resolution is not None:
                 prefix += f"--res-{resolution[0]}x{resolution[1]}"

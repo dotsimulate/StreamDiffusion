@@ -1,22 +1,30 @@
+import os
+
 import torch
 import torch.nn as nn
-from diffusers import AutoencoderKL, UNet2DConditionModel, ControlNetModel
+
+
+os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+from diffusers import AutoencoderKL, ControlNetModel, UNet2DConditionModel
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import (
     retrieve_latents,
 )
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
+
 from .builder import EngineBuilder
 from .models.models import BaseModel
+
 
 def cosine_distance(image_embeds, text_embeds):
     normalized_image_embeds = nn.functional.normalize(image_embeds)
     normalized_text_embeds = nn.functional.normalize(text_embeds)
     return torch.mm(normalized_image_embeds, normalized_text_embeds.t())
 
+
 class StableDiffusionSafetyCheckerWrapper(StableDiffusionSafetyChecker):
     def __init__(self, config):
         super().__init__(config)
-    
+
     @torch.no_grad()
     def forward(self, clip_input):
         pooled_output = self.vision_model(clip_input)[1]
@@ -37,6 +45,7 @@ class StableDiffusionSafetyCheckerWrapper(StableDiffusionSafetyChecker):
 
         return has_nsfw_concepts
 
+
 class TorchVAEEncoder(torch.nn.Module):
     def __init__(self, vae: AutoencoderKL):
         super().__init__()
@@ -44,6 +53,7 @@ class TorchVAEEncoder(torch.nn.Module):
 
     def forward(self, x: torch.Tensor):
         return retrieve_latents(self.vae.encode(x))
+
 
 def compile_vae_encoder(
     vae: TorchVAEEncoder,
@@ -84,6 +94,7 @@ def compile_vae_decoder(
         **engine_build_options,
     )
 
+
 def compile_safety_checker(
     safety_checker: StableDiffusionSafetyCheckerWrapper,
     model_data: BaseModel,
@@ -117,7 +128,14 @@ def compile_unet(
     # These are not valid kwargs for build_engine() and must be handled here.
     build_options = dict(engine_build_options)
     fp8 = build_options.pop("fp8", False)
-    calibration_data_fn = build_options.pop("calibration_data_fn", None)
+    pipe_ref = build_options.pop("pipe_ref", None)
+    calibration_prompts = build_options.pop("calibration_prompts", None)
+    calibration_steps = build_options.pop("calibration_steps", 20)
+    amax_save_path = build_options.pop("amax_save_path", None)
+    fp8_alpha = build_options.pop("fp8_alpha", 0.8)
+    fp8_allow_fp16_fallback = build_options.pop("fp8_allow_fp16_fallback", False)
+    # Legacy key removed; silently discard for backward compat with cached callers
+    build_options.pop("calibration_data_fn", None)
 
     unet = unet.to(torch.device("cuda"), dtype=torch.float16)
     builder = EngineBuilder(model_data, unet, device=torch.device("cuda"))
@@ -127,7 +145,12 @@ def compile_unet(
         engine_path,
         opt_batch_size=opt_batch_size,
         fp8=fp8,
-        calibration_data_fn=calibration_data_fn,
+        pipe_ref=pipe_ref,
+        calibration_prompts=calibration_prompts,
+        calibration_steps=calibration_steps,
+        amax_save_path=amax_save_path,
+        fp8_alpha=fp8_alpha,
+        fp8_allow_fp16_fallback=fp8_allow_fp16_fallback,
         **build_options,
     )
 

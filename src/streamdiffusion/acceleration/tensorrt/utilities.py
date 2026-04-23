@@ -135,8 +135,8 @@ def detect_gpu_profile(device: int = 0) -> GPUBuildProfile:
     # opt_level=4 for all tiers: always compiles dynamic kernels (better kernel
     # selection than level-3 heuristics, even for static shapes). Level 5 avoided —
     # causes OOM during tactic profiling (160 GiB requests observed).
-    # NOTE: tactic 0x3e9 "Assertion g.nodes.size() == 0" errors in TRT 10.12 are
-    # a known TRT bug — benign, the tactic is skipped and build succeeds.
+    # NOTE: tactic 0x3e9 "Assertion g.nodes.size() == 0" errors observed in TRT 10.12–10.16 —
+    # benign (TRT skips the tactic and picks another, build completes normally).
     if cc >= (12, 0):
         tier = "blackwell"
         opt_level = 4
@@ -294,15 +294,46 @@ def _apply_gpu_profile_to_config(
             logger.debug("[TRT Config] RUNTIME_ACTIVATION_RESIZE_10_10 not supported — skipping")
 
     # avg_timing_iterations: number of timing runs averaged per tactic candidate.
-    # Default 1 produces noisy measurements — occasional slow GPU clocks or cache
-    # miss can unfairly disqualify the best kernel. Value of 4 gives stable rankings
-    # with minimal extra build time (4× timing overhead, which is tiny vs. compilation).
-    # TRT 10.12 confirmed to support this property.
+    # Default 1 produces noisy measurements. Blackwell (SM_120+) requires 8 passes —
+    # WDDM kernel-launch latency jitter is higher and needs more averaging to stably
+    # rank tactics. Ada/Ampere use 4 (sufficient; lower variance).
     try:
-        config.avg_timing_iterations = 4
-        logger.info("[TRT Config] avg_timing_iterations=4")
+        timing_iters = 8 if gpu_profile.compute_capability >= (12, 0) else 4
+        config.avg_timing_iterations = timing_iters
+        logger.info(f"[TRT Config] avg_timing_iterations={timing_iters}")
     except AttributeError:
         logger.debug("[TRT Config] avg_timing_iterations not supported — skipping")
+
+    # Tactic sources — SM_120+ (Blackwell) only:
+    # cuDNN conv/norm tactics don't exist in the consumer-Blackwell codegen path.
+    # Leaving CUDNN in the default set wastes profiling time and can steer Myelin
+    # toward a suboptimal fallback. Scope to CUBLAS + CUBLAS_LT + JIT_CONVOLUTIONS
+    # + EDGE_MASK_CONVOLUTIONS — the sources that produce valid SM_120 kernels.
+    # TRT 10.16 exposes TacticSource as an int enum (not IntFlag), so the bitmask
+    # is built via (1 << int(source)). No-op on Ada/Ampere.
+    if gpu_profile.compute_capability >= (12, 0):
+        try:
+            sources = (
+                (1 << int(trt.TacticSource.CUBLAS))
+                | (1 << int(trt.TacticSource.CUBLAS_LT))
+                | (1 << int(trt.TacticSource.JIT_CONVOLUTIONS))
+                | (1 << int(trt.TacticSource.EDGE_MASK_CONVOLUTIONS))
+            )
+            config.set_tactic_sources(sources)
+            logger.info(
+                "[TRT Config] tactic sources = CUBLAS|CUBLAS_LT|JIT_CONV|EDGE_MASK (CUDNN excluded for SM_120+)"
+            )
+        except (AttributeError, TypeError) as e:
+            logger.debug(f"[TRT Config] set_tactic_sources not available: {e}")
+
+    # max_num_tactics: cap profiling candidates per layer to reduce build time.
+    # Available since TRT 10.x; -1 (default) lets TRT decide heuristically. 64 is a
+    # reasonable cap that matches FLUX's config. Gracefully ignored on older TRT.
+    try:
+        config.max_num_tactics = 64
+        logger.info("[TRT Config] max_num_tactics=64")
+    except AttributeError:
+        logger.debug("[TRT Config] max_num_tactics not supported — skipping")
 
 
 # Map of numpy dtype -> torch dtype
@@ -1107,12 +1138,14 @@ def build_engine(
         static_batch=build_static_batch,
         static_shape=not build_dynamic_shape,
     )
+    # Note: build_all_tactics is accepted by build_engine() for API compat but
+    # Engine.build() does not forward it — tactic selection is now driven by
+    # set_tactic_sources (SM_120+) and max_tactics_per_layer in _apply_gpu_profile_to_config.
     engine.build(
         onnx_opt_path,
         fp16=True,
         input_profile=input_profile,
         enable_refit=build_enable_refit,
-        enable_all_tactics=build_all_tactics,
         timing_cache=timing_cache_path,
         workspace_size=max_workspace_size,
         fp8=fp8,
