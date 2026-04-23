@@ -1,10 +1,10 @@
+import platform
 from typing import Literal, Optional
 
 import fire
 from packaging.version import Version
 
-from ..pip_utils import is_installed, run_pip, version, get_cuda_major
-import platform
+from ..pip_utils import get_cuda_major, is_installed, run_pip, version
 
 
 def install(cu: Optional[Literal["11", "12"]] = get_cuda_major()):
@@ -13,50 +13,42 @@ def install(cu: Optional[Literal["11", "12"]] = get_cuda_major()):
 
     print("Installing TensorRT requirements...")
 
-    min_trt_version = Version("10.12.0") if cu == "12" else Version("9.0.0")
+    min_trt_version = Version("10.16.0") if cu == "12" else Version("9.0.0")
     trt_version = version("tensorrt")
     if trt_version and trt_version < min_trt_version:
         run_pip("uninstall -y tensorrt")
 
     cudnn_package, trt_package = (
-        ("nvidia-cudnn-cu12==9.7.1.26", "tensorrt==10.12.0.36")
-        if cu == "12" else
-        ("nvidia-cudnn-cu11==8.9.7.29", "tensorrt==9.0.1.post11.dev4")
+        ("nvidia-cudnn-cu12==9.7.1.26", "tensorrt==10.16.1.11")
+        if cu == "12"
+        else ("nvidia-cudnn-cu11==8.9.7.29", "tensorrt==9.0.1.post11.dev4")
     )
     if not is_installed(trt_package):
         run_pip(f"install {cudnn_package} --no-cache-dir")
         run_pip(f"install --extra-index-url https://pypi.nvidia.com {trt_package} --no-cache-dir")
 
     if not is_installed("polygraphy"):
-        run_pip(
-            "install polygraphy==0.49.26 --extra-index-url https://pypi.ngc.nvidia.com"
-        )
+        run_pip("install polygraphy==0.49.26 --extra-index-url https://pypi.ngc.nvidia.com")
     if not is_installed("onnx_graphsurgeon"):
-        run_pip(
-            "install onnx-graphsurgeon==0.5.8 --extra-index-url https://pypi.ngc.nvidia.com"
-        )
-    if platform.system() == 'Windows' and not is_installed("pywin32"):
-        run_pip(
-            "install pywin32==311"
-        )
-    if platform.system() == 'Windows' and not is_installed("triton"):
-        run_pip(
-            "install triton-windows==3.4.0.post21"
-        )
+        run_pip("install onnx-graphsurgeon==0.6.1 --extra-index-url https://pypi.ngc.nvidia.com")
+    if platform.system() == "Windows" and not is_installed("pywin32"):
+        run_pip("install pywin32==311")
+    if platform.system() == "Windows" and not is_installed("triton"):
+        run_pip("install triton-windows==3.4.0.post21")
 
-    # Pin onnx 1.18 + onnxruntime-gpu 1.24 together:
-    #   - onnx 1.18 exports IR 11; modelopt needs FLOAT4E2M1 added in 1.18
-    #   - onnx 1.19+ exports IR 12 (ORT 1.24 max) and removes float32_to_bfloat16 (onnx-gs needs it)
-    #   - onnxruntime-gpu 1.24 supports IR 11; never co-install CPU onnxruntime (shared files conflict)
-    run_pip("install onnx==1.18.0 onnxruntime-gpu==1.24.4 --no-cache-dir")
+    # ONNX stack aligned with FLUX for TRT 10.16:
+    #   - onnx 1.19.1 (IR 11); modelopt's FLOAT4E2M1 support landed in 1.18 and stays in 1.19
+    #   - onnx-gs 0.6.1 no longer needs float32_to_bfloat16 (previously forced onnx==1.18)
+    #   - onnxruntime-gpu 1.24.4 supports IR 11; never co-install CPU onnxruntime (shared files conflict)
+    #   - onnxoptimizer/onnxslim/onnxscript pair with the onnxoptimizer.optimize_from_path pipeline
+    run_pip(
+        "install onnx==1.19.1 onnxruntime-gpu==1.24.4 onnxoptimizer==0.4.2 onnxslim==0.1.91 onnxscript==0.6.2 --no-cache-dir"
+    )
 
     # FP8 quantization dependencies (CUDA 12 only)
     # nvidia-modelopt requires cupy; pin cupy 13.x + numpy<2 for mediapipe compat
     if cu == "12":
-        run_pip(
-            'install "nvidia-modelopt[onnx]" "cupy-cuda12x==13.6.0" "numpy==1.26.4"'
-            " --no-cache-dir"
-        )
+        run_pip("install nvidia-modelopt[onnx] cupy-cuda12x==13.6.0 numpy==1.26.4 --no-cache-dir")
 
 
 if __name__ == "__main__":

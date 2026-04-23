@@ -4,6 +4,7 @@ import sys
 
 from setuptools import find_packages, setup
 
+
 # Copied from pip_utils.py to avoid import
 def _check_torch_installed():
     try:
@@ -18,16 +19,18 @@ def _check_torch_installed():
         raise RuntimeError(msg)
 
     if not torch.version.cuda:
-        raise RuntimeError("Detected CPU-only PyTorch. Install CUDA-enabled torch/vision/audio before installing this package.")
+        raise RuntimeError(
+            "Detected CPU-only PyTorch. Install CUDA-enabled torch/vision/audio before installing this package."
+        )
 
 
 def get_cuda_constraint():
-    cuda_version = os.environ.get("STREAMDIFFUSION_CUDA_VERSION") or \
-                    os.environ.get("CUDA_VERSION")
+    cuda_version = os.environ.get("STREAMDIFFUSION_CUDA_VERSION") or os.environ.get("CUDA_VERSION")
 
     if not cuda_version:
         try:
             import torch
+
             cuda_version = torch.version.cuda
         except Exception:
             # might not be available during wheel build, so we have to ignore
@@ -55,13 +58,16 @@ _deps = [
     "Pillow>=12.2.0",  # CVE-2026-25990: out-of-bounds write in PSD loading; 12.2.0 verified
     "fire==0.7.1",
     "omegaconf==2.3.0",
-    "onnx==1.18.0",  # IR 11 — modelopt needs FLOAT4E2M1 (added in 1.18); float32_to_bfloat16 present (removed in 1.19+)
+    "onnx==1.19.1",  # IR 11; modelopt needs FLOAT4E2M1 (added in 1.18); onnx-gs 0.6.1 no longer needs float32_to_bfloat16
     "onnxruntime-gpu==1.24.4",  # TRT EP, supports IR 11; never co-install CPU onnxruntime — shared files conflict
+    "onnxoptimizer==0.4.2",
+    "onnxslim==0.1.91",
+    "onnxscript==0.6.2",
     "polygraphy==0.49.26",
     "protobuf>=4.25.8,<5",  # mediapipe 0.10.21 requires protobuf 4.x; 4.25.8 fixes CVE-2025-4565; CVE-2026-0994 (JSON DoS) accepted risk for local pipeline
     "colored==2.3.2",
     "pywin32==311;sys_platform == 'win32'",
-    "onnx-graphsurgeon==0.5.8",
+    "onnx-graphsurgeon==0.6.1",
     "controlnet-aux==0.0.10",
     "diffusers-ipadapter @ git+https://github.com/livepeer/Diffusers_IPAdapter.git@405f87da42932e30bd55ee8dca3ce502d7834a99",
     "mediapipe==0.10.21",
@@ -80,7 +86,18 @@ def deps_list(*pkgs):
 extras = {}
 extras["xformers"] = deps_list("xformers")
 extras["torch"] = deps_list("torch", "accelerate")
-extras["tensorrt"] = deps_list("protobuf", "cuda-python", "onnx", "onnxruntime-gpu", "colored", "polygraphy", "onnx-graphsurgeon")
+extras["tensorrt"] = deps_list(
+    "protobuf",
+    "cuda-python",
+    "onnx",
+    "onnxruntime-gpu",
+    "onnxoptimizer",
+    "onnxslim",
+    "onnxscript",
+    "colored",
+    "polygraphy",
+    "onnx-graphsurgeon",
+)
 extras["controlnet"] = deps_list("onnx-graphsurgeon", "controlnet-aux")
 extras["ipadapter"] = deps_list("diffusers-ipadapter", "mediapipe", "insightface")
 
