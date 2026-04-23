@@ -1,0 +1,36 @@
+# Calibration prompts for FP8 UNet quantization.
+# These are used by calibrate_unet_fp8_torch() to collect activation ranges
+# across a diverse set of visual concepts and lighting conditions.
+# 32 prompts — covers portraits, landscapes, abstract, stylized, lit/dark.
+a portrait of a young woman with long brown hair, soft studio lighting, photorealistic
+a majestic snow-capped mountain peak at golden hour, landscape photography
+an oil painting of a dense forest with sunlight filtering through the trees
+close-up of a red rose with water droplets, macro photography, shallow depth of field
+a futuristic cityscape at night with neon lights and rain-slick streets
+abstract digital art with swirling blue and gold geometric patterns
+a cozy log cabin interior with a fireplace, warm tungsten light
+a black and white portrait of an elderly man with deep wrinkles
+a tropical beach with turquoise water and white sand, aerial view
+impressionist painting of a flower market with colorful blooms
+a dark dramatic fantasy warrior in silver armor, cinematic lighting
+a flat lay of assorted autumn leaves on a wooden surface
+an astronaut floating in deep space with Earth visible behind them
+a vintage leather-bound book open on a wooden desk, moody low key lighting
+a smooth glass sphere reflecting a sunset over the ocean
+wide-angle shot of the Milky Way over a desert landscape at night
+a white ceramic bowl of ramen with soft-boiled egg and green onions
+an animated character with oversized round eyes and pastel blue hair
+a fox sitting in a field of tall grass at dusk, soft backlighting
+birds-eye view of a dense rainforest canopy with morning mist
+a steampunk mechanical clockwork heart with glowing orange embers
+a close-up of a human eye reflecting a burning candle flame
+a chessboard with a dramatic single key light casting long shadows
+minimalist white room with a single window and a beam of sunlight
+a lightning bolt over the sea, long exposure, dark stormy sky
+a watercolor painting of a Japanese pagoda in autumn
+a pair of hands kneading bread dough on a floured wooden surface
+a dragon coiled around a mountain summit, digital painting, epic scale
+a 1960s diner interior with red vinyl booths and a jukebox
+blurry bokeh lights of a city street at night through a rainy window
+a child blowing dandelion seeds in a summer meadow, shallow focus
+a hyperrealistic oil painting of a golden retriever puppy looking up

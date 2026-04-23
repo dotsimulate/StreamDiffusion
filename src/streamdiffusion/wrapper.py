@@ -127,6 +127,7 @@ class StreamDiffusionWrapper:
         max_cache_maxframes: int = 4,
         fp8: bool = False,
         static_shapes: bool = False,
+        fp8_allow_fp16_fallback: bool = False,
     ):
         """
         Initializes the StreamDiffusionWrapper.
@@ -293,6 +294,7 @@ class StreamDiffusionWrapper:
         self.safety_checker_threshold = safety_checker_threshold
         self.fp8 = fp8
         self.static_shapes = static_shapes
+        self.fp8_allow_fp16_fallback = fp8_allow_fp16_fallback
 
         self.stream: StreamDiffusion = self._load_model(
             model_id_or_path=model_id_or_path,
@@ -1793,7 +1795,11 @@ class StreamDiffusionWrapper:
                         "opt_image_width": self.width,
                         "build_dynamic_shape": not self.static_shapes,
                         "build_static_batch": self.static_shapes,
-                        **({"min_image_resolution": 384, "max_image_resolution": 1024, "build_all_tactics": True} if not self.static_shapes else {}),
+                        **(
+                            {"min_image_resolution": 384, "max_image_resolution": 1024, "build_all_tactics": True}
+                            if not self.static_shapes
+                            else {}
+                        ),
                     },
                 )
 
@@ -1818,7 +1824,11 @@ class StreamDiffusionWrapper:
                         "opt_image_width": self.width,
                         "build_dynamic_shape": not self.static_shapes,
                         "build_static_batch": self.static_shapes,
-                        **({"min_image_resolution": 384, "max_image_resolution": 1024, "build_all_tactics": True} if not self.static_shapes else {}),
+                        **(
+                            {"min_image_resolution": 384, "max_image_resolution": 1024, "build_all_tactics": True}
+                            if not self.static_shapes
+                            else {}
+                        ),
                     },
                 )
 
@@ -1828,8 +1838,9 @@ class StreamDiffusionWrapper:
                 vae_dtype = stream.vae.dtype
 
                 try:
-                    logger.info("Loading TensorRT UNet engine...")
-                    # Build engine_build_options, adding FP8 calibration callback when enabled.
+                    logger.warning(
+                        f"[TRT] UNet engine: fp8={fp8}, static_shapes={self.static_shapes}, engine_path={unet_path}"
+                    )
                     _unet_build_opts = {
                         "opt_image_height": self.height,
                         "opt_image_width": self.width,
@@ -1837,16 +1848,17 @@ class StreamDiffusionWrapper:
                         "build_static_batch": True,
                     }
                     if fp8:
-                        from streamdiffusion.acceleration.tensorrt.fp8_quantize import (
-                            generate_unet_calibration_data,
-                        )
-                        _captured_model = unet_model
-                        _calib_batch = stream.trt_unet_batch_size
-                        _calib_h, _calib_w = self.height, self.width
+                        _amax_path = str(unet_path.parent / "unet_amax.pt")
                         _unet_build_opts["fp8"] = True
-                        _unet_build_opts["onnx_opset"] = 19  # modelopt FP8 needs opset ≥19 for fp16 Q/DQ scales
-                        _unet_build_opts["calibration_data_fn"] = lambda: generate_unet_calibration_data(
-                            _captured_model, _calib_batch, _calib_h, _calib_w
+                        _unet_build_opts["onnx_opset"] = 19  # FP8 Q/DQ scales require opset ≥19
+                        _unet_build_opts["pipe_ref"] = stream.pipe
+                        _unet_build_opts["calibration_steps"] = 4 if getattr(self, "_is_turbo", False) else 20
+                        _unet_build_opts["fp8_alpha"] = 0.8
+                        _unet_build_opts["amax_save_path"] = _amax_path
+                        _unet_build_opts["fp8_allow_fp16_fallback"] = self.fp8_allow_fp16_fallback
+                        logger.warning(
+                            f"[TRT] FP8 build opts: steps={_unet_build_opts['calibration_steps']}, "
+                            f"alpha={_unet_build_opts['fp8_alpha']}, amax={_amax_path}"
                         )
 
                     # Compile and load UNet engine using EngineManager
@@ -2080,11 +2092,15 @@ class StreamDiffusionWrapper:
                                     pass
                                 compiled_cn_engines.append(engine)
                             except Exception as e:
-                                logger.warning(f"Failed to compile/load ControlNet engine for {cfg.get('model_id')}: {e}")
+                                logger.warning(
+                                    f"Failed to compile/load ControlNet engine for {cfg.get('model_id')}: {e}"
+                                )
                         if compiled_cn_engines:
                             setattr(stream, "controlnet_engines", compiled_cn_engines)
                             try:
-                                logger.info(f"Compiled/loaded {len(compiled_cn_engines)} ControlNet TensorRT engine(s)")
+                                logger.info(
+                                    f"Compiled/loaded {len(compiled_cn_engines)} ControlNet TensorRT engine(s)"
+                                )
                             except Exception:
                                 pass
                     except Exception:

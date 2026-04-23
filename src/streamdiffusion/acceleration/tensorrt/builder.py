@@ -72,7 +72,12 @@ class EngineBuilder:
         force_onnx_export: bool = False,
         force_onnx_optimize: bool = False,
         fp8: bool = False,
-        calibration_data_fn=None,
+        pipe_ref=None,
+        calibration_prompts=None,
+        calibration_steps: int = 20,
+        amax_save_path: Optional[str] = None,
+        fp8_alpha: float = 0.8,
+        fp8_allow_fp16_fallback: bool = False,
     ):
         build_total_start = time.perf_counter()
         engine_name = Path(engine_path).parent.name
@@ -88,6 +93,66 @@ class EngineBuilder:
             "stages": {},
         }
 
+        # --- FP8 Torch-Level Calibration (must run before ONNX export) ---
+        # Only calibrate when the ONNX does not yet exist; if cached, Q/DQ nodes
+        # are already embedded from the prior build.
+        _fp8_quantized = False
+        if fp8 and (force_onnx_export or not os.path.exists(onnx_path)):
+            if pipe_ref is not None:
+                _build_logger.info(
+                    f"[BUILD] FP8 calibration: fp8=True, pipe={type(pipe_ref).__name__}, "
+                    f"steps={calibration_steps}, alpha={fp8_alpha}, amax={amax_save_path}"
+                )
+                t0 = time.perf_counter()
+                try:
+                    from .fp8_quantize import (
+                        _load_calibration_prompts,
+                        calibrate_unet_fp8_torch,
+                        load_unet_amax,
+                    )
+
+                    prompts = calibration_prompts or _load_calibration_prompts()
+                    amax_loaded = False
+                    if amax_save_path:
+                        amax_loaded = load_unet_amax(pipe_ref.unet, amax_save_path)
+                    if not amax_loaded:
+                        calibrate_unet_fp8_torch(
+                            pipe_ref,
+                            pipe_ref.unet,
+                            prompts,
+                            num_inference_steps=calibration_steps,
+                            alpha=fp8_alpha,
+                            amax_save_path=amax_save_path,
+                        )
+                    _fp8_quantized = True
+                    elapsed = time.perf_counter() - t0
+                    stats["stages"]["fp8_calibrate"] = {"status": "built", "elapsed_s": round(elapsed, 2)}
+                    _build_logger.info(f"[BUILD] FP8 calibration ({engine_filename}): {elapsed:.1f}s")
+                except Exception as calib_err:
+                    elapsed = time.perf_counter() - t0
+                    stats["stages"]["fp8_calibrate"] = {
+                        "status": "failed",
+                        "elapsed_s": round(elapsed, 2),
+                        "error": str(calib_err),
+                    }
+                    if fp8_allow_fp16_fallback:
+                        _build_logger.warning(
+                            f"[BUILD] FP8 calibration failed after {elapsed:.1f}s: {calib_err}. "
+                            "Falling back to FP16 engine (fp8_allow_fp16_fallback=True)."
+                        )
+                        fp8 = False
+                    else:
+                        raise RuntimeError(
+                            f"FP8 calibration failed: {calib_err}.\n"
+                            "Set fp8_allow_fp16_fallback=True in TRT_PROFILES to silently fall "
+                            "back to FP16, or fix the error above."
+                        ) from calib_err
+            else:
+                _build_logger.warning(
+                    "[BUILD] fp8=True but pipe_ref not provided — FP8 calibration skipped. "
+                    "Pass pipe_ref in engine_build_options for proper torch-level calibration."
+                )
+
         # --- ONNX Export ---
         if not force_onnx_export and os.path.exists(onnx_path):
             print(f"Found cached model: {onnx_path}")
@@ -95,8 +160,7 @@ class EngineBuilder:
         else:
             print(f"Exporting model: {onnx_path}")
             t0 = time.perf_counter()
-            export_onnx(
-                self.network,
+            _export_kwargs = dict(
                 onnx_path=onnx_path,
                 model_data=self.model,
                 opt_image_height=opt_image_height,
@@ -104,9 +168,16 @@ class EngineBuilder:
                 opt_batch_size=opt_batch_size,
                 onnx_opset=onnx_opset,
             )
+            if _fp8_quantized:
+                from modelopt.torch.quantization.utils import export_torch_mode
+
+                with export_torch_mode():
+                    export_onnx(self.network, **_export_kwargs)
+            else:
+                export_onnx(self.network, **_export_kwargs)
             elapsed = time.perf_counter() - t0
             stats["stages"]["onnx_export"] = {"status": "built", "elapsed_s": round(elapsed, 2)}
-            _build_logger.warning(f"[BUILD] ONNX export ({engine_filename}): {elapsed:.1f}s")
+            _build_logger.info(f"[BUILD] ONNX export ({engine_filename}): {elapsed:.1f}s")
             self.network = self.network.to("cpu")
             del self.network
             gc.collect()
@@ -126,7 +197,7 @@ class EngineBuilder:
             )
             elapsed = time.perf_counter() - t0
             stats["stages"]["onnx_optimize"] = {"status": "built", "elapsed_s": round(elapsed, 2)}
-            _build_logger.warning(f"[BUILD] ONNX optimize ({engine_filename}): {elapsed:.1f}s")
+            _build_logger.info(f"[BUILD] ONNX optimize ({engine_filename}): {elapsed:.1f}s")
 
         self.model.min_latent_shape = min_image_resolution // 8
         self.model.max_latent_shape = max_image_resolution // 8
@@ -148,50 +219,6 @@ class EngineBuilder:
             )
         _build_logger.info(f"Verified ONNX opt file: {onnx_opt_path} ({opt_file_size / (1024**2):.1f} MB)")
 
-        # --- FP8 Quantization (if enabled) ---
-        # Inserts Q/DQ nodes into the optimized ONNX and replaces onnx_opt_path with
-        # the FP8-annotated ONNX for the TRT build step below.
-        onnx_trt_input = onnx_opt_path  # default: use FP16 opt ONNX
-        fp8_trt = fp8  # may be set to False below if FP8 quantization fails
-        if fp8:
-            onnx_fp8_path = onnx_opt_path.replace(".opt.onnx", ".fp8.onnx")
-            if not os.path.exists(onnx_fp8_path):
-                _build_logger.warning("[BUILD] FP8 quantization starting...")
-                t0 = time.perf_counter()
-                from .fp8_quantize import quantize_onnx_fp8
-
-                try:
-                    quantize_onnx_fp8(
-                        onnx_opt_path,
-                        onnx_fp8_path,
-                        model_data=self.model,
-                        opt_batch_size=opt_batch_size,
-                        opt_image_height=opt_image_height,
-                        opt_image_width=opt_image_width,
-                    )
-                    elapsed = time.perf_counter() - t0
-                    stats["stages"]["fp8_quantize"] = {"status": "built", "elapsed_s": round(elapsed, 2)}
-                    _build_logger.warning(f"[BUILD] FP8 quantization ({engine_filename}): {elapsed:.1f}s")
-                    onnx_trt_input = onnx_fp8_path
-                except Exception as fp8_err:
-                    elapsed = time.perf_counter() - t0
-                    _build_logger.warning(
-                        f"[BUILD] FP8 quantization failed after {elapsed:.1f}s: {fp8_err}. "
-                        f"Falling back to FP16 TensorRT engine (onnx_trt_input unchanged)."
-                    )
-                    stats["stages"]["fp8_quantize"] = {
-                        "status": "failed_fallback_fp16",
-                        "elapsed_s": round(elapsed, 2),
-                        "error": str(fp8_err),
-                    }
-                    # onnx_trt_input remains onnx_opt_path (FP16 ONNX)
-                    # Disable FP8 engine build path (avoids STRONGLY_TYPED flag)
-                    fp8_trt = False
-            else:
-                _build_logger.info(f"[BUILD] Found cached FP8 ONNX: {onnx_fp8_path}")
-                stats["stages"]["fp8_quantize"] = {"status": "cached"}
-                onnx_trt_input = onnx_fp8_path
-
         # --- TRT Engine Build ---
         if not force_engine_build and os.path.exists(engine_path):
             print(f"Found cached engine: {engine_path}")
@@ -200,7 +227,7 @@ class EngineBuilder:
             t0 = time.perf_counter()
             build_engine(
                 engine_path=engine_path,
-                onnx_opt_path=onnx_trt_input,
+                onnx_opt_path=onnx_opt_path,
                 model_data=self.model,
                 opt_image_height=opt_image_height,
                 opt_image_width=opt_image_width,
@@ -209,11 +236,11 @@ class EngineBuilder:
                 build_dynamic_shape=build_dynamic_shape,
                 build_all_tactics=build_all_tactics,
                 build_enable_refit=build_enable_refit,
-                fp8=fp8_trt,
+                fp8=fp8,
             )
             elapsed = time.perf_counter() - t0
             stats["stages"]["trt_build"] = {"status": "built", "elapsed_s": round(elapsed, 2)}
-            _build_logger.warning(f"[BUILD] TRT engine build ({engine_filename}): {elapsed:.1f}s")
+            _build_logger.info(f"[BUILD] TRT engine build ({engine_filename}): {elapsed:.1f}s")
 
         # Record totals (before cleanup so build_stats.json is preserved)
         total_elapsed = time.perf_counter() - build_total_start
@@ -224,13 +251,13 @@ class EngineBuilder:
         if os.path.exists(engine_path):
             stats["engine_size_mb"] = round(os.path.getsize(engine_path) / (1024 * 1024), 1)
 
-        _build_logger.warning(f"[BUILD] {engine_filename} complete: {total_elapsed:.1f}s total")
+        _build_logger.info(f"[BUILD] {engine_filename} complete: {total_elapsed:.1f}s total")
         _write_build_stats(engine_path, stats)
 
-        # Cleanup ONNX artifacts — preserve .engine, .fp8.onnx, timing.cache, and build_stats.json
+        # Cleanup ONNX artifacts — preserve .engine, unet_amax.pt, timing.cache, build_stats.json
         # Two-pass deletion to handle Windows file locks (gc.collect releases Python handles)
-        _keep_suffixes = (".engine", ".fp8.onnx", ".cache")
-        _keep_exact = {"build_stats.json", "timing.cache"}
+        _keep_suffixes = (".engine", ".cache")
+        _keep_exact = {"build_stats.json", "timing.cache", "unet_amax.pt"}
         engine_dir = os.path.dirname(engine_path)
         _to_delete = []
         for file in os.listdir(engine_dir):
@@ -246,29 +273,34 @@ class EngineBuilder:
                 except OSError:
                     _failed.append(fpath)
 
-            # Release Python-held file handles (ONNX model refs), retry failures
+            # Release Python-held file handles (ONNX model refs), retry locked files.
+            # Per-file poll with 50ms backoff instead of a single global sleep — most
+            # handles release within 1-2 retries on Windows; worst case ~0.5s same as before.
             if _failed:
                 gc.collect()
                 torch.cuda.empty_cache()
-                time.sleep(0.5)
                 _still_failed = []
                 for fpath in _failed:
-                    try:
-                        os.remove(fpath)
-                    except OSError as cleanup_err:
+                    _last_err = None
+                    for _attempt in range(10):
+                        try:
+                            os.remove(fpath)
+                            _last_err = None
+                            break
+                        except OSError as _e:
+                            _last_err = _e
+                            time.sleep(0.05)
+                    if _last_err is not None:
                         _still_failed.append(os.path.basename(fpath))
                         _build_logger.warning(
-                            f"[BUILD] Could not delete temp file {os.path.basename(fpath)}: {cleanup_err}"
+                            f"[BUILD] Could not delete temp file {os.path.basename(fpath)}: {_last_err}"
                         )
                 if _still_failed:
                     _build_logger.warning(
                         f"[BUILD] {len(_still_failed)} intermediate files could not be cleaned. "
-                        f"Manual cleanup: delete all files except *.engine and *.fp8.onnx from {engine_dir}"
+                        f"Manual cleanup: delete all files except *.engine and unet_amax.pt from {engine_dir}"
                     )
                 cleaned = len(_to_delete) - len(_still_failed)
             else:
                 cleaned = len(_to_delete)
             _build_logger.info(f"[BUILD] Cleaned {cleaned}/{len(_to_delete)} intermediate files")
-        else:
-            gc.collect()
-            torch.cuda.empty_cache()
