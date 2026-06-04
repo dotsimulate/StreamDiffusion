@@ -484,9 +484,7 @@ class UNet(BaseModel):
         if self.use_feature_injection and self.unet is not None:
             from .utils import get_fi_eligible_mask
 
-            self.fi_eligible_mask = get_fi_eligible_mask(
-                self.unet, image_height, image_width, max_fi_up_blocks
-            )
+            self.fi_eligible_mask = get_fi_eligible_mask(self.unet, image_height, image_width, max_fi_up_blocks)
             # fi_layer_indices: global kvo-layer index for each FI-eligible layer.
             # Used by wrapper.py to allocate fi_cache tensors in walk order.
             # Engine binding names use fi-local sequential indices (fio_cache_in_0 …)
@@ -944,9 +942,9 @@ class UNet(BaseModel):
         if self.use_feature_injection:
             # FI output cache — zeros so the first frame sees no ghost features
             base_inputs = base_inputs + [
-                torch.zeros(
-                    self.cache_maxframes, 2 * export_batch_size, shape[0], shape[1], dtype=torch.float16
-                ).to(self.device)
+                torch.zeros(self.cache_maxframes, 2 * export_batch_size, shape[0], shape[1], dtype=torch.float16).to(
+                    self.device
+                )
                 for shape in self.fi_cache_shapes
             ]
             # fi_strength default 0.8 (thesis α=0.75, reference fork 0.8); fi_threshold 0.98

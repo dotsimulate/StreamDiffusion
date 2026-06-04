@@ -205,8 +205,7 @@ def create_fi_cache(
         fi_eligible_mask = get_fi_eligible_mask(unet, height, width, max_fi_up_blocks)
 
     assert len(fi_eligible_mask) == len(kvo_cache_shapes), (
-        f"fi_eligible_mask length {len(fi_eligible_mask)} != "
-        f"kvo layer count {len(kvo_cache_shapes)}"
+        f"fi_eligible_mask length {len(fi_eligible_mask)} != kvo layer count {len(kvo_cache_shapes)}"
     )
 
     # Collect eligible layers and their (seq, hidden) shapes, preserving walk order
@@ -240,8 +239,12 @@ def create_fi_cache(
     fi_buckets = [
         torch.zeros(
             len(fi_outputs_by_bucket[b]),
-            cache_maxframes, batch_size, s, h,
-            dtype=dtype, device=device,
+            cache_maxframes,
+            batch_size,
+            s,
+            h,
+            dtype=dtype,
+            device=device,
         )
         for b, (s, h) in enumerate(bucket_keys)
     ]
