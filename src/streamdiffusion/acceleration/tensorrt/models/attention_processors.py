@@ -25,13 +25,13 @@ def get_nn_feats(
     Returns:
         Tensor ``[B, N, C]`` — the feature-fused output.
     """
-    x_norm = F.normalize(x, dim=-1)            # [B, N, C]
-    y_norm = F.normalize(y, dim=-1)            # [B, M, C]
+    x_norm = F.normalize(x, dim=-1)  # [B, N, C]
+    y_norm = F.normalize(y, dim=-1)  # [B, M, C]
     cos = torch.bmm(x_norm, y_norm.transpose(1, 2))  # [B, N, M]
-    max_cos, idx = cos.max(dim=-1)              # both [B, N]
+    max_cos, idx = cos.max(dim=-1)  # both [B, N]
     idx_exp = idx.unsqueeze(-1).expand(-1, -1, y.size(-1))  # [B, N, C]
     nn_feats = torch.gather(y, 1, idx_exp)
-    gate = (max_cos >= threshold).unsqueeze(-1)   # [B, N, 1]
+    gate = (max_cos >= threshold).unsqueeze(-1)  # [B, N, 1]
     return torch.where(gate, nn_feats, x)
 
 
@@ -70,8 +70,8 @@ class CachedSTAttnProcessor2_0:
 
         # FI input attributes — set by the export wrapper before each forward pass.
         # None means FI is disabled / cache not yet warm.
-        self._fi_cache: Optional[torch.Tensor] = None       # (maxframes, B, N, C)
-        self._fi_strength: Optional[torch.Tensor] = None   # [1] fp32
+        self._fi_cache: Optional[torch.Tensor] = None  # (maxframes, B, N, C)
+        self._fi_strength: Optional[torch.Tensor] = None  # [1] fp32
         self._fi_threshold: Optional[torch.Tensor] = None  # [1] fp32
 
         # FI output attribute — written after each self-attn forward.
@@ -194,14 +194,16 @@ class CachedSTAttnProcessor2_0:
             fi_threshold = self._fi_threshold
 
             if fi_cache is not None and fi_strength is not None and fi_threshold is not None:
-                strength = fi_strength.item()
-                threshold = fi_threshold.item()
-
-                if strength > 0.0:
-                    # Reshape bank: (maxframes, B, N, C) → (B, maxframes*N, C)
-                    bank = fi_cache.transpose(0, 1).reshape(batch_size, -1, hidden_states.shape[-1])
-                    blended = get_nn_feats(hidden_states, bank, threshold)
-                    hidden_states = (1.0 - strength) * hidden_states + strength * blended
+                # Keep fi_strength / fi_threshold as tensors (no .item()) so ONNX tracing
+                # records them as live graph inputs rather than baking them as Python constants.
+                # strength=0 yields the algebraic identity (1-0)*h + 0*blended = h — no branch
+                # needed; the FI-off fast path is a no-op blend, not a skip.
+                strength = fi_strength.to(hidden_states.dtype)
+                threshold = fi_threshold.to(hidden_states.dtype)
+                # Reshape bank: (maxframes, B, N, C) → (B, maxframes*N, C)
+                bank = fi_cache.transpose(0, 1).reshape(batch_size, -1, hidden_states.shape[-1])
+                blended = get_nn_feats(hidden_states, bank, threshold)
+                hidden_states = (1.0 - strength) * hidden_states + strength * blended
         else:
             self._fi_cache_out = None
 

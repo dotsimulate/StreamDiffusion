@@ -1515,7 +1515,9 @@ class StreamDiffusionWrapper:
             # Persistent fp32 [1] tensors — updated in-place by stream_parameter_updater
             # (CUDA-graph-safe: same device address across frames).
             stream._fi_strength_tensor = torch.tensor([float(fi_strength)], dtype=torch.float32, device=stream.device)
-            stream._fi_threshold_tensor = torch.tensor([float(fi_threshold)], dtype=torch.float32, device=stream.device)
+            stream._fi_threshold_tensor = torch.tensor(
+                [float(fi_threshold)], dtype=torch.float32, device=stream.device
+            )
 
         # Load and properly merge LoRA weights using the standard diffusers approach
         lora_adapters_to_merge = []
@@ -1988,6 +1990,14 @@ class StreamDiffusionWrapper:
                             for _attn in _block.attentions:
                                 for _tf in _attn.transformer_blocks:
                                     _install_cached_proc(_tf.attn1)
+
+                    # Re-collect FI processors now that CachedSTAttnProcessor2_0 is
+                    # installed.  UnifiedExportWrapper.__init__ ran _collect_fi_processors
+                    # before this block — at that point processors were still stock diffusers
+                    # so _fi_procs was [].  refresh_fi_procs() is the authoritative call and
+                    # fail-fasts if the count doesn't match fi_layer_count.
+                    if use_feature_injection:
+                        wrapped_unet.refresh_fi_procs()
 
                 # Compile VAE decoder engine using EngineManager
                 vae_decoder_model = VAE(

@@ -111,11 +111,32 @@ class UnifiedExportWrapper(torch.nn.Module):
                 self.unet, control_input_names, kvo_cache_structure, **controlnet_kwargs
             )
 
-        # Collect FI-eligible processors in kvo walk order.
-        # Must be done AFTER all wrappers are applied (processors are installed by this point).
-        # Each processor in this list corresponds to one fio_cache_in binding at the matching
-        # fi-local index.  The list is the same length as fi_layer_count.
+        # Best-effort collection at construction time — may return [] if processors are
+        # not yet installed (e.g. when wrapper.py constructs UnifiedExportWrapper before
+        # the if-use_cached_attn block installs CachedSTAttnProcessor2_0).
+        # Call refresh_fi_procs() after processor installation for the authoritative list.
         self._fi_procs: List = _collect_fi_processors(self.unet) if fi_layer_count > 0 else []
+
+    def refresh_fi_procs(self) -> None:
+        """Re-collect FI-eligible processors from the UNet.
+
+        Call this AFTER installing ``CachedSTAttnProcessor2_0`` on attn1 layers
+        (i.e. after the ``if use_cached_attn:`` block in wrapper.py).  Construction-
+        time collection runs before processors are installed, so ``self._fi_procs``
+        is empty at that point.  This method is the authoritative collection.
+
+        Raises ``RuntimeError`` if ``fi_layer_count > 0`` but the collected count
+        does not match — fail-fast replaces the cryptic ONNX output-count error.
+        """
+        if self.fi_layer_count == 0:
+            return
+        self._fi_procs = _collect_fi_processors(self.unet)
+        if len(self._fi_procs) != self.fi_layer_count:
+            raise RuntimeError(
+                f"refresh_fi_procs: expected {self.fi_layer_count} FI-eligible processors "
+                f"but found {len(self._fi_procs)}.  Check that CachedSTAttnProcessor2_0 "
+                f"was installed on all fi_eligible attn1 layers before this call."
+            )
 
     def _set_fi_cache(
         self,
