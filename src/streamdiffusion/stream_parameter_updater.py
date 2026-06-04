@@ -666,9 +666,19 @@ class StreamParameterUpdater(OrchestratorUser):
                 if current_magnitude > 1e-8:  # Avoid division by zero
                     combined_noise = combined_noise * (original_magnitude / current_magnitude)
 
-        # Update stream noise
+        # Update stream noise.
+        # IMPORTANT: do NOT zero stock_noise here. Resetting it destroys the RCFG residual
+        # continuity established over previous frames, causing a cold-restart artifact on every
+        # per-frame seed blend. The reference fork (main_sdtd.py:4058) preserves stock_noise
+        # across reseeds intentionally. Only init_noise is replaced; stock_noise evolves from
+        # whatever the scheduler accumulated, which produces the smooth, coherent evolution.
         self.stream.init_noise = combined_noise
-        self.stream.stock_noise = torch.zeros_like(self.stream.init_noise)
+
+        # Keep pre-computed rotation in sync with the new init_noise (same as _update_seed:728-731).
+        if self.stream._init_noise_rotated is not None:
+            self.stream._init_noise_rotated = torch.cat(
+                [self.stream.init_noise[1:], self.stream.init_noise[0:1]], dim=0
+            )
 
     def _slerp_noise(self, noise1: torch.Tensor, noise2: torch.Tensor, t: float) -> torch.Tensor:
         """Spherical linear interpolation between two noise tensors."""
