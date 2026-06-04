@@ -66,6 +66,13 @@ use_cached_attn: true
 cache_maxframes: 2
 cache_interval: 4
 
+# Feature Injection (StreamV2V §3.4.2) — nearest-neighbor O-cache blend, requires use_cached_attn: true
+# fi_strength: blend weight α (0=no injection, 1=full injection; thesis α=0.75, reference default 0.8)
+# fi_threshold: cosine-similarity gate — only inject when patch match ≥ threshold (lower = more injection)
+use_feature_injection: true
+fi_strength: 0.8
+fi_threshold: 0.98
+
 # Image filtering (similar frame skip)
 # enable_similar_image_filter=true: hold previous output on near-duplicate frames → less flicker (matches reference fork)
 enable_similar_image_filter: true

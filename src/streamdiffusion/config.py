@@ -158,7 +158,7 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
     param_map["cache_interval"] = config.get("cache_interval", 1)
 
     # Feature Injection (StreamV2V §3.4.2) — requires use_cached_attn=True
-    param_map["use_feature_injection"] = config.get("use_feature_injection", False)
+    param_map["use_feature_injection"] = config.get("use_feature_injection", True)
     # fi_strength: blend weight α (thesis §3.4.2 Eq 3.2, default 0.8; thesis uses 0.75).
     # fi_threshold: cosine-similarity gate below which injection is skipped (default 0.98).
     param_map["fi_strength"] = config.get("fi_strength", 0.8)
