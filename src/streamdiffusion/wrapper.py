@@ -128,6 +128,8 @@ class StreamDiffusionWrapper:
         min_cache_maxframes: int = 1,
         max_cache_maxframes: int = 4,
         use_feature_injection: bool = False,
+        fi_strength: float = 0.8,
+        fi_threshold: float = 0.98,
         fp8: bool = False,
         static_shapes: bool = False,
         fp8_allow_fp16_fallback: bool = False,
@@ -379,6 +381,8 @@ class StreamDiffusionWrapper:
             min_cache_maxframes=min_cache_maxframes,
             max_cache_maxframes=max_cache_maxframes,
             use_feature_injection=use_feature_injection,
+            fi_strength=fi_strength,
+            fi_threshold=fi_threshold,
             fp8=fp8,
         )
 
@@ -642,6 +646,9 @@ class StreamDiffusionWrapper:
         safety_checker_threshold: Optional[float] = None,
         cache_maxframes: Optional[int] = None,
         cache_interval: Optional[int] = None,
+        # Feature Injection live-tunable params (in-place tensor update, no engine rebuild)
+        fi_strength: Optional[float] = None,
+        fi_threshold: Optional[float] = None,
     ) -> None:
         """
         Update streaming parameters efficiently in a single call.
@@ -715,6 +722,8 @@ class StreamDiffusionWrapper:
                 latent_postprocessing_config=latent_postprocessing_config,
                 cache_maxframes=cache_maxframes,
                 cache_interval=cache_interval,
+                fi_strength=fi_strength,
+                fi_threshold=fi_threshold,
             )
         finally:
             if needs_encoding:
@@ -1194,6 +1203,8 @@ class StreamDiffusionWrapper:
         min_cache_maxframes: int = 1,
         max_cache_maxframes: int = 4,
         use_feature_injection: bool = False,
+        fi_strength: float = 0.8,
+        fi_threshold: float = 0.98,
         fp8: bool = False,
     ) -> StreamDiffusion:
         """
@@ -1503,8 +1514,8 @@ class StreamDiffusionWrapper:
             stream.use_feature_injection = True
             # Persistent fp32 [1] tensors — updated in-place by stream_parameter_updater
             # (CUDA-graph-safe: same device address across frames).
-            stream._fi_strength_tensor = torch.tensor([0.8], dtype=torch.float32, device=stream.device)
-            stream._fi_threshold_tensor = torch.tensor([0.98], dtype=torch.float32, device=stream.device)
+            stream._fi_strength_tensor = torch.tensor([float(fi_strength)], dtype=torch.float32, device=stream.device)
+            stream._fi_threshold_tensor = torch.tensor([float(fi_threshold)], dtype=torch.float32, device=stream.device)
 
         # Load and properly merge LoRA weights using the standard diffusers approach
         lora_adapters_to_merge = []
