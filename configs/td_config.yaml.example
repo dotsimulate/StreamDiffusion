@@ -30,7 +30,7 @@ use_denoising_batch: true
 use_tiny_vae: true
 acceleration: "tensorrt"
 cfg_type: "self"
-do_add_noise: false
+do_add_noise: true  # matches reference fork default; adds re-noising term in inter-step latent buffer rebuild
 warmup: 10
 use_safety_checker: false
 skip_diffusion: false
@@ -61,14 +61,16 @@ scheduler: "lcm"
 sampler: "normal"
 
 # StreamV2V Cached Attention (Cattenable enables, Cattmaxframes/Cattinterval tune)
+# cache_interval=4: hold a stable 4-frame anchor (matches reference fork default, interval=1 just caches previous frame)
 use_cached_attn: true
 cache_maxframes: 2
-cache_interval: 1
+cache_interval: 4
 
 # Image filtering (similar frame skip)
-enable_similar_image_filter: false
-similar_image_filter_threshold: 0.99
-similar_image_filter_max_skip_frame: 1
+# enable_similar_image_filter=true: hold previous output on near-duplicate frames → less flicker (matches reference fork)
+enable_similar_image_filter: true
+similar_image_filter_threshold: 0.9996
+similar_image_filter_max_skip_frame: 10
 
 # HuggingFace cache directory (for model downloads); leave empty to use default
 hf_cache: ""
