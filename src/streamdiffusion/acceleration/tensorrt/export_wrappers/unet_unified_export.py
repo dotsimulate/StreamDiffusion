@@ -153,7 +153,7 @@ class UnifiedExportWrapper(torch.nn.Module):
         fi_threshold: Optional[torch.Tensor] = None
 
         if fi_count > 0:
-            fi_args = args[kvo_count:kvo_count + fi_count]
+            fi_args = args[kvo_count : kvo_count + fi_count]
             fi_scalar_base = kvo_count + fi_count
             if len(args) > fi_scalar_base:
                 fi_strength = args[fi_scalar_base]
@@ -198,11 +198,7 @@ class UnifiedExportWrapper(torch.nn.Module):
         # depth-first, producing the flat output ordering that matches get_output_names:
         #   [latent, kvo_cache_out_0…N-1, fio_cache_out_<idx0>…<idxM-1>]
         if fi_count > 0 and self._fi_procs:
-            fi_cache_outs = tuple(
-                proc._fi_cache_out
-                for proc in self._fi_procs
-                if proc._fi_cache_out is not None
-            )
+            fi_cache_outs = tuple(proc._fi_cache_out for proc in self._fi_procs if proc._fi_cache_out is not None)
             return (res[0], res[1]) + fi_cache_outs
 
         return res
@@ -243,8 +239,25 @@ class UnifiedExportWrapper(torch.nn.Module):
             args = args[1:]
 
         if self.controlnet_wrapper:
-            # ControlNet wrapper handles the UNet call with all parameters
-            return self.controlnet_wrapper(sample, timestep, encoder_hidden_states, *args, **kwargs)
+            # ControlNet wrapper handles the UNet call with all parameters.
+            # When FI is active the tail of *args is:
+            #   [...controls, ...kvo_in, ...fio_in, fi_strength, fi_threshold]
+            # The CN wrapper only understands (controls, kvo_in), so we strip the
+            # FI tail here, wire it into processors via _set_fi_cache, then
+            # collect and append the FI outputs exactly as _basic_unet_forward does.
+            fi_count = self.fi_layer_count
+            if fi_count > 0 and self._fi_procs:
+                fi_tail = fi_count + 2  # fio tensors + fi_strength + fi_threshold
+                fi_args = args[-fi_tail:-2]
+                fi_strength_t = args[-2]
+                fi_threshold_t = args[-1]
+                cn_args = args[:-fi_tail]
+                self._set_fi_cache(fi_args, fi_strength_t, fi_threshold_t)
+                res = self.controlnet_wrapper(sample, timestep, encoder_hidden_states, *cn_args, **kwargs)
+                fi_cache_outs = tuple(proc._fi_cache_out for proc in self._fi_procs if proc._fi_cache_out is not None)
+                return (res[0], res[1]) + fi_cache_outs
+            else:
+                return self.controlnet_wrapper(sample, timestep, encoder_hidden_states, *args, **kwargs)
         else:
             # Basic UNet call with all parameters passed through
             return self._basic_unet_forward(sample, timestep, encoder_hidden_states, *args, **kwargs)
