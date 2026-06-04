@@ -1264,7 +1264,8 @@ def export_onnx(
         wrapped_model = SDXLExportWrapper(model)
     elif not is_controlnet:
         embedding_dim = getattr(model_data, "embedding_dim", "unknown")
-        logger.info(f"Detected non-SDXL model (embedding_dim={embedding_dim}), using model as-is for ONNX export...")
+        label = "SDXL" if is_sdxl else "non-SDXL"
+        logger.info(f"Detected {label} model (embedding_dim={embedding_dim}), using model as-is for ONNX export...")
 
     # SDXL ControlNet models need special wrapper for added_cond_kwargs
     elif is_sdxl_controlnet:

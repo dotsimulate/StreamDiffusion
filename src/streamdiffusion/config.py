@@ -1,8 +1,11 @@
 import json
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Union
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 def load_config(config_path: Union[str, Path]) -> Dict[str, Any]:
@@ -158,6 +161,12 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
     param_map["cache_interval"] = config.get("cache_interval", 1)
 
     # Feature Injection (StreamV2V §3.4.2) — requires use_cached_attn=True
+    if "use_feature_injection" not in config:
+        logger.info(
+            "use_feature_injection not in config; defaulting to True "
+            "(fi_strength=0.8, fi_threshold=0.98). Add 'use_feature_injection: false' "
+            "to your config or add Fienable/Fistrength/Fithreshold pars to the .toe to control explicitly."
+        )
     param_map["use_feature_injection"] = config.get("use_feature_injection", True)
     # fi_strength: blend weight α (thesis §3.4.2 Eq 3.2, default 0.8; thesis uses 0.75).
     # fi_threshold: cosine-similarity gate below which injection is skipped (default 0.98).
