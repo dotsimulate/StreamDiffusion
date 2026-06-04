@@ -111,6 +111,7 @@ class EngineBuilder:
         fp8_guidance_scale: float = 7.5,
         fp8_allow_fp16_fallback: bool = False,
         fp8_use_cached_attn: bool = False,
+        fp8_use_feature_injection: bool = False,
         fp8_use_controlnet: bool = False,
         fp8_num_ip_layers: int = 0,
         builder_optimization_level: Optional[int] = None,
@@ -250,6 +251,7 @@ class EngineBuilder:
                         output_path=_fp8_onnx_path,
                         calibration_data=calib_data,
                         use_cached_attn=fp8_use_cached_attn,
+                        use_feature_injection=fp8_use_feature_injection,
                         use_controlnet=fp8_use_controlnet,
                         num_ip_layers=fp8_num_ip_layers,
                     )

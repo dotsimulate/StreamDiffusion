@@ -279,6 +279,7 @@ _DEFAULT_EXCLUDE_PATTERNS = [r".*time_emb.*", r".*add_emb.*"]
 # is active — keeps plain-UNet Q/DQ counts unaffected.
 _FEATURE_EXCLUDE_PATTERNS = {
     "cached_attn": [r".*kvo_cache.*"],
+    "feature_injection": [r".*fio_cache.*", r".*fi_strength.*", r".*fi_threshold.*"],
     "controlnet": [r".*down_block_additional_residuals.*", r".*mid_block_additional_residual.*"],
     "ipadapter": [r".*to_k_ip.*", r".*to_v_ip.*", r".*to_out_ip.*"],
 }
@@ -362,6 +363,7 @@ def quantize_onnx_fp8(
     nodes_to_exclude: Optional[List[str]] = None,
     disable_mha_qdq: bool = True,
     use_cached_attn: bool = False,
+    use_feature_injection: bool = False,
     use_controlnet: bool = False,
     num_ip_layers: int = 0,
 ) -> None:
@@ -418,6 +420,8 @@ def quantize_onnx_fp8(
         nodes_to_exclude = list(_DEFAULT_EXCLUDE_PATTERNS)
         if use_cached_attn:
             nodes_to_exclude.extend(_FEATURE_EXCLUDE_PATTERNS["cached_attn"])
+        if use_feature_injection:
+            nodes_to_exclude.extend(_FEATURE_EXCLUDE_PATTERNS["feature_injection"])
         if use_controlnet:
             nodes_to_exclude.extend(_FEATURE_EXCLUDE_PATTERNS["controlnet"])
         if num_ip_layers > 0:
