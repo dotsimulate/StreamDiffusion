@@ -512,7 +512,10 @@ class StreamDiffusion:
             generator=generator,
         ).to(device=self.device, dtype=self.dtype)
 
-        self.stock_noise = torch.zeros_like(self.init_noise)
+        # Clone init_noise rather than zeros so stock_noise starts coherent when CFG is active.
+        # Initialising with zeros forces a cold-restart warm-up of the RCFG residual evolution;
+        # the reference fork (pipeline_td.py:1103-1105) uses clone() to avoid that.
+        self.stock_noise = self.init_noise.clone()
 
         # Handle scheduler-specific scaling calculations
         c_skip_list = []
