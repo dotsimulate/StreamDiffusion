@@ -256,6 +256,8 @@ class StreamParameterUpdater(OrchestratorUser):
         latent_postprocessing_config: Optional[List[Dict[str, Any]]] = None,
         cache_maxframes: Optional[int] = None,
         cache_interval: Optional[int] = None,
+        fi_strength: Optional[float] = None,
+        fi_threshold: Optional[float] = None,
     ) -> None:
         """Update streaming parameters efficiently in a single call."""
 
@@ -387,6 +389,16 @@ class StreamParameterUpdater(OrchestratorUser):
                         )
                     else:
                         logger.info(f"update_stream_params: Cache maxframes set to {cache_maxframes}")
+
+            # Feature Injection live-tunable scalars — write into pre-allocated [1] tensors
+            # in-place so CUDA-graph references stay valid (no tensor reallocation).
+            if self.stream.use_feature_injection and self.stream._fi_strength_tensor is not None:
+                if fi_strength is not None:
+                    self.stream._fi_strength_tensor.fill_(float(fi_strength))
+                    logger.info(f"update_stream_params: fi_strength -> {fi_strength:.4f}")
+                if fi_threshold is not None:
+                    self.stream._fi_threshold_tensor.fill_(float(fi_threshold))
+                    logger.info(f"update_stream_params: fi_threshold -> {fi_threshold:.6f}")
 
     @torch.inference_mode()
     def update_prompt_weights(

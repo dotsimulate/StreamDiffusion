@@ -53,6 +53,10 @@ class StreamDiffusion:
         kvo_cache: Optional[List[torch.Tensor]] = None,
         cache_interval: int = 1,
         cache_maxframes: int = 1,
+        fio_cache: Optional[List[torch.Tensor]] = None,
+        use_feature_injection: bool = False,
+        fi_strength: float = 0.8,
+        fi_threshold: float = 0.98,
     ) -> None:
         self.device = torch.device(device)
         self.dtype = torch_dtype
@@ -179,6 +183,22 @@ class StreamDiffusion:
         self.cache_interval = cache_interval
         self.cache_maxframes = cache_maxframes
         self.frame_idx = 0
+
+        # Feature Injection (FI) — output cache (O-cache) for StreamV2V thesis §3.4.2.
+        # fio_cache[i] shape: (cache_maxframes, B, S, H) — pre-allocated by wrapper.py.
+        # Persistent [1] fp32 scalars are updated in-place by param_updater (CUDA-graph-safe).
+        self.fio_cache: List[torch.Tensor] = fio_cache if fio_cache is not None else []
+        self.use_feature_injection: bool = use_feature_injection and bool(self.fio_cache)
+        if self.use_feature_injection:
+            self._fi_strength_tensor: Optional[torch.Tensor] = torch.tensor(
+                [fi_strength], dtype=torch.float32, device=self.device
+            )
+            self._fi_threshold_tensor: Optional[torch.Tensor] = torch.tensor(
+                [fi_threshold], dtype=torch.float32, device=self.device
+            )
+        else:
+            self._fi_strength_tensor = None
+            self._fi_threshold_tensor = None
 
         # Pre-allocated CUDA timing events — reused every frame via .record()
         self._timing_start = torch.cuda.Event(enable_timing=True)
@@ -809,16 +829,22 @@ class StreamDiffusion:
                     if hook_mid_res is not None:
                         extra_kwargs["mid_block_additional_residual"] = hook_mid_res
 
-                    model_pred, kvo_cache_out = self.unet(
+                    _unet_result = self.unet(
                         unet_kwargs["sample"],  # latent_model_input (positional)
                         unet_kwargs["timestep"],  # timestep (positional)
                         unet_kwargs["encoder_hidden_states"],  # encoder_hidden_states (positional)
                         kvo_cache=self.kvo_cache,
+                        fio_cache=self.fio_cache,
+                        fi_strength=self._fi_strength_tensor,
+                        fi_threshold=self._fi_threshold_tensor,
                         **extra_kwargs,
                         # For TRT engines, ensure SDXL cond shapes match engine builds; if engine expects 81 tokens (77+4), append dummy image tokens when none
                         **added_cond_kwargs,  # SDXL conditioning as kwargs
                     )
-                    self.update_kvo_cache(kvo_cache_out)
+                    model_pred = _unet_result[0]
+                    kvo_cache_out = _unet_result[1] if len(_unet_result) > 1 else []
+                    fio_cache_out = _unet_result[2] if len(_unet_result) > 2 else []
+                    self.update_kvo_cache(kvo_cache_out, fio_cache_out)
                 else:
                     # PyTorch UNet expects diffusers-style named arguments. Any processor scaling is handled by IP-Adapter hook
 
@@ -858,15 +884,21 @@ class StreamDiffusion:
             if hook_mid_res is not None:
                 ip_scale_kw["mid_block_additional_residual"] = hook_mid_res
 
-            model_pred, kvo_cache_out = self.unet(
+            _unet_result = self.unet(
                 x_t_latent_plus_uc,
                 t_list,
                 encoder_hidden_states=self.prompt_embeds,
                 kvo_cache=self.kvo_cache,
+                fio_cache=self.fio_cache,
+                fi_strength=self._fi_strength_tensor,
+                fi_threshold=self._fi_threshold_tensor,
                 return_dict=False,
                 **ip_scale_kw,
             )
-            self.update_kvo_cache(kvo_cache_out)
+            model_pred = _unet_result[0]
+            kvo_cache_out = _unet_result[1] if len(_unet_result) > 1 else []
+            fio_cache_out = _unet_result[2] if len(_unet_result) > 2 else []
+            self.update_kvo_cache(kvo_cache_out, fio_cache_out)
 
         if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
             noise_pred_text = model_pred[1:]
@@ -901,8 +933,15 @@ class StreamDiffusion:
 
         return denoised_batch, model_pred
 
-    def update_kvo_cache(self, kvo_cache_out: List[torch.Tensor]) -> None:
-        if self.kvo_cache is None or len(self.kvo_cache) == 0:
+    def update_kvo_cache(
+        self,
+        kvo_cache_out: List[torch.Tensor],
+        fio_cache_out: List[torch.Tensor] = [],
+    ) -> None:
+        has_kvo = bool(self.kvo_cache)
+        has_fio = bool(fio_cache_out) and bool(self.fio_cache)
+
+        if not has_kvo and not has_fio:
             return
 
         self.frame_idx += 1
@@ -915,17 +954,24 @@ class StreamDiffusion:
         # max_cache_maxframes but the logical window is smaller, writes stay within the active range.
         write_slot = (self.frame_idx // self.cache_interval - 1) % self.cache_maxframes
 
-        if self._kvo_buckets is not None:
-            # Bucketed path: N stacks + N copies (N≈3) instead of ~70 individual copies.
-            # Each kvo_cache_out[i] arrives shape (2, 1, B, S, H); squeeze(1) → (2, B, S, H).
-            for bucket_idx, output_indices in enumerate(self._kvo_outputs_by_bucket):
-                stacked = torch.stack([kvo_cache_out[i].squeeze(1) for i in output_indices], dim=0)
-                self._kvo_buckets[bucket_idx][:, :, write_slot].copy_(stacked)
-        else:
-            # Fallback path — used when buckets were dropped after a kvo_cache resize
-            # (stream_parameter_updater rebinds kvo_cache[i] to standalone tensors).
-            for i, new_kv in enumerate(kvo_cache_out):
-                self.kvo_cache[i][:, write_slot].copy_(new_kv.squeeze(1))
+        if has_kvo:
+            if self._kvo_buckets is not None:
+                # Bucketed path: N stacks + N copies (N≈3) instead of ~70 individual copies.
+                # Each kvo_cache_out[i] arrives shape (2, 1, B, S, H); squeeze(1) → (2, B, S, H).
+                for bucket_idx, output_indices in enumerate(self._kvo_outputs_by_bucket):
+                    stacked = torch.stack([kvo_cache_out[i].squeeze(1) for i in output_indices], dim=0)
+                    self._kvo_buckets[bucket_idx][:, :, write_slot].copy_(stacked)
+            else:
+                # Fallback path — used when buckets were dropped after a kvo_cache resize
+                # (stream_parameter_updater rebinds kvo_cache[i] to standalone tensors).
+                for i, new_kv in enumerate(kvo_cache_out):
+                    self.kvo_cache[i][:, write_slot].copy_(new_kv.squeeze(1))
+
+        if has_fio:
+            # FI output cache update — each fio_cache_out[i] has shape (1, B, S, H).
+            # Squeeze dim 0 to (B, S, H) and write into the circular buffer slot.
+            for i, new_fi in enumerate(fio_cache_out):
+                self.fio_cache[i][write_slot].copy_(new_fi.squeeze(0))
 
     def encode_image(self, image_tensors: torch.Tensor) -> torch.Tensor:
         with profiler.region("encode_image"):

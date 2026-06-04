@@ -47,6 +47,13 @@ class UNet2DConditionModelEngine:
         self._kvo_in_names: List[str] = []
         self._kvo_out_names: List[str] = []
         self._kvo_cache_len: int = -1  # -1 = not yet initialized
+
+        # FI (Feature Injection) key names — lazy-init, same pattern as KVO.
+        # Uses fi-local sequential indices (fio_cache_in_0 …), matching engine bindings.
+        self._fio_in_names: List[str] = []
+        self._fio_out_names: List[str] = []
+        self._fio_cache_len: int = -1  # -1 = not yet initialized
+
         self._shape_dict: Dict[str, Any] = {}
         self._input_dict: Dict[str, Any] = {}
 
@@ -62,6 +69,9 @@ class UNet2DConditionModelEngine:
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         kvo_cache: List[torch.Tensor] = [],
+        fio_cache: List[torch.Tensor] = [],
+        fi_strength: Optional[torch.Tensor] = None,
+        fi_threshold: Optional[torch.Tensor] = None,
         down_block_additional_residuals: Optional[List[torch.Tensor]] = None,
         mid_block_additional_residual: Optional[torch.Tensor] = None,
         controlnet_conditioning: Optional[Dict[str, List[torch.Tensor]]] = None,
@@ -77,6 +87,13 @@ class UNet2DConditionModelEngine:
             self._kvo_in_names = [f"kvo_cache_in_{i}" for i in range(n_kvo)]
             self._kvo_out_names = [f"kvo_cache_out_{i}" for i in range(n_kvo)]
             self._kvo_cache_len = n_kvo
+
+        # Lazy-init FIO key name lists — same pattern as KVO.
+        n_fio = len(fio_cache)
+        if n_fio != self._fio_cache_len:
+            self._fio_in_names = [f"fio_cache_in_{i}" for i in range(n_fio)]
+            self._fio_out_names = [f"fio_cache_out_{i}" for i in range(n_fio)]
+            self._fio_cache_len = n_fio
 
         # Update pre-allocated dicts in-place — no new dict objects created per call.
         shape_dict = self._shape_dict
@@ -97,6 +114,21 @@ class UNet2DConditionModelEngine:
             shape_dict[in_name] = _kvo.shape
             shape_dict[out_name] = (*_kvo.shape[:1], 1, *_kvo.shape[2:])
             input_dict[in_name] = _kvo
+
+        if n_fio > 0:
+            for i, _fio in enumerate(fio_cache):
+                in_name = self._fio_in_names[i]
+                # fio_cache_in shape: (cache_maxframes, B, S, H)
+                # fio_cache_out shape: (1, B, S, H) — current frame only
+                shape_dict[in_name] = _fio.shape
+                shape_dict[self._fio_out_names[i]] = (1, *_fio.shape[1:])
+                input_dict[in_name] = _fio
+            if fi_strength is not None:
+                shape_dict["fi_strength"] = fi_strength.shape
+                input_dict["fi_strength"] = fi_strength
+            if fi_threshold is not None:
+                shape_dict["fi_threshold"] = fi_threshold.shape
+                input_dict["fi_threshold"] = fi_threshold
 
         # Handle IP-Adapter runtime scale vector if engine was built with it
         if self._check_use_ipadapter():
@@ -177,7 +209,11 @@ class UNet2DConditionModelEngine:
             kvo_cache_out = [outputs[name] for name in self._kvo_out_names]
         else:
             kvo_cache_out = []
-        return noise_pred, kvo_cache_out
+        if n_fio > 0:
+            fio_cache_out = [outputs[name] for name in self._fio_out_names]
+        else:
+            fio_cache_out = []
+        return noise_pred, kvo_cache_out, fio_cache_out
 
     def _add_controlnet_conditioning_dict(
         self, controlnet_conditioning: Dict[str, List[torch.Tensor]], shape_dict: Dict, input_dict: Dict

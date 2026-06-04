@@ -127,6 +127,7 @@ class StreamDiffusionWrapper:
         cache_interval: int = 1,
         min_cache_maxframes: int = 1,
         max_cache_maxframes: int = 4,
+        use_feature_injection: bool = False,
         fp8: bool = False,
         static_shapes: bool = False,
         fp8_allow_fp16_fallback: bool = False,
@@ -377,6 +378,7 @@ class StreamDiffusionWrapper:
             cache_interval=cache_interval,
             min_cache_maxframes=min_cache_maxframes,
             max_cache_maxframes=max_cache_maxframes,
+            use_feature_injection=use_feature_injection,
             fp8=fp8,
         )
 
@@ -1191,6 +1193,7 @@ class StreamDiffusionWrapper:
         cache_interval: int = 1,
         min_cache_maxframes: int = 1,
         max_cache_maxframes: int = 4,
+        use_feature_injection: bool = False,
         fp8: bool = False,
     ) -> StreamDiffusion:
         """
@@ -1459,6 +1462,8 @@ class StreamDiffusionWrapper:
             kvo_cache=[],  # Set below after stream init with the correct batch size
             cache_interval=cache_interval,
             cache_maxframes=cache_maxframes,
+            fio_cache=[],  # Set below if FI is enabled
+            use_feature_injection=use_feature_injection and use_cached_attn,
         )
 
         # Create KVO cache tensors using the pipeline's actual runtime batch size.
@@ -1479,6 +1484,27 @@ class StreamDiffusionWrapper:
             stream.kvo_cache = kvo_cache
             stream._kvo_buckets = kvo_buckets
             stream._kvo_outputs_by_bucket = kvo_outputs_by_bucket
+
+        # Allocate FI output-cache (O-cache) for Feature Injection (Phase 2, StreamV2V §3.4.2).
+        # Must happen after kvo_cache so create_fi_cache can call get_kvo_cache_info for alignment.
+        if use_feature_injection and use_cached_attn:
+            from streamdiffusion.acceleration.tensorrt.models.utils import create_fi_cache
+
+            fio_cache, _, _, _ = create_fi_cache(
+                pipe.unet,
+                batch_size=stream.trt_unet_batch_size,
+                cache_maxframes=max_cache_maxframes,
+                height=self.height,
+                width=self.width,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            stream.fio_cache = fio_cache
+            stream.use_feature_injection = True
+            # Persistent fp32 [1] tensors — updated in-place by stream_parameter_updater
+            # (CUDA-graph-safe: same device address across frames).
+            stream._fi_strength_tensor = torch.tensor([0.8], dtype=torch.float32, device=stream.device)
+            stream._fi_threshold_tensor = torch.tensor([0.98], dtype=torch.float32, device=stream.device)
 
         # Load and properly merge LoRA weights using the standard diffusers approach
         lora_adapters_to_merge = []
@@ -1667,6 +1693,7 @@ class StreamDiffusionWrapper:
                     ipadapter_tokens=ipadapter_tokens,
                     is_faceid=is_faceid if use_ipadapter_trt else None,
                     use_cached_attn=use_cached_attn,
+                    use_feature_injection=use_feature_injection,
                     use_controlnet=use_controlnet_trt,
                     fp8=fp8,
                     resolution=(self.height, self.width),
@@ -1896,6 +1923,7 @@ class StreamDiffusionWrapper:
                     cache_maxframes=cache_maxframes,
                     min_cache_maxframes=min_cache_maxframes,
                     max_cache_maxframes=max_cache_maxframes,
+                    use_feature_injection=use_feature_injection,
                 )
 
                 # Use ControlNet wrapper if ControlNet support is enabled
@@ -1913,19 +1941,42 @@ class StreamDiffusionWrapper:
                     control_input_names=control_input_names,
                     num_tokens=num_tokens,
                     kvo_cache_structure=kvo_cache_structure,
+                    fi_layer_count=getattr(unet_model, "fi_cache_count", 0),
                 )
 
                 if use_cached_attn:
                     from .acceleration.tensorrt.models.attention_processors import CachedSTAttnProcessor2_0
 
-                    processors = stream.unet.attn_processors
-                    for name, processor in processors.items():
-                        # Target self-attention layers (attn1) by name — kvo_cache is only passed
-                        # to self-attention. Replace any processor that isn't already the cached variant,
-                        # regardless of type (handles cases where IPA install left IPAttnProcessor residue).
-                        if name.endswith("attn1.processor") and not isinstance(processor, CachedSTAttnProcessor2_0):
-                            processors[name] = CachedSTAttnProcessor2_0()
-                    stream.unet.set_attn_processor(processors)
+                    # Walk the UNet in kvo-cache order (down→mid→up) and install
+                    # CachedSTAttnProcessor2_0 on each self-attn (attn1) layer.
+                    # fi_eligible_mask is in the same walk order so index alignment is exact.
+                    fi_mask = getattr(unet_model, "fi_eligible_mask", None) if use_feature_injection else None
+                    _global_idx = 0
+
+                    def _install_cached_proc(attn_module):
+                        nonlocal _global_idx
+                        fi_eligible = bool(fi_mask[_global_idx]) if fi_mask is not None else False
+                        if not isinstance(attn_module.processor, CachedSTAttnProcessor2_0):
+                            attn_module.set_processor(CachedSTAttnProcessor2_0(fi_eligible=fi_eligible))
+                        else:
+                            attn_module.processor.fi_eligible = fi_eligible
+                        _global_idx += 1
+
+                    _unet = stream.unet
+                    for _block in _unet.down_blocks:
+                        if hasattr(_block, "attentions") and _block.attentions is not None:
+                            for _attn in _block.attentions:
+                                for _tf in _attn.transformer_blocks:
+                                    _install_cached_proc(_tf.attn1)
+                    if hasattr(_unet.mid_block, "attentions") and _unet.mid_block.attentions is not None:
+                        for _attn in _unet.mid_block.attentions:
+                            for _tf in _attn.transformer_blocks:
+                                _install_cached_proc(_tf.attn1)
+                    for _block in _unet.up_blocks:
+                        if hasattr(_block, "attentions") and _block.attentions is not None:
+                            for _attn in _block.attentions:
+                                for _tf in _attn.transformer_blocks:
+                                    _install_cached_proc(_tf.attn1)
 
                 # Compile VAE decoder engine using EngineManager
                 vae_decoder_model = VAE(
@@ -2029,6 +2080,7 @@ class StreamDiffusionWrapper:
                         _unet_build_opts["fp8_guidance_scale"] = 0.0 if _is_turbo else 7.5
                         _unet_build_opts["fp8_allow_fp16_fallback"] = self.fp8_allow_fp16_fallback
                         _unet_build_opts["fp8_use_cached_attn"] = use_cached_attn
+                        _unet_build_opts["fp8_use_feature_injection"] = use_feature_injection
                         _unet_build_opts["fp8_use_controlnet"] = use_controlnet_trt
                         _unet_build_opts["fp8_num_ip_layers"] = num_ip_layers if use_ipadapter_trt else 0
                         logger.warning(

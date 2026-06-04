@@ -157,6 +157,9 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
     param_map["cache_maxframes"] = config.get("cache_maxframes", 1)
     param_map["cache_interval"] = config.get("cache_interval", 1)
 
+    # Feature Injection (StreamV2V §3.4.2) — requires use_cached_attn=True
+    param_map["use_feature_injection"] = config.get("use_feature_injection", False)
+
     # CUDA IPC output (SD→TD zero-copy GPU transport via cuda-link)
     param_map["use_cuda_ipc_output"] = config.get("use_cuda_ipc_output", False)
     param_map["cuda_ipc_shm_name"] = config.get("cuda_ipc_shm_name")

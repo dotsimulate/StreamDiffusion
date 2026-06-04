@@ -110,6 +110,7 @@ class EngineManager:
         controlnet_model_id: Optional[str] = None,
         is_faceid: Optional[bool] = None,
         use_cached_attn: bool = False,
+        use_feature_injection: bool = False,
         use_controlnet: bool = False,
         fp8: bool = False,
         resolution: Optional[tuple] = None,
@@ -159,6 +160,9 @@ class EngineManager:
 
             if engine_type == EngineType.UNET:
                 prefix += f"--use_cached_attn-{use_cached_attn}"
+                # FI suffix MUST come right after cached_attn so stale engines
+                # (built without FI bindings) are never loaded when FI is enabled.
+                prefix += f"--fi-{use_feature_injection}"
                 if use_controlnet:
                     prefix += "--controlnet"
                 if fp8:

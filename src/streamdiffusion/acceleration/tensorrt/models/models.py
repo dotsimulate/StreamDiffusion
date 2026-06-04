@@ -425,6 +425,8 @@ class UNet(BaseModel):
         cache_maxframes: int = 1,
         min_cache_maxframes: int = 1,
         max_cache_maxframes: int = 4,
+        use_feature_injection: bool = False,
+        max_fi_up_blocks: int = 2,
     ):
         super(UNet, self).__init__(
             fp16=fp16,
@@ -475,6 +477,24 @@ class UNet(BaseModel):
 
             self.min_kvo_cache_shapes, _, _ = get_kvo_cache_info(self.unet, image_height, image_width)
             self.max_kvo_cache_shapes, _, _ = get_kvo_cache_info(self.unet, image_height, image_width)
+
+        # Feature Injection output-cache (requires use_cached_attn and a live unet)
+        self.use_feature_injection = use_feature_injection and use_cached_attn
+        self.max_fi_up_blocks = max_fi_up_blocks
+        if self.use_feature_injection and self.unet is not None:
+            from .utils import get_fi_eligible_mask
+
+            self.fi_eligible_mask = get_fi_eligible_mask(
+                self.unet, image_height, image_width, max_fi_up_blocks
+            )
+            # fi_layer_indices: global kvo-layer index for each FI-eligible layer.
+            # Used by wrapper.py to allocate fi_cache tensors in walk order.
+            # Engine binding names use fi-local sequential indices (fio_cache_in_0 …)
+            # rather than global indices — the engine only needs the count.
+            self.fi_layer_indices = [i for i, e in enumerate(self.fi_eligible_mask) if e]
+            self.fi_cache_count = len(self.fi_layer_indices)
+            # Shapes in fi-local order (same walk order as fi_layer_indices)
+            self.fi_cache_shapes = [self.kvo_cache_shapes[i] for i in self.fi_layer_indices]
 
     def get_control(self, image_height: int = 512, image_width: int = 512) -> dict:
         """Generate ControlNet input configurations with dynamic spatial dimensions based on input resolution."""
@@ -564,6 +584,32 @@ class UNet(BaseModel):
     def get_kvo_cache_names(self, in_out: str):
         return [f"kvo_cache_{in_out}_{idx}" for idx in range(self.kvo_cache_count)]
 
+    def get_fi_cache_names(self, in_out: str):
+        """Return FI output-cache binding names using fi-local sequential indices.
+
+        Sequential local indices (0, 1, … fi_cache_count-1) keep the engine runtime
+        simple: like kvo, it only needs the count to reconstruct binding names and
+        does not need to know global kvo-layer indices.
+        """
+        return [f"fio_cache_{in_out}_{i}" for i in range(self.fi_cache_count)]
+
+    def get_fi_cache_input_profile(self, min_batch, batch_size, max_batch):
+        """TRT input-profile triples for each fio_cache_in binding.
+
+        Shape: (cache_maxframes, batch, seq, hidden) — no K/V pair dim.
+        cache_maxframes is dynamic (min/opt/max follow kvo_cache convention).
+        """
+        profiles = []
+        for global_idx in self.fi_layer_indices:
+            shape = self.kvo_cache_shapes[global_idx]
+            profile = [
+                (self.min_cache_maxframes, min_batch, shape[0], shape[1]),
+                (self.cache_maxframes, batch_size, shape[0], shape[1]),
+                (self.max_cache_maxframes, max_batch, shape[0], shape[1]),
+            ]
+            profiles.append(profile)
+        return profiles
+
     def _add_control_inputs(self):
         """Add ControlNet inputs to the model's input/output specifications"""
         if not self.control_inputs:
@@ -591,12 +637,18 @@ class UNet(BaseModel):
             base_names = base_names + control_names
         if self.use_cached_attn:
             base_names = base_names + self.get_kvo_cache_names("in")
+        if self.use_feature_injection:
+            # FI output-cache inputs, then scalar tunables (fi_strength, fi_threshold)
+            base_names = base_names + self.get_fi_cache_names("in")
+            base_names = base_names + ["fi_strength", "fi_threshold"]
         return base_names
 
     def get_output_names(self):
         base_names = ["latent"]
         if self.use_cached_attn:
             base_names = base_names + self.get_kvo_cache_names("out")
+        if self.use_feature_injection:
+            base_names = base_names + self.get_fi_cache_names("out")
         return base_names
 
     def get_kvo_cache_input_profile(self, min_batch, batch_size, max_batch):
@@ -643,6 +695,14 @@ class UNet(BaseModel):
             for i in range(self.kvo_cache_count):
                 base_axes[f"kvo_cache_in_{i}"] = {1: "C", 2: "2B"}
                 base_axes[f"kvo_cache_out_{i}"] = {2: "2B"}
+
+        if self.use_feature_injection:
+            # fio_cache shape: (maxframes, batch, S, H) — no K/V dim
+            # dim 0 (maxframes) and dim 1 (batch) are dynamic; dims 2,3 (S,H) are static.
+            for i in range(self.fi_cache_count):
+                base_axes[f"fio_cache_in_{i}"] = {0: "FC", 1: "2B"}
+                base_axes[f"fio_cache_out_{i}"] = {1: "2B"}
+            # fi_strength, fi_threshold: static [1] — no dynamic axes
 
         return base_axes
 
@@ -755,6 +815,15 @@ class UNet(BaseModel):
             ):
                 profile[name] = _profile
 
+        if self.use_feature_injection:
+            for name, _profile in zip(
+                self.get_fi_cache_names("in"), self.get_fi_cache_input_profile(min_batch, batch_size, max_batch)
+            ):
+                profile[name] = _profile
+            # fi_strength and fi_threshold are static [1] fp32 scalars
+            profile["fi_strength"] = [(1,), (1,), (1,)]
+            profile["fi_threshold"] = [(1,), (1,), (1,)]
+
         return profile
 
     def get_shape_dict(self, batch_size, image_height, image_width):
@@ -788,6 +857,16 @@ class UNet(BaseModel):
             ):
                 shape_dict[in_name] = (2, self.cache_maxframes, batch_size, shape[0], shape[1])
                 shape_dict[out_name] = (2, 1, batch_size, shape[0], shape[1])
+
+        if self.use_feature_injection:
+            for in_name, out_name, shape in zip(
+                self.get_fi_cache_names("in"), self.get_fi_cache_names("out"), self.fi_cache_shapes
+            ):
+                # fio_cache_in: all cached frames; fio_cache_out: current frame only
+                shape_dict[in_name] = (self.cache_maxframes, batch_size, shape[0], shape[1])
+                shape_dict[out_name] = (1, batch_size, shape[0], shape[1])
+            shape_dict["fi_strength"] = (1,)
+            shape_dict["fi_threshold"] = (1,)
 
         return shape_dict
 
@@ -861,6 +940,19 @@ class UNet(BaseModel):
                 ).to(self.device)
                 for shape in self.kvo_cache_shapes
             ]
+
+        if self.use_feature_injection:
+            # FI output cache — zeros so the first frame sees no ghost features
+            base_inputs = base_inputs + [
+                torch.zeros(
+                    self.cache_maxframes, 2 * export_batch_size, shape[0], shape[1], dtype=torch.float16
+                ).to(self.device)
+                for shape in self.fi_cache_shapes
+            ]
+            # fi_strength default 0.8 (thesis α=0.75, reference fork 0.8); fi_threshold 0.98
+            base_inputs.append(torch.tensor([0.8], dtype=torch.float32, device=self.device))
+            base_inputs.append(torch.tensor([0.98], dtype=torch.float32, device=self.device))
+
         return tuple(base_inputs)
 
 
