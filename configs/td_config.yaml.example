@@ -72,6 +72,9 @@ cache_interval: 4
 use_feature_injection: true
 fi_strength: 0.75
 fi_threshold: 0.98
+# use_dyme: false  # DyMe dynamic merging (thesis §3.4.3) — host-side, no engine rebuild needed.
+#   Replaces ring-buffer bank update with random-partition cosine-NN merge once bank is warm.
+#   Best with cache_maxframes: 1 (DyMe(1) thesis config). Default false → ring-buffer behavior.
 
 # Image filtering (similar frame skip)
 # enable_similar_image_filter=true: hold previous output on near-duplicate frames → less flicker (matches reference fork)
