@@ -172,6 +172,10 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
     # fi_threshold: cosine-similarity gate below which injection is skipped (default 0.98).
     param_map["fi_strength"] = config.get("fi_strength", 0.75)
     param_map["fi_threshold"] = config.get("fi_threshold", 0.98)
+    # DyMe (StreamV2V thesis §3.4.3): random-partition cosine-NN bank merge.
+    # Default False → existing ring-buffer behavior (bit-identical when off).
+    # Only active when use_feature_injection=True (FI provides O-bank for joint merge).
+    param_map["use_dyme"] = config.get("use_dyme", False)
     # max_cache_maxframes: allocation cap for the KVO/FI cache ring buffers (VRAM).
     # cache_maxframes is the live logical write window; this is the hard upper bound.
     param_map["max_cache_maxframes"] = config.get("max_cache_maxframes", 4)
