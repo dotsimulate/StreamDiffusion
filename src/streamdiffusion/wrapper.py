@@ -2344,7 +2344,7 @@ class StreamDiffusionWrapper:
                                     load_engine=load_engine,
                                     conditioning_channels=cfg.get("conditioning_channels", 3),
                                     builder_optimization_level=self.builder_optimization_level,
-                                    fp8=bool(cfg.get("fp8", False)),
+                                    fp8=fp8 or bool(cfg.get("fp8", False)),
                                 )
                                 try:
                                     setattr(engine, "model_id", cfg["model_id"])
