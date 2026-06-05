@@ -164,13 +164,13 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
     if "use_feature_injection" not in config:
         logger.info(
             "use_feature_injection not in config; defaulting to True "
-            "(fi_strength=0.8, fi_threshold=0.98). Add 'use_feature_injection: false' "
+            "(fi_strength=0.75, fi_threshold=0.98). Add 'use_feature_injection: false' "
             "to your config or add Fienable/Fistrength/Fithreshold pars to the .toe to control explicitly."
         )
     param_map["use_feature_injection"] = config.get("use_feature_injection", True)
-    # fi_strength: blend weight α (thesis §3.4.2 Eq 3.2, default 0.8; thesis uses 0.75).
+    # fi_strength: blend weight α (thesis §3.4.2 Eq 3.2 α=0.75; default matches thesis).
     # fi_threshold: cosine-similarity gate below which injection is skipped (default 0.98).
-    param_map["fi_strength"] = config.get("fi_strength", 0.8)
+    param_map["fi_strength"] = config.get("fi_strength", 0.75)
     param_map["fi_threshold"] = config.get("fi_threshold", 0.98)
     # max_cache_maxframes: allocation cap for the KVO/FI cache ring buffers (VRAM).
     # cache_maxframes is the live logical write window; this is the hard upper bound.
