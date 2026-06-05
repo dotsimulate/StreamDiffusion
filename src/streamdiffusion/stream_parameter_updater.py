@@ -832,6 +832,57 @@ class StreamParameterUpdater(OrchestratorUser):
             dim=0,
         )
 
+        # F2: Keep pre-computed shifted tensors in sync with the new alpha/beta values.
+        # _alpha_next / _beta_next / _init_noise_rotated are built only in prepare()
+        # (pipeline.py:595-605) and the error-fallback _refresh_derived_tensors().
+        # Without this sync they go stale when t_index_list is updated at runtime,
+        # causing incorrect stock_noise rotation at guidance > 1.0 (RCFG-self path,
+        # pipeline.py:979-984).  _init_noise_rotated is a rotation of init_noise which
+        # is unchanged by a t_index value-only update, so we re-derive from the live tensor
+        # rather than re-sampling (mirrors the _update_seed precedent at :749-753).
+        if (
+            self.stream.use_denoising_batch
+            and (self.stream.cfg_type == "self" or self.stream.cfg_type == "initialize")
+            and self.stream._alpha_next is not None
+        ):
+            self.stream._alpha_next = torch.cat(
+                [self.stream.alpha_prod_t_sqrt[1:], torch.ones_like(self.stream.alpha_prod_t_sqrt[0:1])],
+                dim=0,
+            )
+            self.stream._beta_next = torch.cat(
+                [self.stream.beta_prod_t_sqrt[1:], torch.ones_like(self.stream.beta_prod_t_sqrt[0:1])],
+                dim=0,
+            )
+            self.stream._init_noise_rotated = torch.cat(
+                [self.stream.init_noise[1:], self.stream.init_noise[0:1]], dim=0
+            )
+
+        # Warn about known-bad do_add_noise=False regime for multi-step denoising batches.
+        # With do_add_noise=False, inter-step x_t_latent_buffer lacks noise content:
+        #   buffer = alpha_sqrt[1:] * x0_pred   (pipeline.py:1082)
+        # vs. the expected:  alpha_sqrt * x0 + beta_sqrt * epsilon
+        # When beta_sqrt at any inter-step timestep is large (high-noise regime), the UNet
+        # mis-interprets the clean buffer, causing ghost bleed from previous frames.
+        # Threshold 0.75 matches the empirically observed perceptual onset (~t_index 30 in
+        # a 50-step LCM schedule where beta_sqrt crosses 0.78).
+        if (
+            self.stream.use_denoising_batch
+            and not self.stream.do_add_noise
+            and len(self.stream.t_list) > 1
+        ):
+            inter_step_betas = beta_prod_t_sqrt[1:, 0, 0, 0]  # per-step, before repeat_interleave
+            max_beta = inter_step_betas.max().item()
+            _BLEED_THRESHOLD = 0.75
+            if max_beta > _BLEED_THRESHOLD:
+                logger.warning(
+                    "do_add_noise=False + use_denoising_batch: inter-step beta_sqrt=%.3f "
+                    "(t_index=%s) exceeds %.2f. Previous-frame ghost bleed likely — "
+                    "consider enabling do_add_noise (reference fork default).",
+                    max_beta,
+                    self.stream.t_list[1:],
+                    _BLEED_THRESHOLD,
+                )
+
     def _update_timestep_values_only(self, t_index_list: List[int]) -> None:
         """Update only timestep-dependent values when t_index_list values change but length stays same.
         This preserves the working branch behavior for value-only changes."""
