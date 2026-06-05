@@ -2,8 +2,6 @@ import logging
 import time
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
-import torch.nn.functional as F  # noqa: F401 — used in _update_cache_dyme (F.normalize)
-
 import numpy as np
 import PIL.Image
 import torch
@@ -59,7 +57,6 @@ class StreamDiffusion:
         use_feature_injection: bool = False,
         fi_strength: float = 0.75,
         fi_threshold: float = 0.98,
-        use_dyme: bool = False,
     ) -> None:
         self.device = torch.device(device)
         self.dtype = torch_dtype
@@ -74,7 +71,7 @@ class StreamDiffusion:
             torch.backends.cudnn.benchmark = True
             torch.set_float32_matmul_precision("high")
         self.generator = None
-        self._dyme_generator: Optional[torch.Generator] = None  # dedicated CUDA generator for DyMe; avoids H2D sync
+
         self._input_staging: Optional[torch.Tensor] = None
 
         self.height = height
@@ -194,12 +191,7 @@ class StreamDiffusion:
         self.fio_cache: List[torch.Tensor] = fio_cache if fio_cache is not None else []
         self.use_feature_injection: bool = use_feature_injection and bool(self.fio_cache)
 
-        # DyMe (§3.4.3): fi_to_kvo_idx[j] = global KVO layer index for FI layer j.
-        # _kvo_to_fi_idx: reverse map — KVO idx → list of FI local indices.
-        # Both set by wrapper after create_fi_cache; empty until then (no-op safe).
-        self.fi_to_kvo_idx: List[int] = []
-        self._kvo_to_fi_idx: Dict[int, List[int]] = {}
-        self.use_dyme: bool = use_dyme
+
         if self.use_feature_injection:
             self._fi_strength_tensor: Optional[torch.Tensor] = torch.tensor(
                 [fi_strength], dtype=torch.float32, device=self.device
@@ -1014,14 +1006,6 @@ class StreamDiffusion:
 
         writes_done = self.frame_idx // self.cache_interval
 
-        # DyMe (thesis §3.4.3): once bank is warm (fully written), apply random-partition
-        # cosine-NN merge instead of the ring-buffer overwrite.
-        # During warm-up (writes_done < cache_maxframes) or when use_dyme=False, fall through
-        # to the ring-buffer path below.
-        if self.use_dyme and writes_done >= self.cache_maxframes:
-            self._update_cache_dyme(kvo_cache_out, fio_cache_out, has_kvo, has_fio)
-            return
-
         # Circular buffer: overwrite the oldest slot without shifting or cloning.
         # The attention processor reads all slots as an unordered K/V bag, so slot order is irrelevant.
         # Use self.cache_maxframes (not tensor shape) so that when the buffer is allocated at
@@ -1046,115 +1030,6 @@ class StreamDiffusion:
             # Squeeze dim 0 to (B, S, H) and write into the circular buffer slot.
             for i, new_fi in enumerate(fio_cache_out):
                 self.fio_cache[i][write_slot].copy_(new_fi.squeeze(0))
-
-    def _update_cache_dyme(
-        self,
-        kvo_cache_out: List[torch.Tensor],
-        fio_cache_out: List[torch.Tensor],
-        has_kvo: bool,
-        has_fio: bool,
-    ) -> None:
-        """DyMe bank update (thesis §3.4.3): random-partition cosine-NN merge.
-
-        For each layer:
-          1. Slice bank to logical window (m frames) to handle runtime cache_maxframes
-             changes that shrink the window without reallocating the bank tensor
-             (stream_parameter_updater.py:376-389: "no tensor resize").
-          2. Concat logical bank + new frame → (m+1)*S token pool.
-          3. Random partition: src = S tokens, cand = S candidate dst tokens,
-             rest = (m-1)*S tokens carried through untouched.
-             For m=1 (DyMe(1), thesis benchmark config) rest is empty → exact equal-split.
-          4. Per-src find nearest candidate by cosine(K).  bmm is (B, S, S) regardless of
-             m (instead of (B, S, m·S)), making cost independent of cache_maxframes
-             (~4× cheaper at m=4, same cost as DyMe(1)).
-          5. Merge K, V (and O for FI layers) by scatter_reduce mean over candidate tokens.
-          6. Reassemble merged candidates + rest → m*S tokens; write back in-place.
-
-        In-place .copy_() on the logical-window view preserves bank storage addresses
-        (same physical storage as the full allocated bank) → CUDA-graph-safe.
-        """
-        if not has_kvo:
-            return
-
-        for i, kv_new in enumerate(kvo_cache_out):
-            # Use logical window only — bank may be larger than cache_maxframes if a
-            # runtime OSC update shrank the window (stream_parameter_updater.py:376-389
-            # clamps logical window, no tensor resize). Slots ≥ m hold stale frames still
-            # read by the engine as part of the unordered token pool — same as ring path.
-            m = min(self.cache_maxframes, self.kvo_cache[i].shape[1])
-
-            # kv_bank is a view of the first m slots; .copy_() into it stays in-place on
-            # the same storage as the full bank.
-            kv_bank = self.kvo_cache[i][:, :m]  # (2, m, B, S, H_kv)
-            _, _, B, S, H = kv_bank.shape
-            dev = kv_bank.device
-
-            # Lazy-init dedicated CUDA generator — eliminates per-layer CPU→GPU randperm
-            # copy + implicit sync that was occurring with self.generator (CPU generator).
-            # Seeded from self.current_seed for determinism under a fixed seed.
-            if self._dyme_generator is None:
-                self._dyme_generator = torch.Generator(device=dev).manual_seed(
-                    getattr(self, "current_seed", 2)
-                )
-
-            # Concat and flatten frame+token dims: (2, m+1, B, S, H) → (2, B, (m+1)*S, H)
-            kv_comb = torch.cat([kv_bank, kv_new], dim=1)
-            kv_flat = kv_comb.permute(0, 2, 1, 3, 4).reshape(2, B, (m + 1) * S, H)
-
-            # Random partition (on GPU — no H2D transfer):
-            #   src  = S tokens being merged away
-            #   cand = S candidate dst tokens (NN target pool, capped at S)
-            #   rest = (m-1)*S tokens carried through unchanged
-            # For m=1: rest is empty and cand == original dst → exact thesis DyMe(1).
-            perm     = torch.randperm((m + 1) * S, device=dev, generator=self._dyme_generator)
-            src_idx  = perm[:S]          # (S,)
-            cand_idx = perm[S:2 * S]     # (S,) — NN candidates
-            rest_idx = perm[2 * S:]      # ((m-1)*S,) — kept as-is
-
-            K_flat = kv_flat[0]   # (B, (m+1)*S, H)
-            V_flat = kv_flat[1]
-
-            src_K  = K_flat[:, src_idx,  :]          # (B, S, H)
-            cand_K = K_flat[:, cand_idx, :].clone()  # (B, S, H)
-
-            # Cosine NN: each src token finds its nearest candidate token by key similarity.
-            # bmm shape (B, S, S) — independent of m.
-            src_K_n  = src_K  / (src_K.norm( p=2, dim=-1, keepdim=True).clamp(min=1e-8))
-            cand_K_n = cand_K / (cand_K.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-8))
-            nn_idx   = torch.bmm(src_K_n, cand_K_n.transpose(1, 2)).argmax(dim=-1)  # (B, S)
-            nn_idx_H = nn_idx.unsqueeze(-1).expand(-1, -1, H)   # (B, S, H) for scatter
-
-            # Merge K and V into candidate tokens; reassemble with rest → (B, m*S, H).
-            merged_cand_K = cand_K.scatter_reduce_(
-                1, nn_idx_H, src_K, reduce="mean", include_self=True
-            )
-            src_V = V_flat[:, src_idx, :]
-            merged_cand_V = V_flat[:, cand_idx, :].clone().scatter_reduce_(
-                1, nn_idx_H, src_V, reduce="mean", include_self=True
-            )
-
-            merged_K = torch.cat([merged_cand_K, K_flat[:, rest_idx, :]], dim=1)  # (B, m*S, H)
-            merged_V = torch.cat([merged_cand_V, V_flat[:, rest_idx, :]], dim=1)
-
-            # Reshape (B, m*S, H) → (m, B, S, H) and write back in-place
-            merged_K_bank = merged_K.view(B, m, S, H).permute(1, 0, 2, 3)
-            merged_V_bank = merged_V.view(B, m, S, H).permute(1, 0, 2, 3)
-            kv_bank.copy_(torch.stack([merged_K_bank, merged_V_bank], dim=0))
-
-            # Merge FI O-bank using the same partition (identical token layout)
-            if has_fio and i in self._kvo_to_fi_idx:
-                for fi_j in self._kvo_to_fi_idx[i]:
-                    fi_bank     = self.fio_cache[fi_j][:m]  # logical-window slice (m, B, S, H_fi)
-                    fi_new_frame = fio_cache_out[fi_j]       # (1, B, S, H_fi)
-                    H_fi = fi_bank.shape[-1]
-                    fi_comb = torch.cat([fi_bank, fi_new_frame], dim=0)  # (m+1, B, S, H_fi)
-                    fi_flat = fi_comb.permute(1, 0, 2, 3).reshape(B, (m + 1) * S, H_fi)
-                    nn_idx_Hfi    = nn_idx.unsqueeze(-1).expand(-1, -1, H_fi)
-                    merged_cand_O = fi_flat[:, cand_idx, :].clone().scatter_reduce_(
-                        1, nn_idx_Hfi, fi_flat[:, src_idx, :], reduce="mean", include_self=True
-                    )
-                    merged_O = torch.cat([merged_cand_O, fi_flat[:, rest_idx, :]], dim=1)
-                    fi_bank.copy_(merged_O.view(B, m, S, H_fi).permute(1, 0, 2, 3))
 
     def encode_image(self, image_tensors: torch.Tensor) -> torch.Tensor:
         with profiler.region("encode_image"):
