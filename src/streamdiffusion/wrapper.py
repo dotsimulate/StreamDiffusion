@@ -128,7 +128,7 @@ class StreamDiffusionWrapper:
         min_cache_maxframes: int = 1,
         max_cache_maxframes: int = 4,
         use_feature_injection: bool = False,
-        fi_strength: float = 0.8,
+        fi_strength: float = 0.75,
         fi_threshold: float = 0.98,
         fp8: bool = False,
         static_shapes: bool = False,
@@ -1203,7 +1203,7 @@ class StreamDiffusionWrapper:
         min_cache_maxframes: int = 1,
         max_cache_maxframes: int = 4,
         use_feature_injection: bool = False,
-        fi_strength: float = 0.8,
+        fi_strength: float = 0.75,
         fi_threshold: float = 0.98,
         fp8: bool = False,
     ) -> StreamDiffusion:
