@@ -55,7 +55,7 @@ class StreamDiffusion:
         cache_maxframes: int = 1,
         fio_cache: Optional[List[torch.Tensor]] = None,
         use_feature_injection: bool = False,
-        fi_strength: float = 0.8,
+        fi_strength: float = 0.75,
         fi_threshold: float = 0.98,
     ) -> None:
         self.device = torch.device(device)
