@@ -176,6 +176,11 @@ def compile_controlnet(
     opt_batch_size: int = 1,
     engine_build_options: dict = {},
 ):
+    build_options = dict(engine_build_options)
+    fp8 = build_options.pop("fp8", False)
+    fp8_allow_fp16_fallback = build_options.pop("fp8_allow_fp16_fallback", True)
+    calibration_steps = build_options.pop("calibration_steps", 32)
+
     controlnet = controlnet.to(torch.device("cuda"), dtype=torch.float16)
     builder = EngineBuilder(model_data, controlnet, device=torch.device("cuda"))
     builder.build(
@@ -183,5 +188,11 @@ def compile_controlnet(
         onnx_opt_path,
         engine_path,
         opt_batch_size=opt_batch_size,
-        **engine_build_options,
+        fp8=fp8,
+        pipe_ref=controlnet if fp8 else None,
+        is_controlnet=True,
+        artifact_prefix="controlnet",
+        fp8_allow_fp16_fallback=fp8_allow_fp16_fallback,
+        calibration_steps=calibration_steps,
+        **build_options,
     )

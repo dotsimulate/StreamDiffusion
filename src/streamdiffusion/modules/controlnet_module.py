@@ -22,6 +22,7 @@ class ControlNetConfig:
     preprocessor: Optional[str] = None
     conditioning_scale: float = 1.0
     enabled: bool = True
+    fp8: bool = False
     conditioning_channels: Optional[int] = None
     preprocessor_params: Optional[Dict[str, Any]] = None
 

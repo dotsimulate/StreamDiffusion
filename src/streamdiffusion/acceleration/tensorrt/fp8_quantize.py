@@ -250,6 +250,121 @@ def capture_calibration_data(
     return calib_data
 
 
+def capture_calibration_data_controlnet(
+    cn_model,
+    n_calibration_steps: int = 32,
+    image_height: int = 704,
+    image_width: int = 704,
+    batch_size: int = 1,
+    save_path: Optional[str] = None,
+    embedding_dim: int = 2048,
+) -> Dict[str, np.ndarray]:
+    """
+    Capture ControlNet input activations for FP8 calibration using synthetic inputs.
+
+    Generates synthetic SDXL-compatible inputs (random latents, zero edge maps,
+    varying timesteps) and runs them through cn_model to obtain real per-layer
+    activation statistics for modelopt's max-abs calibration.
+
+    Args:
+        cn_model: Diffusers ControlNetModel (may be on CPU; moved to CUDA internally).
+        n_calibration_steps: Number of forward passes to capture (default 32).
+        image_height, image_width: Spatial resolution for synthetic inputs.
+        batch_size: Batch size per forward pass.
+        save_path: Optional path to save calib_data.npz.
+        embedding_dim: Encoder hidden state depth (2048 for SDXL).
+
+    Returns:
+        Dict mapping SDXL ControlNet ONNX input names to np.ndarray arrays.
+    """
+    import torch
+
+    _orig_device = next(cn_model.parameters()).device
+    if _orig_device.type != "cuda":
+        cn_model.to("cuda")
+
+    latent_h, latent_w = image_height // 8, image_width // 8
+    # Cover the full scheduler noise range so every activation bucket is exercised.
+    _timesteps = [999, 899, 799, 699, 599, 499, 399, 299, 199, 99, 50, 20]
+
+    captured: Dict[str, list] = {}
+
+    def _to_npy(t):
+        return np.atleast_1d(t.detach().cpu().numpy())
+
+    def _hook(module, args, kwargs):
+        _key_map = {0: "sample", 1: "timestep", 2: "encoder_hidden_states"}
+        for idx, key in _key_map.items():
+            val = args[idx] if idx < len(args) else kwargs.get(key)
+            if val is not None:
+                captured.setdefault(key, []).append(_to_npy(val))
+        ctrl_cond = args[3] if len(args) > 3 else kwargs.get("controlnet_cond")
+        if ctrl_cond is not None:
+            captured.setdefault("controlnet_cond", []).append(_to_npy(ctrl_cond))
+        added = kwargs.get("added_cond_kwargs") or {}
+        for key in ("text_embeds", "time_ids"):
+            if key in added and added[key] is not None:
+                captured.setdefault(key, []).append(_to_npy(added[key]))
+
+    handle = cn_model.register_forward_pre_hook(_hook, with_kwargs=True)
+    try:
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+            for i in range(n_calibration_steps):
+                t_val = _timesteps[i % len(_timesteps)]
+                sample = torch.randn(batch_size, 4, latent_h, latent_w, dtype=torch.float16, device="cuda")
+                timestep = torch.tensor([t_val] * batch_size, dtype=torch.float32, device="cuda")
+                enc_hidden = torch.randn(batch_size, 77, embedding_dim, dtype=torch.float16, device="cuda")
+                ctrl_cond = torch.rand(batch_size, 3, image_height, image_width, dtype=torch.float16, device="cuda")
+                text_embeds = torch.randn(batch_size, 1280, dtype=torch.float16, device="cuda")
+                time_ids = torch.tensor(
+                    [[image_height, image_width, 0, 0, image_height, image_width]] * batch_size,
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                logger.info(f"[FP8-CN] Calibration step {i + 1}/{n_calibration_steps} (t={t_val})")
+                try:
+                    cn_model(
+                        sample,
+                        timestep,
+                        enc_hidden,
+                        ctrl_cond,
+                        conditioning_scale=1.0,
+                        added_cond_kwargs={"text_embeds": text_embeds, "time_ids": time_ids},
+                        return_dict=False,
+                    )
+                except Exception as e:
+                    logger.warning(f"[FP8-CN] Calibration step {i + 1} failed: {e}. Skipping.")
+    finally:
+        handle.remove()
+        if _orig_device.type != "cuda":
+            cn_model.to(_orig_device)
+            torch.cuda.empty_cache()
+
+    if not captured:
+        raise RuntimeError("[FP8-CN] No ControlNet activations captured — check model forward signature.")
+
+    calib_data: Dict[str, np.ndarray] = {}
+    for key, arrays in captured.items():
+        stacked = np.concatenate(arrays, axis=0)
+        calib_data[key] = stacked
+        logger.info(f"[FP8-CN] Captured '{key}': shape={stacked.shape}, dtype={stacked.dtype}")
+
+    # conditioning_scale is a Python float in diffusers forward but a scalar ONNX
+    # tensor input in the exported graph. Synthesize as constant 1.0.
+    n_total = list(calib_data.values())[0].shape[0]
+    calib_data["conditioning_scale"] = np.ones(n_total, dtype=np.float32)
+    logger.info(f"[FP8-CN] Synthesized 'conditioning_scale': shape=({n_total},), dtype=float32")
+
+    if save_path:
+        tmp_path = save_path + ".tmp"
+        with open(tmp_path, "wb") as _f:
+            np.savez(_f, **calib_data)
+        os.replace(tmp_path, save_path)
+        logger.info(f"[FP8-CN] Saved calibration data: {save_path} ({os.path.getsize(save_path) / 1e6:.1f} MB)")
+
+    return calib_data
+
+
 def load_calibration_data(npz_path: str) -> Optional[Dict[str, np.ndarray]]:
     """
     Load previously-saved calibration data from a .npz file.
@@ -454,7 +569,8 @@ def quantize_onnx_fp8(
     # sample to 2×_n_itr rows, causing modelopt to split kvo into (1,...) chunks.
     import math as _math
 
-    _resolved_dim0 = {name: max(1, (_specs[name][1][0] or 1)) for name in calibration_data}
+    # Empty dims list means scalar ONNX input (shape ()); treat resolved_dim0 as 1.
+    _resolved_dim0 = {name: (max(1, _specs[name][1][0] or 1) if _specs[name][1] else 1) for name in calibration_data}
     _n_itr = max(arr.shape[0] // _resolved_dim0[name] for name, arr in calibration_data.items())
     _n_itr = max(1, _n_itr)
     for _k in list(calibration_data.keys()):

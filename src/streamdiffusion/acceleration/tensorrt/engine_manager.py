@@ -137,7 +137,8 @@ class EngineManager:
                 prefix = f"controlnet_{model_dir_name}--min_batch-{min_batch_size}--max_batch-{max_batch_size}--res-{resolution[0]}x{resolution[1]}"
             else:
                 prefix = f"controlnet_{model_dir_name}--min_batch-{min_batch_size}--max_batch-{max_batch_size}--dyn-384-1024"
-            return self.engine_dir / (prefix + optlvl_suffix) / filename
+            fp8_suffix = "--fp8" if fp8 else ""
+            return self.engine_dir / (prefix + optlvl_suffix + fp8_suffix) / filename
         else:
             # Standard engines use the unified prefix format
             # Extract base name (from wrapper.py lines 1002-1003)
@@ -246,6 +247,7 @@ class EngineManager:
         opt_image_width: int = 704,
         build_dynamic_shape: bool = False,
         builder_optimization_level: Optional[int] = None,
+        fp8: bool = False,
     ) -> Dict:
         """Get default engine build options for ControlNet engines."""
         opts = {
@@ -259,6 +261,10 @@ class EngineManager:
             opts["max_image_resolution"] = 1024
         if builder_optimization_level is not None:
             opts["builder_optimization_level"] = builder_optimization_level
+        if fp8:
+            opts["fp8"] = True
+            opts["fp8_allow_fp16_fallback"] = True
+            opts["onnx_opset"] = 19
         return opts
 
     def compile_and_load_engine(
@@ -359,6 +365,7 @@ class EngineManager:
         opt_image_height: int = 704,
         opt_image_width: int = 704,
         builder_optimization_level: Optional[int] = None,
+        fp8: bool = False,
     ) -> Any:
         """
         Get or load ControlNet engine, providing unified interface for ControlNet management.
@@ -376,6 +383,7 @@ class EngineManager:
             controlnet_model_id=model_id,
             resolution=(opt_image_height, opt_image_width),
             builder_optimization_level=builder_optimization_level,
+            fp8=fp8,
         )
 
         # Compile and load ControlNet engine
@@ -397,5 +405,6 @@ class EngineManager:
                 opt_image_height=opt_image_height,
                 opt_image_width=opt_image_width,
                 builder_optimization_level=builder_optimization_level,
+                fp8=fp8,
             ),
         )

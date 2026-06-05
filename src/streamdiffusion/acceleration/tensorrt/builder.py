@@ -115,6 +115,8 @@ class EngineBuilder:
         fp8_use_controlnet: bool = False,
         fp8_num_ip_layers: int = 0,
         builder_optimization_level: Optional[int] = None,
+        is_controlnet: bool = False,
+        artifact_prefix: str = "unet",
     ):
         build_total_start = time.perf_counter()
         engine_name = Path(engine_path).parent.name
@@ -131,11 +133,11 @@ class EngineBuilder:
         }
 
         # FP8 paths are resolved relative to the engine directory.
-        # calib_data.npz: cached UNet activations (survives engine rebuilds).
-        # unet.fp8.onnx:  ONNX with native FLOAT8E4M3FN Q/DQ (also cached).
+        # calib_data.npz: cached activations (survives engine rebuilds).
+        # {prefix}.fp8.onnx: ONNX with native FLOAT8E4M3FN Q/DQ (also cached).
         engine_dir_early = os.path.dirname(engine_path)
         _calib_data_path = os.path.join(engine_dir_early, "calib_data.npz")
-        _fp8_onnx_path = os.path.join(engine_dir_early, "unet.fp8.onnx")
+        _fp8_onnx_path = os.path.join(engine_dir_early, f"{artifact_prefix}.fp8.onnx")
 
         # --- ONNX Export ---
         if not force_onnx_export and os.path.exists(onnx_path):
@@ -205,24 +207,40 @@ class EngineBuilder:
             else:
 
                 def _calib_fn():
-                    from .fp8_quantize import _load_calibration_prompts, capture_calibration_data
+                    if is_controlnet:
+                        from .fp8_quantize import capture_calibration_data_controlnet
 
-                    prompts = calibration_prompts or _load_calibration_prompts()
-                    _build_logger.info(
-                        f"[BUILD] FP8 activation capture: {len(prompts)} prompts × "
-                        f"{calibration_steps} steps, guidance_scale={fp8_guidance_scale}"
-                    )
-                    capture_calibration_data(
-                        pipe_ref,
-                        prompts,
-                        num_inference_steps=calibration_steps,
-                        save_path=_calib_data_path,
-                        guidance_scale=fp8_guidance_scale,
-                        onnx_path=onnx_opt_path,
-                        use_cached_attn=fp8_use_cached_attn,
-                        use_controlnet=fp8_use_controlnet,
-                        num_ip_layers=fp8_num_ip_layers,
-                    )
+                        _build_logger.info(
+                            f"[BUILD] FP8 CN calibration: {calibration_steps} synthetic passes, "
+                            f"res={opt_image_width}x{opt_image_height}"
+                        )
+                        capture_calibration_data_controlnet(
+                            cn_model=pipe_ref,
+                            n_calibration_steps=calibration_steps,
+                            image_height=opt_image_height,
+                            image_width=opt_image_width,
+                            batch_size=opt_batch_size,
+                            save_path=_calib_data_path,
+                        )
+                    else:
+                        from .fp8_quantize import _load_calibration_prompts, capture_calibration_data
+
+                        prompts = calibration_prompts or _load_calibration_prompts()
+                        _build_logger.info(
+                            f"[BUILD] FP8 activation capture: {len(prompts)} prompts × "
+                            f"{calibration_steps} steps, guidance_scale={fp8_guidance_scale}"
+                        )
+                        capture_calibration_data(
+                            pipe_ref,
+                            prompts,
+                            num_inference_steps=calibration_steps,
+                            save_path=_calib_data_path,
+                            guidance_scale=fp8_guidance_scale,
+                            onnx_path=onnx_opt_path,
+                            use_cached_attn=fp8_use_cached_attn,
+                            use_controlnet=fp8_use_controlnet,
+                            num_ip_layers=fp8_num_ip_layers,
+                        )
 
                 if not _run_fp8_stage("fp8_calib_capture", _calib_fn, stats, fp8_allow_fp16_fallback, engine_filename):
                     fp8 = False

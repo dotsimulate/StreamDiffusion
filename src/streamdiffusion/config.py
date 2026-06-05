@@ -236,6 +236,7 @@ def _prepare_controlnet_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             "preprocessor": cn_config.get("preprocessor", "passthrough"),
             "conditioning_scale": cn_config.get("conditioning_scale", 1.0),
             "enabled": cn_config.get("enabled", True),
+            "fp8": cn_config.get("fp8", False),
             "preprocessor_params": cn_config.get("preprocessor_params"),
             "conditioning_channels": cn_config.get("conditioning_channels"),
             "pipeline_type": pipeline_type,
