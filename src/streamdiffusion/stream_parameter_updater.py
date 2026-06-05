@@ -258,6 +258,7 @@ class StreamParameterUpdater(OrchestratorUser):
         cache_interval: Optional[int] = None,
         fi_strength: Optional[float] = None,
         fi_threshold: Optional[float] = None,
+        cn_cache_interval: Optional[int] = None,
     ) -> None:
         """Update streaming parameters efficiently in a single call."""
 
@@ -399,6 +400,13 @@ class StreamParameterUpdater(OrchestratorUser):
                 if fi_threshold is not None:
                     self.stream._fi_threshold_tensor.fill_(float(fi_threshold))
                     logger.info(f"update_stream_params: fi_threshold -> {fi_threshold:.6f}")
+
+            # ControlNet residual cache interval — delegate to CN module if present.
+            if cn_cache_interval is not None:
+                cn_mod = self._get_controlnet_pipeline()
+                if cn_mod is not None:
+                    cn_mod.set_cn_cache_interval(int(cn_cache_interval))
+                    logger.info(f"update_stream_params: cn_cache_interval -> {int(cn_cache_interval)}")
 
     @torch.inference_mode()
     def update_prompt_weights(
@@ -865,11 +873,7 @@ class StreamParameterUpdater(OrchestratorUser):
         # mis-interprets the clean buffer, causing ghost bleed from previous frames.
         # Threshold 0.75 matches the empirically observed perceptual onset (~t_index 30 in
         # a 50-step LCM schedule where beta_sqrt crosses 0.78).
-        if (
-            self.stream.use_denoising_batch
-            and not self.stream.do_add_noise
-            and len(self.stream.t_list) > 1
-        ):
+        if self.stream.use_denoising_batch and not self.stream.do_add_noise and len(self.stream.t_list) > 1:
             inter_step_betas = beta_prod_t_sqrt[1:, 0, 0, 0]  # per-step, before repeat_interleave
             max_beta = inter_step_betas.max().item()
             _BLEED_THRESHOLD = 0.75

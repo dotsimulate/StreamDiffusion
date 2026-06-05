@@ -130,6 +130,7 @@ class StreamDiffusionWrapper:
         use_feature_injection: bool = False,
         fi_strength: float = 0.75,
         fi_threshold: float = 0.98,
+        cn_cache_interval: int = 1,
         fp8: bool = False,
         static_shapes: bool = False,
         fp8_allow_fp16_fallback: bool = False,
@@ -383,6 +384,7 @@ class StreamDiffusionWrapper:
             use_feature_injection=use_feature_injection,
             fi_strength=fi_strength,
             fi_threshold=fi_threshold,
+            cn_cache_interval=cn_cache_interval,
             fp8=fp8,
         )
 
@@ -649,6 +651,8 @@ class StreamDiffusionWrapper:
         # Feature Injection live-tunable params (in-place tensor update, no engine rebuild)
         fi_strength: Optional[float] = None,
         fi_threshold: Optional[float] = None,
+        # ControlNet residual cache interval (1=off, N>1=reuse residuals for N-1 frames)
+        cn_cache_interval: Optional[int] = None,
     ) -> None:
         """
         Update streaming parameters efficiently in a single call.
@@ -724,6 +728,7 @@ class StreamDiffusionWrapper:
                 cache_interval=cache_interval,
                 fi_strength=fi_strength,
                 fi_threshold=fi_threshold,
+                cn_cache_interval=cn_cache_interval,
             )
         finally:
             if needs_encoding:
@@ -1205,6 +1210,7 @@ class StreamDiffusionWrapper:
         use_feature_injection: bool = False,
         fi_strength: float = 0.75,
         fi_threshold: float = 0.98,
+        cn_cache_interval: int = 1,
         fp8: bool = False,
     ) -> StreamDiffusion:
         """
@@ -2311,6 +2317,9 @@ class StreamDiffusionWrapper:
                     cn_module.add_controlnet(cn_cfg, control_image=cfg.get("control_image"))
                 # Expose for later updates if needed by caller code
                 stream._controlnet_module = cn_module
+                # Apply startup cache interval from config (1 = disabled, no-op).
+                if cn_cache_interval > 1:
+                    cn_module.set_cn_cache_interval(cn_cache_interval)
 
                 if acceleration == "tensorrt":
                     try:

@@ -70,6 +70,14 @@ class ControlNetModule(OrchestratorUser):
         # Cache engine type detection to avoid repeated hasattr calls
         self._engine_type_cache: Dict[str, bool] = {}
 
+        # Residual caching: skip the CN engine forward for intermediate frames and reuse the last result.
+        # interval=1 disables caching (run every frame). interval=2 halves CN cost; control latency = 1 frame.
+        self._cn_cache_interval: int = 1
+        self._cn_frame_counter: int = 0
+        self._cn_cached_residuals: Optional[UnetKwargsDelta] = None
+        self._cn_cache_images_version: int = -1
+        self._cn_cache_scale_hash: Optional[tuple] = None
+
     # ---------- Public API (used by wrapper in a later step) ----------
     def install(self, stream) -> None:
         self._stream = stream
@@ -92,6 +100,11 @@ class ControlNetModule(OrchestratorUser):
         self._is_sdxl = None
         self._sdxl_conditioning_valid = False
         self._engine_type_cache.clear()
+        # Reset residual cache on re-install so stale tensors are never reused.
+        self._cn_frame_counter = 0
+        self._cn_cached_residuals = None
+        self._cn_cache_images_version = -1
+        self._cn_cache_scale_hash = None
 
     def add_controlnet(
         self, cfg: ControlNetConfig, control_image: Optional[Union[str, Any, torch.Tensor]] = None
@@ -207,6 +220,22 @@ class ControlNetModule(OrchestratorUser):
         with self._collections_lock:
             if 0 <= index < len(self.controlnet_scales):
                 self.controlnet_scales[index] = float(scale)
+
+    def set_cn_cache_interval(self, n: int) -> None:
+        """Set the residual cache interval.
+
+        interval=1 (default): disabled — CN runs every frame.
+        interval=N: CN runs once, residuals reused for the next N-1 frames,
+        then re-run, repeating.  Control latency = N-1 frames.  N=2 halves cost.
+
+        Changing the interval resets the frame counter and drops any cached delta.
+        """
+        n = max(1, int(n))
+        with self._collections_lock:
+            if n != self._cn_cache_interval:
+                self._cn_cache_interval = n
+                self._cn_frame_counter = 0
+                self._cn_cached_residuals = None
 
     def update_controlnet_enabled(self, index: int, enabled: bool) -> None:
         with self._collections_lock:
@@ -411,8 +440,24 @@ class ControlNetModule(OrchestratorUser):
                         if enabled:
                             active_data.append((cn, img, scale, i))
 
+                # Snapshot invalidation keys for residual cache (captured under lock for consistency).
+                curr_images_version = self._images_version
+                scale_hash = tuple(self.controlnet_scales)
+
                 if not active_data:
                     return UnetKwargsDelta()
+
+            # Residual cache hit: reuse the last forward result when control
+            # inputs are unchanged and this is an intermediate frame.
+            if (
+                self._cn_cache_interval > 1
+                and self._cn_cached_residuals is not None
+                and self._cn_cache_images_version == curr_images_version
+                and self._cn_cache_scale_hash == scale_hash
+                and self._cn_frame_counter % self._cn_cache_interval != 0
+            ):
+                self._cn_frame_counter += 1
+                return self._cn_cached_residuals
 
             # Cache TRT engines lookup to avoid rebuilding every frame
             if not self._engines_cache_valid:
@@ -555,23 +600,30 @@ class ControlNetModule(OrchestratorUser):
                 return UnetKwargsDelta()
 
             if len(down_samples_list) == 1:
-                return UnetKwargsDelta(
+                _result = UnetKwargsDelta(
                     down_block_additional_residuals=down_samples_list[0],
                     mid_block_additional_residual=mid_samples_list[0],
                 )
+            else:
+                # Merge multiple ControlNet residuals
+                merged_down = down_samples_list[0]
+                merged_mid = mid_samples_list[0]
+                for ds, ms in zip(down_samples_list[1:], mid_samples_list[1:]):
+                    for j in range(len(merged_down)):
+                        merged_down[j] = merged_down[j] + ds[j]
+                    merged_mid = merged_mid + ms
+                _result = UnetKwargsDelta(
+                    down_block_additional_residuals=merged_down,
+                    mid_block_additional_residual=merged_mid,
+                )
 
-            # Merge multiple ControlNet residuals
-            merged_down = down_samples_list[0]
-            merged_mid = mid_samples_list[0]
-            for ds, ms in zip(down_samples_list[1:], mid_samples_list[1:]):
-                for j in range(len(merged_down)):
-                    merged_down[j] = merged_down[j] + ds[j]
-                merged_mid = merged_mid + ms
-
-            return UnetKwargsDelta(
-                down_block_additional_residuals=merged_down,
-                mid_block_additional_residual=merged_mid,
-            )
+            # Residual cache write: store result for reuse on upcoming intermediate frames.
+            if self._cn_cache_interval > 1:
+                self._cn_cached_residuals = _result
+                self._cn_cache_images_version = curr_images_version
+                self._cn_cache_scale_hash = scale_hash
+            self._cn_frame_counter += 1
+            return _result
 
         return _unet_hook
 

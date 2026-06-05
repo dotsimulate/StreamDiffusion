@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Tuple, Union
 
 import yaml
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -172,6 +173,10 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
     # fi_threshold: cosine-similarity gate below which injection is skipped (default 0.98).
     param_map["fi_strength"] = config.get("fi_strength", 0.75)
     param_map["fi_threshold"] = config.get("fi_threshold", 0.98)
+    # cn_cache_interval: ControlNet residual reuse interval.
+    # 1 (default) = disabled, run CN every frame.
+    # N > 1 = run CN once every N frames; reuse residuals between (control latency = N-1 frames).
+    param_map["cn_cache_interval"] = config.get("cn_cache_interval", 1)
 
     # max_cache_maxframes: allocation cap for the KVO/FI cache ring buffers (VRAM).
     # cache_maxframes is the live logical write window; this is the hard upper bound.
