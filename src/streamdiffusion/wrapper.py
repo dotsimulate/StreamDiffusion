@@ -130,6 +130,7 @@ class StreamDiffusionWrapper:
         use_feature_injection: bool = False,
         fi_strength: float = 0.75,
         fi_threshold: float = 0.98,
+        use_dyme: bool = False,
         fp8: bool = False,
         static_shapes: bool = False,
         fp8_allow_fp16_fallback: bool = False,
@@ -383,6 +384,7 @@ class StreamDiffusionWrapper:
             use_feature_injection=use_feature_injection,
             fi_strength=fi_strength,
             fi_threshold=fi_threshold,
+            use_dyme=use_dyme,
             fp8=fp8,
         )
 
@@ -1205,6 +1207,7 @@ class StreamDiffusionWrapper:
         use_feature_injection: bool = False,
         fi_strength: float = 0.75,
         fi_threshold: float = 0.98,
+        use_dyme: bool = False,
         fp8: bool = False,
     ) -> StreamDiffusion:
         """
@@ -1475,6 +1478,7 @@ class StreamDiffusionWrapper:
             cache_maxframes=cache_maxframes,
             fio_cache=[],  # Set below if FI is enabled
             use_feature_injection=use_feature_injection and use_cached_attn,
+            use_dyme=use_dyme and use_cached_attn,
         )
 
         # Create KVO cache tensors using the pipeline's actual runtime batch size.
@@ -1501,7 +1505,7 @@ class StreamDiffusionWrapper:
         if use_feature_injection and use_cached_attn:
             from streamdiffusion.acceleration.tensorrt.models.utils import create_fi_cache
 
-            fio_cache, _, _, _ = create_fi_cache(
+            fio_cache, fi_layer_indices, _, _ = create_fi_cache(
                 pipe.unet,
                 batch_size=stream.trt_unet_batch_size,
                 cache_maxframes=max_cache_maxframes,
@@ -1512,6 +1516,12 @@ class StreamDiffusionWrapper:
             )
             stream.fio_cache = fio_cache
             stream.use_feature_injection = True
+            # DyMe: store FI↔KVO layer mapping for joint K/V/O merge (§3.4.3).
+            # fi_layer_indices[j] = global KVO index of FI layer j (from create_fi_cache walk).
+            stream.fi_to_kvo_idx = fi_layer_indices
+            stream._kvo_to_fi_idx = {}
+            for fi_j, kvo_i in enumerate(fi_layer_indices):
+                stream._kvo_to_fi_idx.setdefault(kvo_i, []).append(fi_j)
             # Persistent fp32 [1] tensors — updated in-place by stream_parameter_updater
             # (CUDA-graph-safe: same device address across frames).
             stream._fi_strength_tensor = torch.tensor([float(fi_strength)], dtype=torch.float32, device=stream.device)
