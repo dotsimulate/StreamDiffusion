@@ -269,9 +269,23 @@ dummy_img = PIL.Image.new("RGB", (_WIDTH, _HEIGHT), (128, 128, 128))
 # ── ControlNet activation (--cn-scale > 0) ────────────────────────────────────
 if args.cn_scale > 0.0:
     try:
-        stream.update_control_image(0, dummy_img)
-        stream.update_controlnet_scale(0, args.cn_scale)
-        print(f"[profile] ControlNet[0] enabled: scale={args.cn_scale}, image=dummy gray {_WIDTH}x{_HEIGHT}")
+        cn_mod = getattr(stream.stream, "_controlnet_module", None)
+        if cn_mod is None:
+            raise RuntimeError("No _controlnet_module found — ensure config has a ControlNet")
+        # Set scale
+        cn_mod.update_controlnet_scale(0, args.cn_scale)
+        # update_control_image_efficient bails if _preprocessing_orchestrator is None (offline mode).
+        # Bypass it: directly inject a dummy control tensor ([1,3,H,W] fp16 on GPU) so the hook's
+        # 'img is not None' gate passes.  prepare_frame_tensors will expand it to the right batch.
+        with cn_mod._collections_lock:
+            if len(cn_mod.controlnet_images) > 0:
+                dummy_cn = torch.ones(1, 3, _HEIGHT, _WIDTH, dtype=torch.float16, device="cuda") * 0.5
+                cn_mod.controlnet_images[0] = dummy_cn
+                cn_mod._prepared_tensors = []
+                cn_mod._images_version += 1
+            else:
+                raise RuntimeError("ControlNet registered but controlnet_images list is empty")
+        print(f"[profile] ControlNet[0] enabled: scale={args.cn_scale}, image=dummy gray tensor {_WIDTH}x{_HEIGHT}")
     except Exception as _cn_err:
         print(f"[profile] WARNING: Could not activate ControlNet — {_cn_err}")
         print("  Make sure the config includes a ControlNet and its engine is built.")
