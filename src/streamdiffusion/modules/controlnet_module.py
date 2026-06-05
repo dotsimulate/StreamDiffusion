@@ -13,6 +13,7 @@ from streamdiffusion.preprocessing.orchestrator_user import OrchestratorUser
 from streamdiffusion.preprocessing.preprocessing_orchestrator import (
     PreprocessingOrchestrator,
 )
+from streamdiffusion.tools.gpu_profiler import profiler
 
 
 @dataclass
@@ -460,91 +461,93 @@ class ControlNetModule(OrchestratorUser):
             prepared_images = self._prepared_tensors
 
             for cn, img, scale, idx_i in active_data:
-                # Swap to TRT engine if available for this model_id (use cached lookup)
-                model_id = getattr(cn, "model_id", None)
-                if model_id and model_id in self._engines_by_id:
-                    cn = self._engines_by_id[model_id]
+                with profiler.region("cn.prep"):
+                    # Swap to TRT engine if available for this model_id (use cached lookup)
+                    model_id = getattr(cn, "model_id", None)
+                    if model_id and model_id in self._engines_by_id:
+                        cn = self._engines_by_id[model_id]
 
-                # Use pre-prepared tensor
-                current_img = prepared_images[idx_i] if idx_i < len(prepared_images) else img
-                if current_img is None:
-                    continue
+                    # Use pre-prepared tensor
+                    current_img = prepared_images[idx_i] if idx_i < len(prepared_images) else img
+                    if current_img is None:
+                        continue
 
-                # Check if this is TensorRT engine (use cached result to avoid repeated hasattr calls)
-                cache_key = id(cn)  # Use object id as unique identifier
-                if cache_key in self._engine_type_cache:
-                    is_trt_engine = self._engine_type_cache[cache_key]
-                else:
-                    is_trt_engine = hasattr(cn, "engine") and hasattr(cn, "stream")
-                    self._engine_type_cache[cache_key] = is_trt_engine
-
-                # Get optimized SDXL conditioning (uses caching to avoid repeated tensor operations)
-                added_cond_kwargs = self._get_cached_sdxl_conditioning(ctx)
-
-                try:
-                    if is_trt_engine:
-                        # TensorRT engine path
-                        if added_cond_kwargs:
-                            down_samples, mid_sample = cn(
-                                sample=x_t,
-                                timestep=t_list,
-                                encoder_hidden_states=encoder_hidden_states,
-                                controlnet_cond=current_img,
-                                conditioning_scale=float(scale),
-                                **added_cond_kwargs,
-                            )
-                        else:
-                            down_samples, mid_sample = cn(
-                                sample=x_t,
-                                timestep=t_list,
-                                encoder_hidden_states=encoder_hidden_states,
-                                controlnet_cond=current_img,
-                                conditioning_scale=float(scale),
-                            )
+                    # Check if this is TensorRT engine (use cached result to avoid repeated hasattr calls)
+                    cache_key = id(cn)  # Use object id as unique identifier
+                    if cache_key in self._engine_type_cache:
+                        is_trt_engine = self._engine_type_cache[cache_key]
                     else:
-                        # PyTorch ControlNet path
-                        if added_cond_kwargs:
-                            down_samples, mid_sample = cn(
-                                sample=x_t,
-                                timestep=t_list,
-                                encoder_hidden_states=encoder_hidden_states,
-                                controlnet_cond=current_img,
-                                conditioning_scale=float(scale),
-                                return_dict=False,
-                                added_cond_kwargs=added_cond_kwargs,
-                            )
-                        else:
-                            down_samples, mid_sample = cn(
-                                sample=x_t,
-                                timestep=t_list,
-                                encoder_hidden_states=encoder_hidden_states,
-                                controlnet_cond=current_img,
-                                conditioning_scale=float(scale),
-                                return_dict=False,
-                            )
-                except Exception as e:
-                    import traceback
+                        is_trt_engine = hasattr(cn, "engine") and hasattr(cn, "stream")
+                        self._engine_type_cache[cache_key] = is_trt_engine
 
-                    __import__("logging").getLogger(__name__).error(
-                        "ControlNetModule: controlnet forward failed: %s", e
-                    )
+                    # Get optimized SDXL conditioning (uses caching to avoid repeated tensor operations)
+                    added_cond_kwargs = self._get_cached_sdxl_conditioning(ctx)
+
+                with profiler.region("cn.forward"):
                     try:
+                        if is_trt_engine:
+                            # TensorRT engine path
+                            if added_cond_kwargs:
+                                down_samples, mid_sample = cn(
+                                    sample=x_t,
+                                    timestep=t_list,
+                                    encoder_hidden_states=encoder_hidden_states,
+                                    controlnet_cond=current_img,
+                                    conditioning_scale=float(scale),
+                                    **added_cond_kwargs,
+                                )
+                            else:
+                                down_samples, mid_sample = cn(
+                                    sample=x_t,
+                                    timestep=t_list,
+                                    encoder_hidden_states=encoder_hidden_states,
+                                    controlnet_cond=current_img,
+                                    conditioning_scale=float(scale),
+                                )
+                        else:
+                            # PyTorch ControlNet path
+                            if added_cond_kwargs:
+                                down_samples, mid_sample = cn(
+                                    sample=x_t,
+                                    timestep=t_list,
+                                    encoder_hidden_states=encoder_hidden_states,
+                                    controlnet_cond=current_img,
+                                    conditioning_scale=float(scale),
+                                    return_dict=False,
+                                    added_cond_kwargs=added_cond_kwargs,
+                                )
+                            else:
+                                down_samples, mid_sample = cn(
+                                    sample=x_t,
+                                    timestep=t_list,
+                                    encoder_hidden_states=encoder_hidden_states,
+                                    controlnet_cond=current_img,
+                                    conditioning_scale=float(scale),
+                                    return_dict=False,
+                                )
+                    except Exception as e:
+                        import traceback
+
                         __import__("logging").getLogger(__name__).error(
-                            "ControlNetModule: call_summary: cond_shape=%s, img_shape=%s, scale=%s, is_sdxl=%s, is_trt=%s",
-                            (
-                                tuple(encoder_hidden_states.shape)
-                                if isinstance(encoder_hidden_states, torch.Tensor)
-                                else None
-                            ),
-                            (tuple(current_img.shape) if isinstance(current_img, torch.Tensor) else None),
-                            scale,
-                            self._is_sdxl,
-                            is_trt_engine,
+                            "ControlNetModule: controlnet forward failed: %s", e
                         )
-                    except Exception:
-                        pass
-                    __import__("logging").getLogger(__name__).error(traceback.format_exc())
-                    continue
+                        try:
+                            __import__("logging").getLogger(__name__).error(
+                                "ControlNetModule: call_summary: cond_shape=%s, img_shape=%s, scale=%s, is_sdxl=%s, is_trt=%s",
+                                (
+                                    tuple(encoder_hidden_states.shape)
+                                    if isinstance(encoder_hidden_states, torch.Tensor)
+                                    else None
+                                ),
+                                (tuple(current_img.shape) if isinstance(current_img, torch.Tensor) else None),
+                                scale,
+                                self._is_sdxl,
+                                is_trt_engine,
+                            )
+                        except Exception:
+                            pass
+                        __import__("logging").getLogger(__name__).error(traceback.format_exc())
+                        continue
                 down_samples_list.append(down_samples)
                 mid_samples_list.append(mid_sample)
 

@@ -77,6 +77,15 @@ parser.add_argument(
     help="Print subprocess commands without executing (td_main target only)",
 )
 parser.add_argument(
+    "--cn-scale",
+    type=float,
+    default=0.0,
+    metavar="SCALE",
+    help="[benchmark] ControlNet conditioning scale (0 = disabled, default). "
+    "When > 0, activates the first registered ControlNet at this scale using a dummy "
+    "gray control image. Lets you measure CN per-frame cost alongside the UNet baseline.",
+)
+parser.add_argument(
     "--config",
     default="",
     metavar="PATH",
@@ -256,6 +265,16 @@ import PIL.Image
 
 
 dummy_img = PIL.Image.new("RGB", (_WIDTH, _HEIGHT), (128, 128, 128))
+
+# ── ControlNet activation (--cn-scale > 0) ────────────────────────────────────
+if args.cn_scale > 0.0:
+    try:
+        stream.update_control_image(0, dummy_img)
+        stream.update_controlnet_scale(0, args.cn_scale)
+        print(f"[profile] ControlNet[0] enabled: scale={args.cn_scale}, image=dummy gray {_WIDTH}x{_HEIGHT}")
+    except Exception as _cn_err:
+        print(f"[profile] WARNING: Could not activate ControlNet — {_cn_err}")
+        print("  Make sure the config includes a ControlNet and its engine is built.")
 
 # ── Preprocess once ────────────────────────────────────────────────────────────
 image_tensor = stream.preprocess_image(dummy_img)
