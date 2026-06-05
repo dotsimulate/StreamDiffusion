@@ -637,6 +637,59 @@ class StreamDiffusion:
         # Seed _unet_kwargs with the constant key so per-frame code only updates values
         self._unet_kwargs = {"return_dict": False}
 
+    def _refresh_derived_tensors(self) -> None:
+        """Re-create tensors derived from batch_size/scheduler state but NOT rebuilt by
+        StreamParameterUpdater._update_timestep_calculations.
+
+        Called by the error-fallback handler in __call__ after
+        _param_updater._update_timestep_calculations() has already refreshed
+        sub_timesteps_tensor, c_skip/c_out, alpha/beta_prod_t_sqrt.
+        """
+        # init_noise + stock_noise — re-sampled so the fallback frame is coherent
+        self.init_noise = torch.randn(
+            (self.batch_size, 4, self.latent_height, self.latent_width),
+            generator=self.generator,
+        ).to(device=self.device, dtype=self.dtype)
+        self.stock_noise = self.init_noise.clone()
+
+        # Pre-computed shifted tensors (depend on alpha/beta already refreshed above)
+        if self.use_denoising_batch and (self.cfg_type == "self" or self.cfg_type == "initialize"):
+            self._alpha_next = torch.cat(
+                [self.alpha_prod_t_sqrt[1:], torch.ones_like(self.alpha_prod_t_sqrt[0:1])], dim=0
+            )
+            self._beta_next = torch.cat(
+                [self.beta_prod_t_sqrt[1:], torch.ones_like(self.beta_prod_t_sqrt[0:1])], dim=0
+            )
+            self._init_noise_rotated = torch.cat([self.init_noise[1:], self.init_noise[0:1]], dim=0)
+        else:
+            self._alpha_next = None
+            self._beta_next = None
+            self._init_noise_rotated = None
+
+        # Pre-allocated latent scratch buffers (batch-size-dependent)
+        if self.denoising_steps_num > 1:
+            self._combined_latent_buf = torch.empty(
+                (self.batch_size, 4, self.latent_height, self.latent_width),
+                dtype=self.dtype,
+                device=self.device,
+            )
+        else:
+            self._combined_latent_buf = None
+
+        if self.guidance_scale > 1.0 and (self.cfg_type == "initialize" or self.cfg_type == "full"):
+            cfg_batch = (1 + self.batch_size) if self.cfg_type == "initialize" else (2 * self.batch_size)
+            self._cfg_latent_buf = torch.empty(
+                (cfg_batch, 4, self.latent_height, self.latent_width),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._cfg_t_buf = torch.empty(
+                cfg_batch, dtype=self.sub_timesteps_tensor.dtype, device=self.device
+            )
+        else:
+            self._cfg_latent_buf = None
+            self._cfg_t_buf = None
+
     def _get_scheduler_scalings(self, timestep):
         """Get LCM/TCD-specific scaling factors for boundary conditions."""
         if isinstance(self.scheduler, LCMScheduler):
@@ -1220,7 +1273,33 @@ class StreamDiffusion:
                 device=self.device, dtype=self.dtype
             )
 
-        x_0_pred_out = self.predict_x0_batch(x_t_latent)
+        try:
+            x_0_pred_out = self.predict_x0_batch(x_t_latent)
+        except RuntimeError as _e:
+            _msg = str(_e).lower()
+            if "out of memory" in _msg:
+                logger.error("StreamDiffusion.__call__: OOM — clearing cache and re-raising: %s", _e)
+                torch.cuda.empty_cache()
+                raise
+            if "expanded size" in _msg and "must match" in _msg:
+                logger.error(
+                    "StreamDiffusion.__call__: tensor size mismatch — attempting scheduler rebuild: %s", _e
+                )
+                try:
+                    self._param_updater._update_timestep_calculations()
+                    self._refresh_derived_tensors()
+                except Exception as _fix_err:
+                    logger.error("StreamDiffusion.__call__: rebuild failed: %s", _fix_err)
+                torch.cuda.empty_cache()
+                logger.warning("StreamDiffusion.__call__: returning safe fallback frame")
+                return self.decode_image(
+                    torch.randn(
+                        (1, 4, self.latent_height, self.latent_width),
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                )
+            raise
 
         # LATENT POSTPROCESSING HOOKS: After diffusion, before VAE decoding
         x_0_pred_out = self._apply_latent_postprocessing_hooks(x_0_pred_out)
