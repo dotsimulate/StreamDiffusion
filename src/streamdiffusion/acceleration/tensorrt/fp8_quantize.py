@@ -349,8 +349,9 @@ def capture_calibration_data_controlnet(
         calib_data[key] = stacked
         logger.info(f"[FP8-CN] Captured '{key}': shape={stacked.shape}, dtype={stacked.dtype}")
 
-    # conditioning_scale is a Python float in diffusers forward but a scalar ONNX
-    # tensor input in the exported graph. Synthesize as constant 1.0.
+    # conditioning_scale is a Python float in diffusers forward but exported as a
+    # rank-1 (1,) ONNX tensor input. np.ones(n_total) already has shape (n_total,),
+    # which splits cleanly into n_total × (1,) slices for modelopt CalibrationDataProvider.
     n_total = list(calib_data.values())[0].shape[0]
     calib_data["conditioning_scale"] = np.ones(n_total, dtype=np.float32)
     logger.info(f"[FP8-CN] Synthesized 'conditioning_scale': shape=({n_total},), dtype=float32")

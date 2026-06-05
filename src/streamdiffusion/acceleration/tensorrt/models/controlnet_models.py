@@ -174,8 +174,9 @@ class ControlNetSDXLTRT(ControlNetTRT):
         # Get base input shapes
         base_shapes = super().get_shape_dict(batch_size, image_height, image_width)
 
-        # Add conditioning_scale to input shapes (scalar tensor)
-        base_shapes["conditioning_scale"] = ()  # Scalar tensor has empty shape
+        # Add conditioning_scale to input shapes — rank-1 (1,) so modelopt's
+        # CalibrationDataProvider can split it; broadcasting in the graph is unaffected.
+        base_shapes["conditioning_scale"] = (1,)
 
         # Calculate latent dimensions
         latent_height, latent_width = self.check_dims(batch_size, image_height, image_width)
@@ -221,7 +222,7 @@ class ControlNetSDXLTRT(ControlNetTRT):
             torch.randn(
                 batch_size, self.conditioning_channels, image_height, image_width, dtype=dtype, device=self.device
             ),  # controlnet_cond
-            torch.tensor(1.0, dtype=torch.float32, device=self.device),  # conditioning_scale
+            torch.tensor([1.0], dtype=torch.float32, device=self.device),  # conditioning_scale — rank-1 (1,)
             torch.randn(batch_size, 1280, dtype=dtype, device=self.device),  # text_embeds
             torch.randn(batch_size, 6, dtype=dtype, device=self.device),  # time_ids
         )
@@ -277,11 +278,11 @@ class ControlNetSDXLTRT(ControlNetTRT):
         min_batch = batch_size if static_batch else self.min_batch
         max_batch = batch_size if static_batch else self.max_batch
 
-        # conditioning_scale is a scalar (empty shape)
+        # conditioning_scale is rank-1 (1,) — fixes modelopt CalibrationDataProvider IndexError
         profile["conditioning_scale"] = [
-            (),  # min
-            (),  # opt
-            (),  # max
+            (1,),  # min
+            (1,),  # opt
+            (1,),  # max
         ]
 
         # text_embeds has shape (batch, 1280)

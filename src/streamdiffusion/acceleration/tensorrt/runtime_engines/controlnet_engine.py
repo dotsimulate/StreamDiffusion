@@ -31,6 +31,17 @@ class ControlNetModelEngine:
         self._input_names = None
         self._output_names = None
 
+        # Probe rank of conditioning_scale binding once at load time.
+        # Engines built before the rank-1 fix have an empty-shape (rank-0) binding;
+        # newly built engines (fp8 or fp16) declare shape (1,).  The correct feed
+        # tensor is chosen per-call via self._cs_rank1 so both engine generations
+        # remain usable without deleting cached directories.
+        try:
+            _cs_shape = tuple(self.engine.engine.get_tensor_shape("conditioning_scale"))
+            self._cs_rank1: bool = len(_cs_shape) == 1
+        except Exception:
+            self._cs_rank1 = False  # sd15 engines / engines lacking this input
+
         # Pre-compute model-specific values to eliminate runtime branching
         if self.model_type in ["sdxl", "sdxl_turbo"]:
             self.max_blocks = 9
@@ -113,7 +124,11 @@ class ControlNetModelEngine:
             "timestep": timestep,
             "encoder_hidden_states": encoder_hidden_states,
             "controlnet_cond": controlnet_cond,
-            "conditioning_scale": torch.tensor(conditioning_scale, dtype=torch.float32, device=sample.device),
+            "conditioning_scale": (
+                torch.tensor([conditioning_scale], dtype=torch.float32, device=sample.device)
+                if self._cs_rank1
+                else torch.tensor(conditioning_scale, dtype=torch.float32, device=sample.device)
+            ),
         }
 
         if text_embeds is not None:
