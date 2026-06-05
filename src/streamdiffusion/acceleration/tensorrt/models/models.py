@@ -947,8 +947,8 @@ class UNet(BaseModel):
                 )
                 for shape in self.fi_cache_shapes
             ]
-            # fi_strength default 0.8 (thesis α=0.75, reference fork 0.8); fi_threshold 0.98
-            base_inputs.append(torch.tensor([0.8], dtype=torch.float32, device=self.device))
+            # fi_strength default 0.75 (thesis α=0.75); fi_threshold 0.98
+            base_inputs.append(torch.tensor([0.75], dtype=torch.float32, device=self.device))
             base_inputs.append(torch.tensor([0.98], dtype=torch.float32, device=self.device))
 
         return tuple(base_inputs)
