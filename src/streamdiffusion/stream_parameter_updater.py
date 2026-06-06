@@ -323,6 +323,10 @@ class StreamParameterUpdater(OrchestratorUser):
 
             # Handle prompt blending if prompt_list is provided
             if prompt_list is not None:
+                first = prompt_list[0][0][:60] if prompt_list else ""
+                logger.info(
+                    f"update_stream_params: prompt_list -> {len(prompt_list)} prompt(s): [{first!r}{'...' if len(prompt_list[0][0]) > 60 else ''}]"
+                )
                 self._update_blended_prompts(
                     prompt_list=prompt_list,
                     negative_prompt=negative_prompt or self._current_negative_prompt,
