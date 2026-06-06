@@ -88,6 +88,12 @@ engine_dir: "engines/td"
 
 # ControlNet configuration (disabled)
 use_controlnet: false
+# cn_cache_interval: reuse CN residuals every N frames instead of recomputing each frame.
+# 1 = disabled (default, always recompute). 2+ = skip forward on intermediate frames.
+# Safe to change live; invalidated automatically on control-image or scale change.
+# Note: cache key does NOT include t_index_list — avoid changing batch config mid-stream
+# while caching is active. Low practical risk but noted.
+cn_cache_interval: 1
 
 # IPAdapter configuration (disabled)
 use_ipadapter: false
