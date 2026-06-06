@@ -727,7 +727,7 @@ class StreamDiffusionWrapper:
                 negative_prompt is None or negative_prompt == self.stream._param_updater._current_negative_prompt
             )
             if _normalized == _current and _neg_unchanged:
-                logger.info(
+                logger.debug(
                     "update_stream_params: prompt_list unchanged (%d prompt(s)) -- skipping re-encode",
                     len(_normalized),
                 )

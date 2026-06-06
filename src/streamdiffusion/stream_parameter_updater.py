@@ -324,7 +324,12 @@ class StreamParameterUpdater(OrchestratorUser):
             # Handle prompt blending if prompt_list is provided
             if prompt_list is not None:
                 first = prompt_list[0][0][:60] if prompt_list else ""
-                logger.info(
+                # Log at INFO only when the prompt *texts* change (real new prompt).
+                # Weight-only changes during a drag produce a different list each frame
+                # but don't warrant INFO noise — demote those to DEBUG.
+                _texts_changed = [str(p) for p, _ in prompt_list] != [p for p, _ in self._current_prompt_list]
+                _log = logger.info if _texts_changed else logger.debug
+                _log(
                     f"update_stream_params: prompt_list -> {len(prompt_list)} prompt(s): [{first!r}{'...' if len(prompt_list[0][0]) > 60 else ''}]"
                 )
                 self._update_blended_prompts(
