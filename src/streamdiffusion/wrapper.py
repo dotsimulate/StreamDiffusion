@@ -965,7 +965,20 @@ class StreamDiffusionWrapper:
 
             bgra = self._ipc_pack_rgba(image_tensor)
             exporter = self._lazy_init_ipc_exporter(bgra.shape[0], bgra.shape[1])
-            outcome = exporter.export(GpuFrame(ptr=bgra.data_ptr(), size=bgra.numel()))
+            # Pass the producer stream so the Exporter issues a GPU-side stream_wait_event
+            # before the D2D memcpy. Without this the high-priority non-blocking IPC stream
+            # can launch the memcpy before the default-stream pack kernels finish, reading
+            # a half-written BGRA buffer and producing a gray-washed torn frame every frame
+            # when blend-weight updates are in flight (they extend default-stream work).
+            # producer_stream=0 (legacy default stream) is valid: 0 is not None, and
+            # cudaEventRecord(event, 0) captures all prior default-stream work correctly.
+            outcome = exporter.export(
+                GpuFrame(
+                    ptr=bgra.data_ptr(),
+                    size=bgra.numel(),
+                    producer_stream=torch.cuda.current_stream().cuda_stream,
+                )
+            )
             if self.debug_mode:
                 # Health tracking — diagnostic only; gated behind debug_mode (par.Debugmode in TD UI).
                 # Reads private attr defensively; safe if vendored exporter.py is re-synced.
