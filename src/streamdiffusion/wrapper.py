@@ -68,8 +68,8 @@ class StreamDiffusionWrapper:
     ## Weight Management:
     - Prompt weights are normalized by default (sum to 1.0) unless normalize_prompt_weights=False
     - Seed weights are normalized by default (sum to 1.0) unless normalize_seed_weights=False
-    - Use update_prompt_weights([0.8, 0.2]) to change weights without re-encoding prompts
-    - Use update_seed_weights([0.3, 0.7]) to change weights without regenerating noise
+    - To change blend weights, pass the full prompt_list/seed_list to update_stream_params —
+      unchanged texts/seeds hit the embedding/noise cache, so only re-blending occurs (no re-encode)
 
     ## Cache Management:
     - Prompt embeddings and seed noise tensors are automatically cached for performance

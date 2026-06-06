@@ -413,56 +413,6 @@ class StreamParameterUpdater(OrchestratorUser):
                     logger.info(f"update_stream_params: cn_cache_interval -> {int(cn_cache_interval)}")
 
     @torch.inference_mode()
-    def update_prompt_weights(
-        self, prompt_weights: List[float], prompt_interpolation_method: Literal["linear", "slerp"] = "slerp"
-    ) -> None:
-        """Update weights for current prompt list without re-encoding prompts."""
-        if not self._current_prompt_list:
-            logger.warning("update_prompt_weights: Warning: No current prompt list to update weights for")
-            return
-
-        if len(prompt_weights) != len(self._current_prompt_list):
-            logger.warning(
-                f"update_prompt_weights: Warning: Weight count {len(prompt_weights)} doesn't match prompt count {len(self._current_prompt_list)}"
-            )
-            return
-
-        # Update the current prompt list with new weights
-        updated_prompt_list = []
-        for i, (prompt_text, _) in enumerate(self._current_prompt_list):
-            updated_prompt_list.append((prompt_text, prompt_weights[i]))
-
-        self._current_prompt_list = updated_prompt_list
-
-        # Recompute blended embeddings with new weights
-        self._apply_prompt_blending(prompt_interpolation_method)
-
-    @torch.inference_mode()
-    def update_seed_weights(
-        self, seed_weights: List[float], interpolation_method: Literal["linear", "slerp"] = "linear"
-    ) -> None:
-        """Update weights for current seed list without regenerating noise."""
-        if not self._current_seed_list:
-            logger.warning("update_seed_weights: Warning: No current seed list to update weights for")
-            return
-
-        if len(seed_weights) != len(self._current_seed_list):
-            logger.warning(
-                f"update_seed_weights: Warning: Weight count {len(seed_weights)} doesn't match seed count {len(self._current_seed_list)}"
-            )
-            return
-
-        # Update the current seed list with new weights
-        updated_seed_list = []
-        for i, (seed_value, _) in enumerate(self._current_seed_list):
-            updated_seed_list.append((seed_value, seed_weights[i]))
-
-        self._current_seed_list = updated_seed_list
-
-        # Recompute blended noise with new weights
-        self._apply_seed_blending(interpolation_method)
-
-    @torch.inference_mode()
     def _update_blended_prompts(
         self,
         prompt_list: List[Tuple[str, float]],
