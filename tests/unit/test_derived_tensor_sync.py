@@ -13,7 +13,6 @@ wires only the attributes StreamParameterUpdater._update_timestep_calculations r
 """
 
 import torch
-import pytest
 
 from streamdiffusion.stream_parameter_updater import StreamParameterUpdater
 
@@ -22,9 +21,9 @@ from streamdiffusion.stream_parameter_updater import StreamParameterUpdater
 # helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_mock_lcm_scheduler(num_steps=50, device="cpu"):
     """Minimal scheduler shell with alphas_cumprod and get_scalings_for_boundary_condition_discrete."""
-    import types
     from diffusers import LCMScheduler
 
     sched = object.__new__(LCMScheduler)
@@ -46,12 +45,17 @@ def _make_mock_lcm_scheduler(num_steps=50, device="cpu"):
     return sched
 
 
-def _make_stream_shell(t_index_list, device="cpu", dtype=torch.float32,
-                       frame_bff_size=1, use_denoising_batch=True,
-                       cfg_type="self", do_add_noise=True):
+def _make_stream_shell(
+    t_index_list,
+    device="cpu",
+    dtype=torch.float32,
+    frame_bff_size=1,
+    use_denoising_batch=True,
+    cfg_type="self",
+    do_add_noise=True,
+):
     """Minimal StreamDiffusion pipeline shell for updater testing."""
     import types
-    from diffusers import LCMScheduler
 
     stream = types.SimpleNamespace()
     stream.device = device
@@ -106,9 +110,7 @@ def _make_stream_shell(t_index_list, device="cpu", dtype=torch.float32,
         stream._beta_next = torch.cat(
             [stream.beta_prod_t_sqrt[1:], torch.ones_like(stream.beta_prod_t_sqrt[0:1])], dim=0
         )
-        stream._init_noise_rotated = torch.cat(
-            [stream.init_noise[1:], stream.init_noise[0:1]], dim=0
-        )
+        stream._init_noise_rotated = torch.cat([stream.init_noise[1:], stream.init_noise[0:1]], dim=0)
     else:
         stream._alpha_next = None
         stream._beta_next = None
@@ -129,6 +131,7 @@ def _make_updater(stream):
 # tests
 # ---------------------------------------------------------------------------
 
+
 class TestDerivedTensorSync:
     """F2: _update_timestep_calculations must keep _alpha_next/_beta_next in sync."""
 
@@ -144,13 +147,11 @@ class TestDerivedTensorSync:
         # Change t_index values (same length, different values)
         updater._update_timestep_values_only([14, 28])
 
-        expected = torch.cat(
-            [stream.alpha_prod_t_sqrt[1:], torch.ones_like(stream.alpha_prod_t_sqrt[0:1])], dim=0
+        expected = torch.cat([stream.alpha_prod_t_sqrt[1:], torch.ones_like(stream.alpha_prod_t_sqrt[0:1])], dim=0)
+        assert not torch.allclose(old_alpha_next, stream._alpha_next), "_alpha_next was not updated (stale)"
+        assert torch.allclose(stream._alpha_next, expected, atol=1e-5), (
+            f"_alpha_next mismatch: max_diff={(stream._alpha_next - expected).abs().max().item():.6f}"
         )
-        assert not torch.allclose(old_alpha_next, stream._alpha_next), \
-            "_alpha_next was not updated (stale)"
-        assert torch.allclose(stream._alpha_next, expected, atol=1e-5), \
-            f"_alpha_next mismatch: max_diff={( stream._alpha_next - expected).abs().max().item():.6f}"
 
     def test_beta_next_updated_after_t_index_change(self):
         """After a same-length value-only t_index change, _beta_next must equal
@@ -161,13 +162,11 @@ class TestDerivedTensorSync:
 
         updater._update_timestep_values_only([14, 28])
 
-        expected = torch.cat(
-            [stream.beta_prod_t_sqrt[1:], torch.ones_like(stream.beta_prod_t_sqrt[0:1])], dim=0
-        )
-        assert not torch.allclose(old_beta_next, stream._beta_next), \
-            "_beta_next was not updated (stale)"
-        assert torch.allclose(stream._beta_next, expected, atol=1e-5), \
+        expected = torch.cat([stream.beta_prod_t_sqrt[1:], torch.ones_like(stream.beta_prod_t_sqrt[0:1])], dim=0)
+        assert not torch.allclose(old_beta_next, stream._beta_next), "_beta_next was not updated (stale)"
+        assert torch.allclose(stream._beta_next, expected, atol=1e-5), (
             f"_beta_next mismatch: max_diff={(stream._beta_next - expected).abs().max().item():.6f}"
+        )
 
     def test_init_noise_rotated_stays_consistent_after_t_index_change(self):
         """_init_noise_rotated must equal cat([init_noise[1:], init_noise[0:1]])
@@ -179,14 +178,14 @@ class TestDerivedTensorSync:
         updater._update_timestep_values_only([14, 28])
 
         # init_noise should be unchanged
-        assert torch.allclose(stream.init_noise, saved_init_noise), \
+        assert torch.allclose(stream.init_noise, saved_init_noise), (
             "init_noise was unexpectedly mutated by _update_timestep_values_only"
-
-        expected_rotated = torch.cat(
-            [stream.init_noise[1:], stream.init_noise[0:1]], dim=0
         )
-        assert torch.allclose(stream._init_noise_rotated, expected_rotated, atol=1e-6), \
+
+        expected_rotated = torch.cat([stream.init_noise[1:], stream.init_noise[0:1]], dim=0)
+        assert torch.allclose(stream._init_noise_rotated, expected_rotated, atol=1e-6), (
             "_init_noise_rotated out of sync with init_noise after t_index update"
+        )
 
     def test_no_update_when_derived_tensors_not_initialized(self):
         """When _alpha_next is None (non-batched or non-RCFG-self), updater must
@@ -201,18 +200,21 @@ class TestDerivedTensorSync:
     def test_warn_on_do_add_noise_false_high_beta(self, caplog):
         """When do_add_noise=False and inter-step beta_sqrt > 0.75, a warning must be logged."""
         import logging
+
         stream = _make_stream_shell([14, 28], do_add_noise=False)
         updater = _make_updater(stream)
 
         with caplog.at_level(logging.WARNING, logger="streamdiffusion.stream_parameter_updater"):
             updater._update_timestep_values_only([14, 28])
 
-        assert any("do_add_noise=False" in r.message for r in caplog.records), \
+        assert any("do_add_noise=False" in r.message for r in caplog.records), (
             "Expected do_add_noise bleed-risk warning not emitted"
+        )
 
     def test_no_warn_when_do_add_noise_true(self, caplog):
         """When do_add_noise=True, no bleed-risk warning should be logged."""
         import logging
+
         stream = _make_stream_shell([14, 28], do_add_noise=True)
         updater = _make_updater(stream)
 

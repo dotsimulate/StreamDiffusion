@@ -724,8 +724,7 @@ class StreamDiffusionWrapper:
             _normalized = [(str(p), float(w)) for p, w in prompt_list]
             _current = self.stream._param_updater.get_current_prompts()
             _neg_unchanged = (
-                negative_prompt is None
-                or negative_prompt == self.stream._param_updater._current_negative_prompt
+                negative_prompt is None or negative_prompt == self.stream._param_updater._current_negative_prompt
             )
             if _normalized == _current and _neg_unchanged:
                 logger.info(

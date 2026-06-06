@@ -191,7 +191,6 @@ class StreamDiffusion:
         self.fio_cache: List[torch.Tensor] = fio_cache if fio_cache is not None else []
         self.use_feature_injection: bool = use_feature_injection and bool(self.fio_cache)
 
-
         if self.use_feature_injection:
             self._fi_strength_tensor: Optional[torch.Tensor] = torch.tensor(
                 [fi_strength], dtype=torch.float32, device=self.device
@@ -676,9 +675,7 @@ class StreamDiffusion:
                 dtype=self.dtype,
                 device=self.device,
             )
-            self._cfg_t_buf = torch.empty(
-                cfg_batch, dtype=self.sub_timesteps_tensor.dtype, device=self.device
-            )
+            self._cfg_t_buf = torch.empty(cfg_batch, dtype=self.sub_timesteps_tensor.dtype, device=self.device)
         else:
             self._cfg_latent_buf = None
             self._cfg_t_buf = None
@@ -1190,9 +1187,7 @@ class StreamDiffusion:
                 torch.cuda.empty_cache()
                 raise
             if "expanded size" in _msg and "must match" in _msg:
-                logger.error(
-                    "StreamDiffusion.__call__: tensor size mismatch — attempting scheduler rebuild: %s", _e
-                )
+                logger.error("StreamDiffusion.__call__: tensor size mismatch — attempting scheduler rebuild: %s", _e)
                 try:
                     self._param_updater._update_timestep_calculations()
                     self._refresh_derived_tensors()

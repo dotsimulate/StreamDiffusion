@@ -297,7 +297,9 @@ if args.cn_scale > 0.0:
         print(f"[profile] ControlNet[0] enabled: scale={args.cn_scale}, image=dummy gray tensor {_WIDTH}x{_HEIGHT}")
         if args.cn_cache_interval > 1:
             cn_mod.set_cn_cache_interval(args.cn_cache_interval)
-            print(f"[profile] ControlNet residual cache: interval={args.cn_cache_interval} (CN forward every {args.cn_cache_interval} frames)")
+            print(
+                f"[profile] ControlNet residual cache: interval={args.cn_cache_interval} (CN forward every {args.cn_cache_interval} frames)"
+            )
     except Exception as _cn_err:
         print(f"[profile] WARNING: Could not activate ControlNet — {_cn_err}")
         print("  Make sure the config includes a ControlNet and its engine is built.")
