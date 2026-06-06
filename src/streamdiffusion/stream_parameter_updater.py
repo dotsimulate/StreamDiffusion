@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 
 logger = logging.getLogger(__name__)
-from .preprocessing.orchestrator_user import OrchestratorUser
+from .preprocessing.orchestrator_user import OrchestratorUser  # noqa: E402
 
 
 class CacheStats:
@@ -126,7 +126,7 @@ class StreamParameterUpdater(OrchestratorUser):
         self._embedding_preprocessors = [
             (preprocessor, key) for preprocessor, key in self._embedding_preprocessors if key != style_image_key
         ]
-        removed_count = original_count - len(self._embedding_preprocessors)
+        original_count - len(self._embedding_preprocessors)
 
         # Clear cached embeddings for this key
         if style_image_key in self._embedding_cache:
@@ -1074,7 +1074,7 @@ class StreamParameterUpdater(OrchestratorUser):
             return
 
         # Remove from current list
-        removed_prompt = self._current_prompt_list.pop(index)
+        self._current_prompt_list.pop(index)
 
         # Remove from cache and reindex
         if index in self._prompt_cache:
@@ -1175,7 +1175,7 @@ class StreamParameterUpdater(OrchestratorUser):
             return
 
         # Remove from current list
-        removed_seed = self._current_seed_list.pop(index)
+        self._current_seed_list.pop(index)
 
         # Remove from cache and reindex
         if index in self._seed_cache:

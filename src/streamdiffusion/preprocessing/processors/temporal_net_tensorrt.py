@@ -24,7 +24,7 @@ except ImportError:
 
 # Try to import torchvision for RAFT model
 try:
-    from torchvision.models.optical_flow import Raft_Small_Weights, raft_small
+    from torchvision.models.optical_flow import Raft_Small_Weights, raft_small  # noqa: F401
     from torchvision.utils import flow_to_image
 
     TORCHVISION_AVAILABLE = True
@@ -136,7 +136,7 @@ class TensorRTEngine:
                 try:
                     if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
                         self.context.set_input_shape(name, buf.shape)
-                except:
+                except Exception:
                     # Tensor name might not be in engine, skip
                     pass
 

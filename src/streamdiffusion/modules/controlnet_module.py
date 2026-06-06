@@ -484,13 +484,6 @@ class ControlNetModule(OrchestratorUser):
 
             encoder_hidden_states = self._stream.prompt_embeds[:, : self._expected_text_len, :]
 
-            base_kwargs: Dict[str, Any] = {
-                "sample": x_t,
-                "timestep": t_list,
-                "encoder_hidden_states": encoder_hidden_states,
-                "return_dict": False,
-            }
-
             down_samples_list: List[List[torch.Tensor]] = []
             mid_samples_list: List[torch.Tensor] = []
 

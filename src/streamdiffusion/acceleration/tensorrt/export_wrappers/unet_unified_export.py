@@ -8,9 +8,9 @@ from streamdiffusion._patches.diffusers_kvo_patch import apply as _apply_kvo_pat
 
 _apply_kvo_patch()  # ensure kvo_cache patch is present even if diffusers was imported first
 
-from ..models.utils import convert_list_to_structure
-from .unet_controlnet_export import create_controlnet_wrapper
-from .unet_ipadapter_export import create_ipadapter_wrapper
+from ..models.utils import convert_list_to_structure  # noqa: E402
+from .unet_controlnet_export import create_controlnet_wrapper  # noqa: E402
+from .unet_ipadapter_export import create_ipadapter_wrapper  # noqa: E402
 
 
 def _collect_fi_processors(unet: UNet2DConditionModel) -> List:

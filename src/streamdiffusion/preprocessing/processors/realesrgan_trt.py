@@ -242,7 +242,7 @@ class RealESRGANProcessor(BasePreprocessor):
         """Load PyTorch model from file"""
         if not SPANDREL_AVAILABLE:
             # Fallback loading without spandrel
-            state_dict = torch.load(self.model_path, map_location=self.device)
+            torch.load(self.model_path, map_location=self.device)
             # This is a simplified approach - real implementation would need model architecture
             return
 
@@ -250,7 +250,7 @@ class RealESRGANProcessor(BasePreprocessor):
         # Don't force dtype conversion as it can cause type mismatches
         # Let the model keep its native dtype and convert inputs as needed
         self.pytorch_model = model_descriptor.model.eval().to(device=self.device)
-        model_dtype = next(self.pytorch_model.parameters()).dtype
+        next(self.pytorch_model.parameters()).dtype
 
     def _export_to_onnx(self):
         """Export PyTorch model to ONNX format"""
@@ -391,7 +391,6 @@ class RealESRGANProcessor(BasePreprocessor):
 
         # Ensure model and input tensor have compatible dtypes
         model_dtype = next(self.pytorch_model.parameters()).dtype
-        original_dtype = tensor.dtype
         if tensor.dtype != model_dtype:
             tensor = tensor.to(dtype=model_dtype)
 

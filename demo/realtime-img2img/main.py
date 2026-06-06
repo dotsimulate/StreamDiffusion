@@ -18,7 +18,7 @@ mimetypes.add_type("application/javascript", ".js")
 THROTTLE = 1.0 / 120
 
 # Import configuration from separate file to avoid circular imports
-from app_config import AVAILABLE_CONTROLNETS, DEFAULT_SETTINGS
+from app_config import AVAILABLE_CONTROLNETS, DEFAULT_SETTINGS  # noqa: E402
 
 
 # Configure logging
@@ -333,7 +333,7 @@ class AppState:
     def remove_controlnet(self, index: int):
         """Remove ControlNet from AppState - SINGLE SOURCE OF TRUTH"""
         if index < len(self.controlnet_info["controlnets"]):
-            removed = self.controlnet_info["controlnets"].pop(index)
+            self.controlnet_info["controlnets"].pop(index)
             # Re-index remaining controlnets
             for i, controlnet in enumerate(self.controlnet_info["controlnets"]):
                 controlnet["index"] = i
@@ -380,7 +380,7 @@ class AppState:
         if hook_type in self.pipeline_hooks:
             processors = self.pipeline_hooks[hook_type]["processors"]
             if processor_index < len(processors):
-                removed = processors.pop(processor_index)
+                processors.pop(processor_index)
                 # Re-index remaining processors
                 for i, processor in enumerate(processors):
                     processor["index"] = i
@@ -880,8 +880,7 @@ class App:
     def _create_pipeline(self):
         """Create pipeline using AppState as single source of truth"""
         logger.info("_create_pipeline: Creating pipeline using AppState as single source of truth")
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        torch_dtype = torch.float16
+        torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Generate pipeline config from AppState - SINGLE SOURCE OF TRUTH
         pipeline_config = self.app_state.generate_pipeline_config()
@@ -906,7 +905,7 @@ class App:
         if "use_safety_checker" in pipeline_config:
             args_dict["safety_checker"] = pipeline_config["use_safety_checker"]
 
-        updated_args = Args(**args_dict)
+        Args(**args_dict)
 
         # Create Pipeline instance with the pre-created wrapper and config
         pipeline = Pipeline(wrapper=wrapper, config=pipeline_config)
@@ -941,7 +940,7 @@ class App:
                 try:
                     if os.path.exists(temp_path):
                         os.unlink(temp_path)
-                except:
+                except Exception:
                     pass
             self._temp_config_files.clear()
 

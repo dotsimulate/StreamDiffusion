@@ -26,7 +26,7 @@ from onnx import shape_inference
 
 
 logger = logging.getLogger(__name__)
-from polygraphy.backend.onnx.loader import fold_constants
+from polygraphy.backend.onnx.loader import fold_constants  # noqa: E402
 
 
 class Optimizer:

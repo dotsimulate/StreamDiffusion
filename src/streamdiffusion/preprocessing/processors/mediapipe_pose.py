@@ -289,11 +289,11 @@ class MediaPipePosePreprocessor(BasePreprocessor):
 
                 # Try to create base options with GPU delegate
                 try:
-                    base_options = mp.tasks.BaseOptions(delegate=mp.tasks.BaseOptions.Delegate.GPU)
+                    mp.tasks.BaseOptions(delegate=mp.tasks.BaseOptions.Delegate.GPU)
                     print("MediaPipePosePreprocessor.detector: GPU delegate available")
                 except Exception as gpu_error:
                     print(f"MediaPipePosePreprocessor.detector: GPU delegate failed ({gpu_error}), using CPU")
-                    base_options = mp.tasks.BaseOptions(delegate=mp.tasks.BaseOptions.Delegate.CPU)
+                    mp.tasks.BaseOptions(delegate=mp.tasks.BaseOptions.Delegate.CPU)
 
                 # Create detector with optimized settings
                 print(
@@ -498,7 +498,7 @@ class MediaPipePosePreprocessor(BasePreprocessor):
             return image
 
         h, w = image.shape[:2]
-        confidence_threshold = self.params.get("confidence_threshold", 0.3)
+        self.params.get("confidence_threshold", 0.3)
 
         # Standard hand connections (21 landmarks per hand)
         hand_connections = [

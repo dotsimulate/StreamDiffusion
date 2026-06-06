@@ -73,7 +73,6 @@ async def stream(user_id: uuid.UUID, request: Request, app_instance=Depends(get_
         # No need to check for resolution mismatches here
 
         # Check for acceleration changes (requires pipeline recreation)
-        acceleration_changed = False
         if (
             hasattr(app_instance, "new_acceleration")
             and app_instance.new_acceleration != app_instance.args.acceleration
@@ -97,7 +96,6 @@ async def stream(user_id: uuid.UUID, request: Request, app_instance=Depends(get_
                 app_instance._cleanup_pipeline(old_pipeline)
 
             app_instance.pipeline = app_instance._create_pipeline()
-            acceleration_changed = True
             logging.info("stream: Pipeline recreated with new acceleration")
 
         # IPAdapter style images are now handled dynamically in pipeline.predict()

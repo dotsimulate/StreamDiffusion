@@ -78,12 +78,12 @@ async def upload_controlnet_config(file: UploadFile = File(...), app_instance=De
         # Get config prompt if available
         config_prompt = config_data.get("prompt", None)
         # Get negative prompt if available
-        config_negative_prompt = config_data.get("negative_prompt", None)
+        config_data.get("negative_prompt", None)
 
         # Get t_index_list from config if available
         from app_config import DEFAULT_SETTINGS
 
-        t_index_list = config_data.get("t_index_list", DEFAULT_SETTINGS.get("t_index_list", [35, 45]))
+        config_data.get("t_index_list", DEFAULT_SETTINGS.get("t_index_list", [35, 45]))
 
         # Get acceleration from config if available
         config_acceleration = config_data.get("acceleration", app_instance.args.acceleration)
@@ -428,7 +428,7 @@ async def remove_controlnet(request: Request, app_instance=Depends(get_app_insta
         if index < 0 or index >= len(controlnets):
             raise HTTPException(status_code=400, detail=f"ControlNet index {index} out of range")
 
-        removed_controlnet = controlnets.pop(index)
+        controlnets.pop(index)
 
         # Remove from AppState - SINGLE SOURCE OF TRUTH
         app_instance.app_state.remove_controlnet(index)
@@ -529,7 +529,7 @@ async def switch_preprocessor(request: Request, app_instance=Depends(get_app_ins
 
         # Update the preprocessor in AppState
         controlnet = app_instance.app_state.controlnet_info["controlnets"][controlnet_index]
-        old_preprocessor = controlnet.get("preprocessor", "unknown")
+        controlnet.get("preprocessor", "unknown")
         controlnet["preprocessor"] = preprocessor_name
         controlnet["preprocessor_params"] = {}  # Reset parameters when switching
 

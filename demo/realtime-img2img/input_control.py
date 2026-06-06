@@ -148,7 +148,7 @@ class GamepadInput(InputControl):
         finally:
             try:
                 pygame.quit()
-            except:
+            except Exception:
                 pass
 
 

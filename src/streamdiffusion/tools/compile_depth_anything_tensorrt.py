@@ -28,7 +28,7 @@ except ImportError:
     logger.warning("TensorRT not available. Please install it first.")
 
 try:
-    import onnx
+    import onnx  # noqa: F401
 
     ONNX_AVAILABLE = True
 except ImportError:

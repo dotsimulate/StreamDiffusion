@@ -180,7 +180,7 @@ class StandardLineartPreprocessor(BasePreprocessor):
         """
         Apply standard line art detection to the input image
         """
-        start_time = time.time()
+        time.time()
 
         if isinstance(image, Image.Image):
             input_image_cpu = np.array(image, dtype=np.uint8)

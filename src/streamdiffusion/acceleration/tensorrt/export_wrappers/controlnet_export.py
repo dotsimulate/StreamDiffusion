@@ -15,7 +15,7 @@ class SDXLControlNetExportWrapper(torch.nn.Module):
             # Try to infer from first parameter
             try:
                 self.device = next(controlnet_model.parameters()).device
-            except:
+            except Exception:
                 self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         if hasattr(controlnet_model, "dtype"):
@@ -24,7 +24,7 @@ class SDXLControlNetExportWrapper(torch.nn.Module):
             # Try to infer from first parameter
             try:
                 self.dtype = next(controlnet_model.parameters()).dtype
-            except:
+            except Exception:
                 self.dtype = torch.float16
 
     def forward(

@@ -248,13 +248,13 @@ def compile_raft(
     # Parse resolution strings
     try:
         min_height, min_width = map(int, min_resolution.split("x"))
-    except:
+    except ValueError:
         logger.error(f"Invalid min_resolution format: {min_resolution}. Expected format: HxW (e.g., 512x512)")
         return
 
     try:
         max_height, max_width = map(int, max_resolution.split("x"))
-    except:
+    except ValueError:
         logger.error(f"Invalid max_resolution format: {max_resolution}. Expected format: HxW (e.g., 1024x1024)")
         return
 

@@ -228,7 +228,7 @@ def main():
 
     # Get the script directory to make paths relative to it
     script_dir = Path(__file__).parent
-    default_config = script_dir.parent.parent / "configs" / "controlnet_examples" / "multi_controlnet_example.yaml"
+    script_dir.parent.parent / "configs" / "controlnet_examples" / "multi_controlnet_example.yaml"
 
     parser.add_argument("--config", type=str, required=True, help="Path to ControlNet configuration file")
     parser.add_argument("--input-video", type=str, required=True, help="Path to input video file")
@@ -270,7 +270,7 @@ def main():
     print(f"main: Output directory: {args.output_dir}")
 
     try:
-        metrics = process_video(args.config, args.input_video, args.output_dir, engine_only=args.engine_only)
+        process_video(args.config, args.input_video, args.output_dir, engine_only=args.engine_only)
         if args.engine_only:
             print("main: Engine-only mode completed successfully!")
             return 0

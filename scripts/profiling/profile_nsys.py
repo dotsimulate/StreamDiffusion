@@ -209,10 +209,10 @@ if args.target == "td_main":
 # ═══════════════════════════════════════════════════════════════════════════════
 # benchmark target: in-process wrapper loop
 # ═══════════════════════════════════════════════════════════════════════════════
-import torch
-from torch.profiler import ProfilerActivity, profile, schedule
+import torch  # noqa: E402
+from torch.profiler import ProfilerActivity, profile, schedule  # noqa: E402
 
-from streamdiffusion.tools.gpu_profiler import profiler
+from streamdiffusion.tools.gpu_profiler import profiler  # noqa: E402
 
 
 os.environ.setdefault("GPU_PROFILER", "1")  # wrapper.__init__ reads this to activate
@@ -270,7 +270,7 @@ else:
 print(f"[profile] Pipeline ready in {time.perf_counter() - t0:.1f}s\n")
 
 # ── Dummy input image ──────────────────────────────────────────────────────────
-import PIL.Image
+import PIL.Image  # noqa: E402
 
 
 dummy_img = PIL.Image.new("RGB", (_WIDTH, _HEIGHT), (128, 128, 128))

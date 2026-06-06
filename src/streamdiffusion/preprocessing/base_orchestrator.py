@@ -64,7 +64,7 @@ class BaseOrchestrator(Generic[T, R], ABC):
         """Cleanup on destruction"""
         try:
             self.cleanup()
-        except:
+        except Exception:
             pass
 
     @abstractmethod

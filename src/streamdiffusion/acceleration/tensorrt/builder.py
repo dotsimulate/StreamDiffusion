@@ -146,14 +146,14 @@ class EngineBuilder:
         else:
             print(f"Exporting model: {onnx_path}")
             t0 = time.perf_counter()
-            _export_kwargs = dict(
-                onnx_path=onnx_path,
-                model_data=self.model,
-                opt_image_height=opt_image_height,
-                opt_image_width=opt_image_width,
-                opt_batch_size=opt_batch_size,
-                onnx_opset=onnx_opset,
-            )
+            _export_kwargs = {
+                "onnx_path": onnx_path,
+                "model_data": self.model,
+                "opt_image_height": opt_image_height,
+                "opt_image_width": opt_image_width,
+                "opt_batch_size": opt_batch_size,
+                "onnx_opset": onnx_opset,
+            }
             export_onnx(self.network, **_export_kwargs)
             elapsed = time.perf_counter() - t0
             stats["stages"]["onnx_export"] = {"status": "built", "elapsed_s": round(elapsed, 2)}

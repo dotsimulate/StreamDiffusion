@@ -4,7 +4,7 @@ from .base import BasePreprocessor
 
 
 try:
-    import cv2
+    import cv2  # noqa: F401
 
     OPENCV_AVAILABLE = True
 except ImportError:

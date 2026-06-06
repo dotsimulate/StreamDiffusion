@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 TRT_LOGGER = get_trt_logger()  # polygraphy singleton — shared with engine_from_bytes()
 
-from ...model_detection import detect_model
+from ...model_detection import detect_model  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -478,12 +478,12 @@ class Engine:
         if hasattr(self, "cuda_graph_instance") and self.cuda_graph_instance is not None:
             try:
                 CUASSERT(cudart.cudaGraphExecDestroy(self.cuda_graph_instance))
-            except:
+            except Exception:
                 pass
         if hasattr(self, "graph") and self.graph is not None:
             try:
                 CUASSERT(cudart.cudaGraphDestroy(self.graph))
-            except:
+            except Exception:
                 pass
 
         del self.engine
@@ -969,7 +969,7 @@ class Engine:
                     logger.debug(
                         "TensorRT Engine: filtering unsupported inputs %s (allowed=%s)",
                         missing,
-                        sorted(list(self._allowed_inputs)),
+                        sorted(self._allowed_inputs),
                     )
             feed_dict = filtered_feed_dict
 
@@ -1062,7 +1062,7 @@ def decode_images(images: torch.Tensor):
 
 def preprocess_image(image: Image.Image):
     w, h = image.size
-    w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
+    w, h = (x - x % 32 for x in (w, h))  # resize to integer multiple of 32
     image = image.resize((w, h))
     init_image = np.array(image).astype(np.float32) / 255.0
     init_image = init_image[None].transpose(0, 3, 1, 2)

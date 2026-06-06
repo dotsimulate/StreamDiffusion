@@ -23,7 +23,7 @@ def _postprocess_image(queue: Queue) -> None:
     while True:
         try:
             if not queue.empty():
-                output = postprocess_image(queue.get(block=False), output_type="pil")[0]
+                postprocess_image(queue.get(block=False), output_type="pil")[0]
             time.sleep(0.0005)
         except KeyboardInterrupt:
             return
