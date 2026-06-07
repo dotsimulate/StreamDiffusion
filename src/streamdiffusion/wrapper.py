@@ -1589,6 +1589,20 @@ class StreamDiffusionWrapper:
                 adapter_name = f"custom_lora_{i}"
                 logger.info(f"_load_model: Loading LoRA '{lora_name}' with scale {lora_scale}")
 
+                # G8 fix: scale-0 fuse is a mathematical no-op (W + 0·ΔW = W), so skip
+                # loading and fusing entirely.  The entry is also excluded from
+                # _loaded_adapter_names so the G1 block at the end of the loop naturally
+                # drops it from the engine cache signature — a lora_dict with only
+                # zero-scale entries collapses to None and reuses the baseline UNet engine.
+                # Note: negative scales are valid (subtract the LoRA delta), so skip == 0
+                # exactly, not <= 0.
+                if lora_scale == 0:
+                    logger.info(
+                        f"_load_model: Skipping zero-scale LoRA '{lora_name}' — "
+                        "no effect on weights; engine will match baseline cache"
+                    )
+                    continue
+
                 try:
                     # Load LoRA weights with unique adapter name
                     stream.pipe.load_lora_weights(lora_name, adapter_name=adapter_name)
