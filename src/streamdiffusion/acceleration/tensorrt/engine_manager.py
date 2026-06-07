@@ -155,8 +155,11 @@ class EngineManager:
             if ipadapter_tokens is not None:
                 prefix += f"--tokens{ipadapter_tokens}"
 
-            # Fused Loras - use concise hashed signature to avoid long/invalid paths
-            if lora_dict is not None and len(lora_dict) > 0:
+            # Fused Loras - use concise hashed signature to avoid long/invalid paths.
+            # Only UNet engines bake LoRA weights; VAE and other standard engines are
+            # LoRA-agnostic, so scoping the suffix to UNET prevents redundant VAE rebuilds
+            # every time the LoRA dict changes.
+            if engine_type == EngineType.UNET and lora_dict is not None and len(lora_dict) > 0:
                 prefix += f"--lora-{self._lora_signature(lora_dict)}"
 
             if engine_type == EngineType.UNET:
