@@ -141,6 +141,7 @@ class StreamDiffusionWrapper:
         static_shapes: bool = False,
         fp8_allow_fp16_fallback: bool = False,
         builder_optimization_level: Optional[int] = None,
+        vae_builder_optimization_level: Optional[int] = None,
         # CUDA IPC output (SD→TD zero-copy GPU transport via cuda-link)
         use_cuda_ipc_output: bool = False,
         cuda_ipc_shm_name: Optional[str] = None,
@@ -355,6 +356,10 @@ class StreamDiffusionWrapper:
         self.static_shapes = static_shapes
         self.fp8_allow_fp16_fallback = fp8_allow_fp16_fallback
         self.builder_optimization_level = builder_optimization_level
+        # Per-engine VAE optlvl (None → inherit builder_optimization_level).
+        # Tiny-VAE engines are small and gain little from optlvl 4 — defaulting to
+        # optlvl 3 via config.py shaves VAE encoder build time without affecting UNet quality.
+        self.vae_builder_optimization_level = vae_builder_optimization_level
 
         self.stream: StreamDiffusion = self._load_model(
             model_id_or_path=model_id_or_path,
@@ -1779,6 +1784,12 @@ class StreamDiffusionWrapper:
                     resolution=(self.height, self.width),
                     builder_optimization_level=self.builder_optimization_level,
                 )
+                # Effective VAE optlvl: per-engine override first, then global fallback.
+                _vae_optlvl = (
+                    self.vae_builder_optimization_level
+                    if self.vae_builder_optimization_level is not None
+                    else self.builder_optimization_level
+                )
                 vae_encoder_path = engine_manager.get_engine_path(
                     EngineType.VAE_ENCODER,
                     model_id_or_path=model_id_or_path,
@@ -1791,7 +1802,7 @@ class StreamDiffusionWrapper:
                     ipadapter_tokens=ipadapter_tokens,
                     is_faceid=is_faceid if use_ipadapter_trt else None,
                     resolution=(self.height, self.width),
-                    builder_optimization_level=self.builder_optimization_level,
+                    builder_optimization_level=_vae_optlvl,
                 )
                 vae_decoder_path = engine_manager.get_engine_path(
                     EngineType.VAE_DECODER,
@@ -1805,7 +1816,7 @@ class StreamDiffusionWrapper:
                     ipadapter_tokens=ipadapter_tokens,
                     is_faceid=is_faceid if use_ipadapter_trt else None,
                     resolution=(self.height, self.width),
-                    builder_optimization_level=self.builder_optimization_level,
+                    builder_optimization_level=_vae_optlvl,
                 )
 
                 # Check if all required engines exist
@@ -2066,6 +2077,14 @@ class StreamDiffusionWrapper:
                     if use_feature_injection:
                         wrapped_unet.refresh_fi_procs()
 
+                # Effective VAE optlvl for both decoder and encoder compile calls.
+                # Mirrors the _vae_optlvl computed for get_engine_path above.
+                _vae_build_optlvl = (
+                    self.vae_builder_optimization_level
+                    if self.vae_builder_optimization_level is not None
+                    else self.builder_optimization_level
+                )
+
                 # Compile VAE decoder engine using EngineManager
                 vae_decoder_model = VAE(
                     device=self.device,
@@ -2092,11 +2111,7 @@ class StreamDiffusionWrapper:
                             if not self.static_shapes
                             else {}
                         ),
-                        **(
-                            {"builder_optimization_level": self.builder_optimization_level}
-                            if self.builder_optimization_level is not None
-                            else {}
-                        ),
+                        **({"builder_optimization_level": _vae_build_optlvl} if _vae_build_optlvl is not None else {}),
                     },
                 )
 
@@ -2126,11 +2141,7 @@ class StreamDiffusionWrapper:
                             if not self.static_shapes
                             else {}
                         ),
-                        **(
-                            {"builder_optimization_level": self.builder_optimization_level}
-                            if self.builder_optimization_level is not None
-                            else {}
-                        ),
+                        **({"builder_optimization_level": _vae_build_optlvl} if _vae_build_optlvl is not None else {}),
                     },
                 )
 

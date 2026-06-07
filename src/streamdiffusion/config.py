@@ -138,6 +138,9 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
         "static_shapes": config.get("static_shapes", False),
         "fp8": config.get("fp8", False),
         "builder_optimization_level": config.get("builder_optimization_level"),
+        # Per-engine VAE optlvl override; default 3 (tiny-VAE gains little from level 4).
+        # Set to null in YAML to inherit builder_optimization_level; omit to use default 3.
+        "vae_builder_optimization_level": config.get("vae_builder_optimization_level", 3),
         "build_engines_if_missing": config.get("build_engines_if_missing", True),
         "fp8_allow_fp16_fallback": config.get("fp8_allow_fp16_fallback", False),
     }
