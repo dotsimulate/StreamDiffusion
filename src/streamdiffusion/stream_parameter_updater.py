@@ -59,6 +59,10 @@ class StreamParameterUpdater(OrchestratorUser):
         # Use the shared orchestrator attached via OrchestratorUser
         self._embedding_orchestrator = self._preprocessing_orchestrator
 
+        # Tracks the last prompt interpolation method used; read by td_manager for
+        # IPAdapter style-image re-blends (td_manager.py:1147).
+        self._last_prompt_interpolation_method: str = "slerp"
+
     def get_cache_info(self) -> Dict:
         """Get cache statistics for monitoring performance."""
         total_requests = self._prompt_cache_stats.hits + self._prompt_cache_stats.misses
@@ -243,7 +247,7 @@ class StreamParameterUpdater(OrchestratorUser):
         seed: Optional[int] = None,
         prompt_list: Optional[List[Tuple[str, float]]] = None,
         negative_prompt: Optional[str] = None,
-        prompt_interpolation_method: Literal["linear", "slerp"] = "slerp",
+        prompt_interpolation_method: Literal["linear", "slerp", "cosine_weighted"] = "slerp",
         normalize_prompt_weights: Optional[bool] = None,
         seed_list: Optional[List[Tuple[int, float]]] = None,
         seed_interpolation_method: Literal["linear", "slerp"] = "linear",
@@ -422,7 +426,7 @@ class StreamParameterUpdater(OrchestratorUser):
         self,
         prompt_list: List[Tuple[str, float]],
         negative_prompt: str = "",
-        prompt_interpolation_method: Literal["linear", "slerp"] = "slerp",
+        prompt_interpolation_method: Literal["linear", "slerp", "cosine_weighted"] = "slerp",
     ) -> None:
         """Update prompt embeddings using multiple weighted prompts."""
         # Store current state
@@ -457,7 +461,9 @@ class StreamParameterUpdater(OrchestratorUser):
                 # Cache hit
                 self._prompt_cache_stats.record_hit()
 
-    def _apply_prompt_blending(self, prompt_interpolation_method: Literal["linear", "slerp"]) -> None:
+    def _apply_prompt_blending(
+        self, prompt_interpolation_method: Literal["linear", "slerp", "cosine_weighted"]
+    ) -> None:
         """Apply weighted blending of cached prompt embeddings."""
         if not self._current_prompt_list:
             return
@@ -474,15 +480,26 @@ class StreamParameterUpdater(OrchestratorUser):
             logger.warning("_apply_prompt_blending: Warning: No cached embeddings found")
             return
 
+        # Record last method used (consumed by td_manager IPAdapter re-blend at 1147).
+        self._last_prompt_interpolation_method = prompt_interpolation_method
+
         # Normalize weights
         weights = self._normalize_weights(weights, self.normalize_prompt_weights)
 
         # Apply interpolation
-        if prompt_interpolation_method == "slerp" and len(embeddings) == 2:
-            # Spherical linear interpolation for 2 prompts
-            embed1, embed2 = embeddings[0], embeddings[1]
-            t = weights[1].item()  # Use second weight as interpolation factor
-            combined_embeds = self._slerp(embed1, embed2, t)
+        if prompt_interpolation_method == "slerp":
+            if len(embeddings) == 2:
+                # Original 2-way slerp path — identical output to before.
+                embed1, embed2 = embeddings[0], embeddings[1]
+                t = weights[1].item()  # Use second weight as interpolation factor
+                combined_embeds = self._slerp(embed1, embed2, t)
+            else:
+                # N-way iterative slerp (ported from reference multi_slerp).
+                combined_embeds = self._multi_slerp(embeddings, weights.tolist())
+        elif prompt_interpolation_method == "cosine_weighted":
+            # Genuine cosine-similarity weighting: emphasise embeddings aligned with the
+            # weighted consensus direction, de-emphasise outliers, then N-way slerp.
+            combined_embeds = self._cosine_weighted_blend(embeddings, weights.tolist())
         else:
             # Linear interpolation (weighted average)
             combined_embeds = torch.zeros_like(embeddings[0])
@@ -570,6 +587,74 @@ class StreamParameterUpdater(OrchestratorUser):
             result = w1 * flat1 + w2 * flat2
 
         return result.view(original_shape)
+
+    def _multi_slerp(self, embeddings: List[torch.Tensor], weights: List[float]) -> torch.Tensor:
+        """N-way iterative SLERP over a list of embeddings, ported from the reference fork.
+
+        Embeddings are sorted by weight (desc) and folded pairwise with the standard 2-way
+        ``_slerp``.  The result is scaled by ``max(1, sum(weights))`` so that weights > 1
+        amplify the output magnitude rather than being silently clipped.
+
+        Args:
+            embeddings: List of embedding tensors (all same shape).
+            weights: Corresponding raw (already-normalised by caller) weights as plain floats.
+
+        Returns:
+            Interpolated embedding tensor with the same shape as each input.
+        """
+        total_weight = sum(weights)
+        scale_factor = max(1.0, total_weight)
+        if len(embeddings) == 1:
+            return embeddings[0] * scale_factor
+        scaled_weights = [w / scale_factor for w in weights]
+        sorted_pairs = sorted(zip(embeddings, scaled_weights), key=lambda x: x[1], reverse=True)
+        sorted_embeddings, sorted_weights = zip(*sorted_pairs)
+        result = sorted_embeddings[0]
+        accumulated_weight = sorted_weights[0]
+        for i in range(1, len(sorted_embeddings)):
+            if sorted_weights[i] == 0:
+                continue
+            t = sorted_weights[i] / (accumulated_weight + sorted_weights[i])
+            result = self._slerp(result, sorted_embeddings[i], t)
+            accumulated_weight += sorted_weights[i]
+        return result * scale_factor
+
+    def _cosine_weighted_blend(self, embeddings: List[torch.Tensor], weights: List[float]) -> torch.Tensor:
+        """Blend embeddings with cosine-similarity weighting toward the weighted consensus direction.
+
+        Computes a weighted-mean direction across all embeddings, then adjusts each embedding's
+        weight by its cosine similarity to that consensus.  Embeddings that agree with the
+        consensus are up-weighted; outliers are down-weighted.  The adjusted weights preserve
+        total weight mass so that overall embedding magnitude is unchanged.  The final blend
+        is performed with ``_multi_slerp`` for perceptually smooth interpolation.
+
+        This is the genuine implementation of what the reference fork named
+        "cosine_weighted_interpolation" but never actually computed (its implementation
+        was a dead-code alias for plain multi_slerp).
+
+        Args:
+            embeddings: List of embedding tensors (all same shape).
+            weights: Corresponding raw (already-normalised by caller) weights as plain floats.
+
+        Returns:
+            Interpolated embedding tensor with the same shape as each input.
+        """
+        if len(embeddings) == 1:
+            return embeddings[0]
+        # Work in float32 regardless of model dtype for numerical stability.
+        ref_device = embeddings[0].device
+        flats = torch.stack([e.flatten().float() for e in embeddings])  # [N, D]
+        w = torch.tensor(weights, device=ref_device, dtype=torch.float32)  # [N]
+        # Weighted consensus direction.
+        mean_dir = F.normalize((flats * w.unsqueeze(1)).sum(0), dim=0)  # [D]
+        # Cosine similarity of each embedding to the consensus.
+        cos_sims = (F.normalize(flats, dim=1) @ mean_dir).clamp(min=1e-4)  # [N]
+        # Adjust weights by cosine similarity; keep total weight mass constant.
+        adj = w * cos_sims
+        total_w = w.sum()
+        if adj.sum() > 1e-8:
+            adj = adj * (total_w / adj.sum())
+        return self._multi_slerp(embeddings, adj.tolist())
 
     @torch.inference_mode()
     def _update_blended_seeds(
@@ -948,7 +1033,10 @@ class StreamParameterUpdater(OrchestratorUser):
 
     @torch.inference_mode()
     def update_prompt_at_index(
-        self, index: int, new_prompt: str, prompt_interpolation_method: Literal["linear", "slerp"] = "slerp"
+        self,
+        index: int,
+        new_prompt: str,
+        prompt_interpolation_method: Literal["linear", "slerp", "cosine_weighted"] = "slerp",
     ) -> None:
         """Update a single prompt at the specified index without re-encoding others."""
         if not self._validate_index(index, self._current_prompt_list, "update_prompt_at_index"):
@@ -996,7 +1084,10 @@ class StreamParameterUpdater(OrchestratorUser):
 
     @torch.inference_mode()
     def add_prompt(
-        self, prompt: str, weight: float = 1.0, prompt_interpolation_method: Literal["linear", "slerp"] = "slerp"
+        self,
+        prompt: str,
+        weight: float = 1.0,
+        prompt_interpolation_method: Literal["linear", "slerp", "cosine_weighted"] = "slerp",
     ) -> None:
         """Add a new prompt to the current list."""
         new_index = len(self._current_prompt_list)
@@ -1018,7 +1109,9 @@ class StreamParameterUpdater(OrchestratorUser):
 
     @torch.inference_mode()
     def remove_prompt_at_index(
-        self, index: int, prompt_interpolation_method: Literal["linear", "slerp"] = "slerp"
+        self,
+        index: int,
+        prompt_interpolation_method: Literal["linear", "slerp", "cosine_weighted"] = "slerp",
     ) -> None:
         """Remove a prompt at the specified index."""
         if not self._validate_index(index, self._current_prompt_list, "remove_prompt_at_index"):

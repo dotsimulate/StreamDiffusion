@@ -441,7 +441,7 @@ class StreamDiffusionWrapper:
         guidance_scale: float = 1.2,
         delta: float = 1.0,
         # Blending-specific parameters (only used when prompt is a list)
-        prompt_interpolation_method: Literal["linear", "slerp"] = "slerp",
+        prompt_interpolation_method: Literal["linear", "slerp", "cosine_weighted"] = "slerp",
         seed_list: Optional[List[Tuple[int, float]]] = None,
         seed_interpolation_method: Literal["linear", "slerp"] = "linear",
     ) -> None:
@@ -569,7 +569,7 @@ class StreamDiffusionWrapper:
         self,
         prompt: Union[str, List[Tuple[str, float]]],
         negative_prompt: str = "",
-        prompt_interpolation_method: Literal["linear", "slerp"] = "slerp",
+        prompt_interpolation_method: Literal["linear", "slerp", "cosine_weighted"] = "slerp",
         clear_blending: bool = True,
         warn_about_conflicts: bool = True,
     ) -> None:
@@ -589,7 +589,7 @@ class StreamDiffusionWrapper:
             - Blending: [("cat", 0.7), ("dog", 0.3)]
         negative_prompt : str, optional
             The negative prompt (used with blending), by default "".
-        prompt_interpolation_method : Literal["linear", "slerp"], optional
+        prompt_interpolation_method : Literal["linear", "slerp", "cosine_weighted"], optional
             Method for interpolating between prompt embeddings (used with blending), by default "slerp".
         clear_blending : bool, optional
             Whether to clear existing blending when switching to single prompt, by default True.
@@ -647,7 +647,7 @@ class StreamDiffusionWrapper:
         # Prompt blending parameters
         prompt_list: Optional[List[Tuple[str, float]]] = None,
         negative_prompt: Optional[str] = None,
-        prompt_interpolation_method: Literal["linear", "slerp"] = "slerp",
+        prompt_interpolation_method: Literal["linear", "slerp", "cosine_weighted"] = "slerp",
         normalize_prompt_weights: Optional[bool] = None,
         # Seed blending parameters
         seed_list: Optional[List[Tuple[int, float]]] = None,
@@ -692,7 +692,7 @@ class StreamDiffusionWrapper:
             Example: [("cat", 0.7), ("dog", 0.3)]
         negative_prompt : Optional[str]
             The negative prompt to apply to all blended prompts.
-        prompt_interpolation_method : Literal["linear", "slerp"]
+        prompt_interpolation_method : Literal["linear", "slerp", "cosine_weighted"]
             Method for interpolating between prompt embeddings, by default "slerp".
         normalize_prompt_weights : Optional[bool]
             Whether to normalize prompt weights in blending to sum to 1, by default None (no change).

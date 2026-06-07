@@ -502,8 +502,8 @@ def _validate_config(config: Dict[str, Any]) -> None:
                     raise ValueError(f"_validate_config: Prompt weight {i} must be a non-negative number")
 
         interpolation_method = blend_config.get("interpolation_method", "slerp")
-        if interpolation_method not in ["linear", "slerp"]:
-            raise ValueError("_validate_config: interpolation_method must be 'linear' or 'slerp'")
+        if interpolation_method not in ["linear", "slerp", "cosine_weighted"]:
+            raise ValueError("_validate_config: interpolation_method must be 'linear', 'slerp', or 'cosine_weighted'")
 
     # Validate seed blending configuration if present
     if "seed_blending" in config:
