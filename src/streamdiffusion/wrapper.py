@@ -1605,7 +1605,7 @@ class StreamDiffusionWrapper:
 
                 try:
                     # Load LoRA weights with unique adapter name
-                    stream.pipe.load_lora_weights(lora_name, adapter_name=adapter_name)
+                    stream.load_lora(lora_name, adapter_name=adapter_name)
                     lora_adapters_to_merge.append(adapter_name)
                     lora_scales_to_merge.append(lora_scale)
                     _loaded_adapter_names[adapter_name] = (lora_name, lora_scale)
