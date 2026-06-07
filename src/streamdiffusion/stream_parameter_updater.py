@@ -62,6 +62,9 @@ class StreamParameterUpdater(OrchestratorUser):
         # Tracks the last prompt interpolation method used; read by td_manager for
         # IPAdapter style-image re-blends (td_manager.py:1147).
         self._last_prompt_interpolation_method: str = "slerp"
+        # Warn-once set: emit one logger.warning per unique unknown method string so
+        # that per-frame weight-drag calls don't flood the log.
+        self._warned_unknown_interp_methods: set = set()
 
     def get_cache_info(self) -> Dict:
         """Get cache statistics for monitoring performance."""
@@ -501,6 +504,17 @@ class StreamParameterUpdater(OrchestratorUser):
             # weighted consensus direction, de-emphasise outliers, then N-way slerp.
             combined_embeds = self._cosine_weighted_blend(embeddings, weights.tolist())
         else:
+            # Unknown method — warn once per unique string so weight-drag updates don't
+            # flood the log, then fall back to linear interpolation.
+            if prompt_interpolation_method != "linear" and (
+                prompt_interpolation_method not in self._warned_unknown_interp_methods
+            ):
+                self._warned_unknown_interp_methods.add(prompt_interpolation_method)
+                logger.warning(
+                    "_apply_prompt_blending: unknown interpolation method %r - "
+                    "falling back to linear (valid: linear, slerp, cosine_weighted)",
+                    prompt_interpolation_method,
+                )
             # Linear interpolation (weighted average)
             combined_embeds = torch.zeros_like(embeddings[0])
             for embed, weight in zip(embeddings, weights):

@@ -269,3 +269,41 @@ class TestApplyPromptBlendingDispatch:
         fresh = _make_updater()
         assert hasattr(fresh, "_last_prompt_interpolation_method")
         assert fresh._last_prompt_interpolation_method == "slerp"
+
+    def test_unknown_method_falls_back_to_linear(self):
+        """An unrecognised method string must produce the same output as 'linear'."""
+        # Capture the linear result first on a fresh updater sharing the same embeds.
+        upd_linear = _make_updater()
+        upd_linear._prompt_cache = dict(self.upd._prompt_cache)
+        upd_linear._current_prompt_list = list(self.upd._current_prompt_list)
+        upd_linear._current_negative_prompt = ""
+        upd_linear._apply_prompt_blending("linear")
+        linear_embed = upd_linear.stream.prompt_embeds.clone()
+
+        # Now run the typo'd string on our main updater.
+        self.upd._apply_prompt_blending("cosine_weignted")
+        unknown_embed = self.upd.stream.prompt_embeds
+
+        assert torch.allclose(unknown_embed, linear_embed, atol=1e-5), (
+            "Unknown method should fall back to linear interpolation"
+        )
+
+    def test_unknown_method_warns_once(self, caplog):
+        """Exactly one warning per unique unknown string; 'linear' never warns."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="streamdiffusion.stream_parameter_updater"):
+            # Two calls with the same bad string → only one warning record.
+            self.upd._apply_prompt_blending("cosine_weignted")
+            self.upd._apply_prompt_blending("cosine_weignted")
+
+        unknown_warnings = [r for r in caplog.records if "cosine_weignted" in r.message]
+        assert len(unknown_warnings) == 1, (
+            f"Expected exactly 1 warning for repeated unknown method, got {len(unknown_warnings)}"
+        )
+
+        # A 'linear' call must never produce a warning.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="streamdiffusion.stream_parameter_updater"):
+            self.upd._apply_prompt_blending("linear")
+        assert not caplog.records, "No warning expected for the 'linear' method"
