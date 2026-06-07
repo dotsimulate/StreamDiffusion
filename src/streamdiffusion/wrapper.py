@@ -1575,6 +1575,8 @@ class StreamDiffusionWrapper:
         # Load and properly merge LoRA weights using the standard diffusers approach
         lora_adapters_to_merge = []
         lora_scales_to_merge = []
+        # adapter_name → (lora_name, lora_scale) for only successfully loaded adapters (G1 fix)
+        _loaded_adapter_names: dict = {}
 
         # Collect all LoRA adapters and their scales from lora_dict
         if lora_dict is not None:
@@ -1587,10 +1589,11 @@ class StreamDiffusionWrapper:
                     stream.pipe.load_lora_weights(lora_name, adapter_name=adapter_name)
                     lora_adapters_to_merge.append(adapter_name)
                     lora_scales_to_merge.append(lora_scale)
+                    _loaded_adapter_names[adapter_name] = (lora_name, lora_scale)
                     logger.info(f"Successfully loaded LoRA adapter: {adapter_name}")
                 except Exception as e:
                     logger.error(f"Failed to load LoRA {lora_name}: {e}")
-                    # Continue with other LoRAs even if one fails
+                    # Drop this entry — do NOT carry it into the engine cache key (G1 fix)
                     continue
 
         # Merge all LoRA adapters using the proper diffusers method
@@ -1604,15 +1607,26 @@ class StreamDiffusionWrapper:
                 stream.pipe.unload_lora_weights()
                 logger.info("Successfully merged LoRAs individually")
 
-            except Exception as fallback_error:
-                logger.error(f"LoRA merging fallback also failed: {fallback_error}")
-                logger.warning("Continuing without LoRA merging - LoRAs may not be applied correctly")
-
-                # Clean up any partial state
+            except Exception as fuse_error:
+                # Partial fusion leaves UNet weights in an ambiguous state; baking a TRT engine
+                # from this state creates a permanently mislabeled or corrupted engine (G1 fix).
                 try:
                     stream.pipe.unload_lora_weights()
                 except Exception:
                     logger.debug("LoRA cleanup: unload_lora_weights() failed after merge failure", exc_info=True)
+                raise RuntimeError(
+                    f"LoRA fusion failed — cannot build TRT engine with partial UNet state. Error: {fuse_error}"
+                ) from fuse_error
+
+        # G1 fix: Correct lora_dict to only contain successfully fused LoRAs so that
+        # get_engine_path() computes the correct engine cache signature.  Any LoRA that
+        # failed to load was never merged into UNet weights; the engine must NOT carry
+        # its signature in the cache path.
+        if lora_dict is not None:
+            fused_lora_dict = {
+                lora_name: lora_scale for _adapter, (lora_name, lora_scale) in _loaded_adapter_names.items()
+            }
+            lora_dict = fused_lora_dict if fused_lora_dict else None
 
         if use_tiny_vae:
             if vae_id is not None:
