@@ -162,6 +162,7 @@ class SoftEdgePreprocessor(BasePreprocessor):
     that mimics HED output quality at 50x+ the speed.
     """
 
+    gpu_native = True  # _process_tensor_core uses torch ops under no_grad — no PIL round-trip
     _model_cache = {}
 
     @classmethod

@@ -1,5 +1,6 @@
+import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -7,10 +8,19 @@ import torch.nn.functional as F
 from PIL import Image
 
 
+_pil_fallback_warned: Set[str] = set()  # per-class warning dedup
+_base_logger = logging.getLogger(__name__)
+
+
 class BasePreprocessor(ABC):
     """
     Base class for ControlNet preprocessors with template method pattern
     """
+
+    # Set to True on subclasses whose _process_tensor_core path is genuinely GPU-native
+    # (i.e. does NOT call tensor_to_pil / pil_to_tensor or any CPU op).
+    # Used by the residency guard test and the one-time PIL-fallback warning below.
+    gpu_native: bool = False
 
     def __init__(self, normalization_context: str = "controlnet", **kwargs):
         """
@@ -73,8 +83,22 @@ class BasePreprocessor(ABC):
 
     def _process_tensor_core(self, tensor: torch.Tensor) -> torch.Tensor:
         """
-        Optional GPU processing (fallback to PIL if not overridden)
+        Optional GPU processing (fallback to PIL if not overridden).
+
+        D8 residency guard: emits a one-time per-class warning when this
+        fallback fires so that silent CPU round-trips surface immediately.
+        Subclasses that are genuinely GPU-native must override this method
+        AND set `gpu_native = True` on the class.
         """
+        cls_name = type(self).__name__
+        if cls_name not in _pil_fallback_warned:
+            _pil_fallback_warned.add(cls_name)
+            _base_logger.warning(
+                f"[GPU-residency] {cls_name}._process_tensor_core is using the PIL "
+                "fallback (tensor → CPU → PIL → _process_core → tensor). "
+                "Set gpu_native=True and override _process_tensor_core to eliminate "
+                "this CPU round-trip. (This warning fires once per class.)"
+            )
         pil_image = self.tensor_to_pil(tensor)
         processed_pil = self._process_core(pil_image)
         return self.pil_to_tensor(processed_pil)

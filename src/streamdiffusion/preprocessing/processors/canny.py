@@ -14,6 +14,8 @@ class CannyPreprocessor(BasePreprocessor):
     Detects edges in the input image using the Canny edge detection algorithm.
     """
 
+    gpu_native = True  # _process_tensor_core uses conv2d — no CPU/PIL round-trip
+
     @classmethod
     def get_preprocessor_metadata(cls):
         return {

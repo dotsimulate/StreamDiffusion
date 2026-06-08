@@ -17,6 +17,8 @@ class StandardLineartPreprocessor(BasePreprocessor):
     pre-trained models. GPU-accelerated with PyTorch for optimal real-time performance.
     """
 
+    gpu_native = True  # _process_tensor_core uses torch ops — no CPU/PIL round-trip
+
     @classmethod
     def get_preprocessor_metadata(cls):
         return {

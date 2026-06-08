@@ -9,96 +9,11 @@ import torch.nn.functional as F
 from PIL import Image
 
 from .base import BasePreprocessor
-
-
-try:
-    from collections import OrderedDict
-
-    import tensorrt as trt
-    from polygraphy.backend.common import bytes_from_path
-    from polygraphy.backend.trt import engine_from_bytes
-
-    TENSORRT_AVAILABLE = True
-except ImportError:
-    TENSORRT_AVAILABLE = False
-
-
-# Map of numpy dtype -> torch dtype
-numpy_to_torch_dtype_dict = {
-    np.uint8: torch.uint8,
-    np.int8: torch.int8,
-    np.int16: torch.int16,
-    np.int32: torch.int32,
-    np.int64: torch.int64,
-    np.float16: torch.float16,
-    np.float32: torch.float32,
-    np.float64: torch.float64,
-    np.complex64: torch.complex64,
-    np.complex128: torch.complex128,
-}
-if np.version.full_version >= "1.24.0":
-    numpy_to_torch_dtype_dict[np.bool_] = torch.bool
-else:
-    numpy_to_torch_dtype_dict[np.bool] = torch.bool
-
-
-class TensorRTEngine:
-    """Simplified TensorRT engine wrapper for depth estimation inference (optimized)"""
-
-    def __init__(self, engine_path):
-        self.engine_path = engine_path
-        self.engine = None
-        self.context = None
-        self.tensors = OrderedDict()
-        self._cuda_stream = None  # Cache CUDA stream
-
-    def load(self):
-        """Load TensorRT engine from file"""
-        print(f"Loading TensorRT engine: {self.engine_path}")
-        self.engine = engine_from_bytes(bytes_from_path(self.engine_path))
-
-    def activate(self):
-        """Create execution context"""
-        self.context = self.engine.create_execution_context()
-        # Cache CUDA stream for reuse
-        self._cuda_stream = torch.cuda.current_stream().cuda_stream
-
-    def allocate_buffers(self, device="cuda"):
-        """Allocate input/output buffers"""
-        for idx in range(self.engine.num_io_tensors):
-            name = self.engine.get_tensor_name(idx)
-            shape = self.context.get_tensor_shape(name)
-            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
-
-            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
-                self.context.set_input_shape(name, shape)
-
-            tensor = torch.empty(tuple(shape), dtype=numpy_to_torch_dtype_dict[dtype]).to(device=device)
-            self.tensors[name] = tensor
-
-    def infer(self, feed_dict, stream=None):
-        """Run inference with optional stream parameter"""
-        # Use cached stream if none provided
-        if stream is None:
-            stream = self._cuda_stream
-
-        # Copy input data to tensors
-        for name, buf in feed_dict.items():
-            self.tensors[name].copy_(buf)
-
-        # Set tensor addresses
-        for name, tensor in self.tensors.items():
-            self.context.set_tensor_address(name, tensor.data_ptr())
-
-        # Execute inference
-        success = self.context.execute_async_v3(stream)
-        if not success:
-            raise ValueError("ERROR: TensorRT inference failed.")
-
-        return self.tensors
+from .trt_base import TENSORRT_AVAILABLE, TensorRTEngine  # shared engine wrapper
 
 
 class DepthAnythingTensorrtPreprocessor(BasePreprocessor):
+    gpu_native = True  # _process_tensor_core runs full pipeline on GPU — no PIL round-trip
     """
     Depth Anything TensorRT preprocessor for ControlNet
 

@@ -25,6 +25,8 @@ class FeedbackPreprocessor(PipelineAwareProcessor):
     For the first frame (when no previous output exists), it falls back to the input image.
     """
 
+    gpu_native = True  # _process_tensor_core blends tensors on GPU — no CPU/PIL round-trip
+
     @classmethod
     def get_preprocessor_metadata(cls):
         return {

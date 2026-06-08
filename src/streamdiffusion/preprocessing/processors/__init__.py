@@ -39,6 +39,30 @@ except ImportError:
     POSE_TENSORRT_AVAILABLE = False
 
 try:
+    from .hed_tensorrt import HEDTensorrtPreprocessor
+
+    HED_TENSORRT_AVAILABLE = True
+except ImportError:
+    HEDTensorrtPreprocessor = None
+    HED_TENSORRT_AVAILABLE = False
+
+try:
+    from .scribble_tensorrt import ScribbleTensorrtPreprocessor
+
+    SCRIBBLE_TENSORRT_AVAILABLE = True
+except ImportError:
+    ScribbleTensorrtPreprocessor = None
+    SCRIBBLE_TENSORRT_AVAILABLE = False
+
+try:
+    from .normal_bae_tensorrt import NormalBaeTensorrtPreprocessor
+
+    NORMAL_BAE_TENSORRT_AVAILABLE = True
+except ImportError:
+    NormalBaeTensorrtPreprocessor = None
+    NORMAL_BAE_TENSORRT_AVAILABLE = False
+
+try:
     from .temporal_net_tensorrt import TemporalNetTensorRTPreprocessor
 
     TEMPORAL_NET_TENSORRT_AVAILABLE = True
@@ -98,6 +122,16 @@ if MEDIAPIPE_POSE_AVAILABLE:
 
 if MEDIAPIPE_SEGMENTATION_AVAILABLE:
     _preprocessor_registry["mediapipe_segmentation"] = MediaPipeSegmentationPreprocessor
+
+# Add GPU-native TRT ControlNet preprocessors (HED, Scribble, NormalBae)
+if HED_TENSORRT_AVAILABLE:
+    _preprocessor_registry["hed_tensorrt"] = HEDTensorrtPreprocessor
+
+if SCRIBBLE_TENSORRT_AVAILABLE:
+    _preprocessor_registry["scribble_tensorrt"] = ScribbleTensorrtPreprocessor
+
+if NORMAL_BAE_TENSORRT_AVAILABLE:
+    _preprocessor_registry["normal_bae_tensorrt"] = NormalBaeTensorrtPreprocessor
 
 
 def get_preprocessor_class(name: str) -> type:
@@ -209,6 +243,15 @@ if MEDIAPIPE_POSE_AVAILABLE:
 
 if MEDIAPIPE_SEGMENTATION_AVAILABLE:
     __all__.append("MediaPipeSegmentationPreprocessor")
+
+if HED_TENSORRT_AVAILABLE:
+    __all__.append("HEDTensorrtPreprocessor")
+
+if SCRIBBLE_TENSORRT_AVAILABLE:
+    __all__.append("ScribbleTensorrtPreprocessor")
+
+if NORMAL_BAE_TENSORRT_AVAILABLE:
+    __all__.append("NormalBaeTensorrtPreprocessor")
 
 
 # region Custom Processor Discovery

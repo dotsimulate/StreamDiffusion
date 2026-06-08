@@ -15,6 +15,8 @@ class PassthroughPreprocessor(BasePreprocessor):
     - Custom ControlNets that don't need preprocessing
     """
 
+    gpu_native = True  # _process_tensor_core is a no-op identity — no CPU/PIL round-trip
+
     @classmethod
     def get_preprocessor_metadata(cls):
         return {
