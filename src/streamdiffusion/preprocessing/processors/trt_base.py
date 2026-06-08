@@ -91,17 +91,57 @@ class TensorRTEngine:
         self.context = self.engine.create_execution_context()
         self._cuda_stream = torch.cuda.current_stream().cuda_stream
 
-    def allocate_buffers(self, device: str = "cuda"):
+    def allocate_buffers(self, device: str = "cuda", input_shape: tuple = None):
+        """
+        Allocate GPU buffers for all engine I/O tensors.
+
+        For dynamic-shape engines the caller must pass ``input_shape`` (concrete
+        NCHW tuple) so input dims are resolved before output shapes are queried.
+        Without it, ``get_tensor_shape`` returns -1 for dynamic dims and the
+        subsequent ``torch.empty`` call fails or allocates with a stale shape.
+
+        Args:
+            device:      CUDA device string (default ``"cuda"``)
+            input_shape: Concrete ``(N, C, H, W)`` shape for the engine's INPUT tensor.
+                         Required when the engine was built with a dynamic-shape
+                         optimization profile.
+        """
+        # Pass 1: set all INPUT shapes so TRT can resolve downstream output shapes.
         for idx in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(idx)
-            shape = self.context.get_tensor_shape(name)
-            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+            if self.engine.get_tensor_mode(name) != trt.TensorIOMode.INPUT:
+                continue
+            if input_shape is not None:
+                self.context.set_input_shape(name, input_shape)
+            else:
+                static_shape = tuple(self.context.get_tensor_shape(name))
+                if any(d < 0 for d in static_shape):
+                    raise RuntimeError(
+                        f"TensorRTEngine.allocate_buffers: tensor '{name}' has dynamic "
+                        f"shape {static_shape} but no input_shape was provided. "
+                        "Pass input_shape=(N, C, H, W) when using a dynamic engine."
+                    )
+                self.context.set_input_shape(name, static_shape)
 
-            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
-                self.context.set_input_shape(name, shape)
+        # Pass 2: allocate buffers for ALL tensors (output shapes resolved by TRT now).
+        for idx in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(idx)
+            dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+            is_input = self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+
+            if is_input and input_shape is not None:
+                shape = input_shape
+            else:
+                shape = tuple(self.context.get_tensor_shape(name))
+                if any(d < 0 for d in shape):
+                    raise RuntimeError(
+                        f"TensorRTEngine.allocate_buffers: tensor '{name}' still has "
+                        f"unresolved dynamic dims {shape} after setting input shapes. "
+                        "Provide input_shape to resolve all dimensions."
+                    )
 
             tensor = torch.empty(
-                tuple(shape),
+                shape,
                 dtype=numpy_to_torch_dtype_dict[dtype],
             ).to(device=device)
             self.tensors[name] = tensor
@@ -110,7 +150,45 @@ class TensorRTEngine:
         if stream is None:
             stream = self._cuda_stream
 
+        # --- Per-request shape reconciliation ---
+        # Keeps output aligned to the fed input resolution (critical for dynamic engines
+        # where detect_resolution may differ from the built opt shape).
+        # This is a no-op when detect_resolution is constant (zero per-frame overhead).
+        shape_changed = False
         for name, buf in feed_dict.items():
+            if name not in self.tensors:
+                continue
+            fed_shape = tuple(buf.shape)
+            if fed_shape != tuple(self.tensors[name].shape):
+                self.context.set_input_shape(name, fed_shape)
+                self.tensors[name] = torch.empty(
+                    fed_shape,
+                    dtype=self.tensors[name].dtype,
+                    device=self.tensors[name].device,
+                )
+                shape_changed = True
+
+        if shape_changed:
+            # Re-query and reallocate output buffers with TRT-resolved shapes.
+            for out_idx in range(self.engine.num_io_tensors):
+                out_name = self.engine.get_tensor_name(out_idx)
+                if self.engine.get_tensor_mode(out_name) == trt.TensorIOMode.OUTPUT:
+                    new_out_shape = tuple(self.context.get_tensor_shape(out_name))
+                    if new_out_shape != tuple(self.tensors[out_name].shape):
+                        self.tensors[out_name] = torch.empty(
+                            new_out_shape,
+                            dtype=self.tensors[out_name].dtype,
+                            device=self.tensors[out_name].device,
+                        )
+
+        # --- Copy inputs with dtype validation ---
+        for name, buf in feed_dict.items():
+            if self.tensors[name].dtype != buf.dtype:
+                raise ValueError(
+                    f"TensorRTEngine.infer: dtype mismatch for tensor '{name}': "
+                    f"engine expects {self.tensors[name].dtype}, got {buf.dtype}. "
+                    f"(engine: {self.engine_path})"
+                )
             self.tensors[name].copy_(buf)
 
         for name, tensor in self.tensors.items():
@@ -121,6 +199,37 @@ class TensorRTEngine:
             raise ValueError("TensorRTEngine: inference failed.")
 
         return self.tensors
+
+
+# ---------------------------------------------------------------------------
+# Output-key helper — guards against TRT renaming the output tensor
+# ---------------------------------------------------------------------------
+
+
+def _first_output(engine_outputs: dict) -> torch.Tensor:
+    """
+    Return the ``'output'`` tensor from TRT engine outputs, or the first
+    non-``'input'`` key if ``'output'`` is absent.
+
+    TRT may rename output tensors depending on the ONNX model and opset.
+    Using this helper instead of a hard-coded ``engine_outputs["output"]``
+    guards against a bare ``KeyError`` when the tensor name doesn't match.
+
+    Args:
+        engine_outputs: Dict returned by :meth:`TensorRTEngine.infer`.
+
+    Returns:
+        The output tensor.
+
+    Raises:
+        KeyError: if no output tensor is found (e.g. all keys are inputs).
+    """
+    if "output" in engine_outputs:
+        return engine_outputs["output"]
+    candidates = [v for k, v in engine_outputs.items() if not k.startswith("input")]
+    if candidates:
+        return candidates[0]
+    raise KeyError(f"TRT engine returned no recognizable output tensor. Available keys: {list(engine_outputs.keys())}")
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +268,8 @@ class SelfBuildingTRTPreprocessor(BasePreprocessor):
     """
 
     gpu_native = True
+    # One-time FP8→FP16 fallback log: keyed by class name so each subclass logs once.
+    _fp8_warned_classes: set = set()
 
     # Subclasses set these:
     engine_filename: str = "engine.engine"
@@ -209,16 +320,32 @@ class SelfBuildingTRTPreprocessor(BasePreprocessor):
         if self._engine is None:
             with self._engine_lock:
                 if self._engine is None:
+                    cls_name = self.__class__.__name__
                     engine_path = self._get_engine_path()
-                    self._ensure_engine()
+                    try:
+                        self._ensure_engine()
+                    except Exception as exc:
+                        raise RuntimeError(f"{cls_name}: engine build/export failed for {engine_path}: {exc}") from exc
                     if not engine_path.exists():
-                        raise FileNotFoundError(
-                            f"{self.__class__.__name__}: engine not found after build: {engine_path}"
+                        raise FileNotFoundError(f"{cls_name}: engine not found after build: {engine_path}")
+                    try:
+                        trt_engine = TensorRTEngine(str(engine_path))
+                        trt_engine.load()
+                        trt_engine.activate()
+                        trt_engine.allocate_buffers(
+                            device=self.device,
+                            input_shape=(
+                                1,
+                                3,
+                                self.default_detect_resolution,
+                                self.default_detect_resolution,
+                            ),
                         )
-                    self._engine = TensorRTEngine(str(engine_path))
-                    self._engine.load()
-                    self._engine.activate()
-                    self._engine.allocate_buffers(device=self.device)
+                        self._engine = trt_engine
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"{cls_name}: engine load/activate/allocate failed for {engine_path}: {exc}"
+                        ) from exc
         return self._engine
 
     def _ensure_engine(self) -> None:
@@ -242,7 +369,13 @@ class SelfBuildingTRTPreprocessor(BasePreprocessor):
                 onnx_path.unlink()
 
     def _build_tensorrt_engine(self, onnx_path: Path, engine_path: Path) -> None:
-        """Build TRT engine from ONNX using trt.Builder with FP16 + dynamic shapes."""
+        """Build TRT engine from ONNX using trt.Builder with FP16 + dynamic shapes.
+
+        FP16 is always used; FP8 builds produce a one-time info log and fall back to FP16
+        (no calibration infrastructure for preprocessor engines).  The active UI profile's
+        ``builder_optimization_level`` is applied via the shared GPU-profile helper so
+        build quality matches the main UNet/VAE build for the selected profile.
+        """
         if not onnx_path.exists():
             raise FileNotFoundError(f"ONNX model not found: {onnx_path}")
 
@@ -257,6 +390,54 @@ class SelfBuildingTRTPreprocessor(BasePreprocessor):
 
         config = builder.create_builder_config()
         config.set_flag(trt.BuilderFlag.FP16)
+
+        # FP8 guard: one-time log, always build FP16 (no Q/DQ calibration infra for preprocessors).
+        if self.params.get("build_fp8", False):
+            cls_name = self.__class__.__name__
+            if cls_name not in SelfBuildingTRTPreprocessor._fp8_warned_classes:
+                logger.info(
+                    "%s: FP8 Q/DQ is not applied to preprocessor engines "
+                    "(no calibration infrastructure for tiny conv detectors). "
+                    "Building FP16 instead.",
+                    cls_name,
+                )
+                SelfBuildingTRTPreprocessor._fp8_warned_classes.add(cls_name)
+
+        # Apply builder_optimization_level via the shared GPU-profile helper.
+        # This honours the active UI profile (Flexible/Quality/Performance/Fast Build)
+        # at build time.  The preprocessor engine is always dynamic + FP16 regardless.
+        opt_level = self.params.get("builder_optimization_level")
+        try:
+            from streamdiffusion.acceleration.tensorrt.utilities import (
+                _apply_gpu_profile_to_config,
+                detect_gpu_profile,
+            )
+
+            gpu_profile = detect_gpu_profile()
+            # dynamic_shapes=True: tiling / l2tc helpers suppressed automatically
+            _apply_gpu_profile_to_config(config, gpu_profile, dynamic_shapes=True)
+            # Per-UI-profile override takes precedence over hardware-detected default
+            if opt_level is not None:
+                config.builder_optimization_level = int(opt_level)
+                logger.info(
+                    "%s: builder_optimization_level set to %d (from UI profile)",
+                    self.__class__.__name__,
+                    int(opt_level),
+                )
+        except Exception as exc:
+            logger.debug(
+                "%s: GPU profile helper not available (%s); using TRT defaults.",
+                self.__class__.__name__,
+                exc,
+            )
+            if opt_level is not None:
+                try:
+                    config.builder_optimization_level = int(opt_level)
+                except AttributeError:
+                    logger.debug(
+                        "%s: config.builder_optimization_level not supported by this TRT version.",
+                        self.__class__.__name__,
+                    )
 
         profile = builder.create_optimization_profile()
         res = self.default_detect_resolution
@@ -341,10 +522,12 @@ class SelfBuildingTRTPreprocessor(BasePreprocessor):
             instance._ensure_engine()
             return Path(engine_path).exists()
         except Exception as exc:
-            logger.error(f"{cls.__name__}.build_engine_for_path failed: {exc}")
-            import traceback
-
-            traceback.print_exc()
+            logger.exception(
+                "%s.build_engine_for_path failed for %s: %s",
+                cls.__name__,
+                engine_path,
+                exc,
+            )
             return False
 
     def __del__(self):

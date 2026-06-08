@@ -14,7 +14,7 @@ from pathlib import Path
 
 import torch
 
-from .trt_base import SelfBuildingTRTPreprocessor
+from .trt_base import SelfBuildingTRTPreprocessor, _first_output
 
 
 logger = logging.getLogger(__name__)
@@ -143,7 +143,7 @@ class HEDTensorrtPreprocessor(SelfBuildingTRTPreprocessor):
         Input  : engine_outputs["output"]  shape (B, 1, H, W)  or (B, H, W)
         Output : (3, H, W) in [0, 1]
         """
-        out = engine_outputs["output"].float()
+        out = _first_output(engine_outputs).float()
 
         # Collapse batch + channel dims if present
         if out.dim() == 4:

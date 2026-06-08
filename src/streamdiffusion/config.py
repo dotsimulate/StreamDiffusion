@@ -246,6 +246,22 @@ def _prepare_controlnet_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             "control_guidance_start": cn_config.get("control_guidance_start", 0.0),
             "control_guidance_end": cn_config.get("control_guidance_end", 1.0),
         }
+
+        # --- Profile knob injection ---
+        # Thread the active UI build profile into preprocessor_params so self-building
+        # TRT preprocessors (HED, Scribble, NormalBae) apply the same
+        # builder_optimization_level as the main UNet/VAE build.  FP8 is flagged so
+        # the preprocessor can log a one-time info message and fall back to FP16.
+        # Per-CN overrides in the YAML take precedence over the top-level value.
+        pp = dict(controlnet_config["preprocessor_params"] or {})
+        global_opt_level = config.get("builder_optimization_level")
+        if global_opt_level is not None and "builder_optimization_level" not in pp:
+            pp["builder_optimization_level"] = global_opt_level
+        if config.get("fp8", False) and "build_fp8" not in pp:
+            pp["build_fp8"] = True
+        if pp:
+            controlnet_config["preprocessor_params"] = pp
+
         controlnet_configs.append(controlnet_config)
 
     return controlnet_configs

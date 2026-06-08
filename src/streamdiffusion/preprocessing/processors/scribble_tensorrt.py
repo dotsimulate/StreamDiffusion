@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from .hed_tensorrt import HEDTensorrtPreprocessor
+from .trt_base import _first_output
 
 
 logger = logging.getLogger(__name__)
@@ -110,7 +111,7 @@ class ScribbleTensorrtPreprocessor(HEDTensorrtPreprocessor):
         Input  : engine_outputs["output"]  shape (B, 1, H, W)  or (B, H, W)
         Output : (3, H, W) in {0.0, 1.0}   (binary scribble map)
         """
-        out = engine_outputs["output"].float()
+        out = _first_output(engine_outputs).float()
 
         if out.dim() == 4:
             out = out.squeeze(1)

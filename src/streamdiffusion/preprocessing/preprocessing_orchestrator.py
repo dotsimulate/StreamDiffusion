@@ -444,9 +444,7 @@ class PreprocessingOrchestrator(BaseOrchestrator[ControlImage, List[Optional[tor
             return None
 
         except Exception:
-            import traceback
-
-            traceback.print_exc()
+            logger.exception("PreprocessingOrchestrator: IPAdapter preprocessor %d failed", index)
             return None
 
     # Helper methods
@@ -768,8 +766,28 @@ class PreprocessingOrchestrator(BaseOrchestrator[ControlImage, List[Optional[tor
                         control_variants["tensor"], preprocessor, stream_width, stream_height
                     )
                     return {"prep_key": prep_key, "indices": indices, "processed_image": processed_image}
-                except Exception:
-                    pass  # Fall through to PIL processing
+                except Exception as tensor_exc:
+                    # Lazy-init dedup set to suppress per-frame log spam.
+                    if not hasattr(self, "_tensor_fail_warned"):
+                        self._tensor_fail_warned = set()
+                    if prep_key not in self._tensor_fail_warned:
+                        logger.warning(
+                            "PreprocessingOrchestrator: tensor path failed for '%s': %s",
+                            prep_key,
+                            tensor_exc,
+                        )
+                        logger.debug(
+                            "PreprocessingOrchestrator: tensor path traceback for '%s'",
+                            prep_key,
+                            exc_info=True,
+                        )
+                        self._tensor_fail_warned.add(prep_key)
+
+                    # GPU-native preprocessors (e.g. self-building TRT) route the PIL
+                    # path through the same _process_tensor_core — the fallback would
+                    # fail identically.  Skip it and surface the error immediately.
+                    if getattr(preprocessor, "gpu_native", False):
+                        return None
 
             # PIL processing fallback
             if control_variants["image"] is not None:
@@ -781,5 +799,5 @@ class PreprocessingOrchestrator(BaseOrchestrator[ControlImage, List[Optional[tor
             return None
 
         except Exception as e:
-            logger.error(f"PreprocessingOrchestrator: Preprocessor {prep_key} failed: {e}")
+            logger.exception("PreprocessingOrchestrator: Preprocessor '%s' failed: %s", prep_key, e)
             return None

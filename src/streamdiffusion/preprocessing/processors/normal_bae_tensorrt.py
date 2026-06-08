@@ -32,7 +32,7 @@ import torch
 from PIL import Image
 
 from .base import BasePreprocessor
-from .trt_base import TENSORRT_AVAILABLE, SelfBuildingTRTPreprocessor
+from .trt_base import TENSORRT_AVAILABLE, SelfBuildingTRTPreprocessor, _first_output
 
 
 logger = logging.getLogger(__name__)
@@ -184,6 +184,11 @@ class _NormalBaeTorchGPU(BasePreprocessor):
         return self.tensor_to_pil(result)
 
     def _process_tensor_core(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        if not hasattr(self, "_detector") or self._detector is None:
+            raise RuntimeError(
+                f"{self.__class__.__name__}._process_tensor_core: model not initialized — "
+                "_load_model() was never called. This is a bug; please report it."
+            )
         with torch.no_grad():
             if image_tensor.dim() == 3:
                 image_tensor = image_tensor.unsqueeze(0)
@@ -247,17 +252,24 @@ class NormalBaeTensorrtPreprocessor(SelfBuildingTRTPreprocessor):
         use_trt = TENSORRT_AVAILABLE and _probe_normal_bae_onnx_export(device)
 
         if not use_trt:
-            # Return torch-direct fallback (different class, transparent to caller)
-            obj = object.__new__(_NormalBaeTorchGPU)
-            return obj
+            # Return a fully-constructed fallback.
+            #
+            # Using object.__new__(_NormalBaeTorchGPU) here would cause CPython's
+            # type.__call__ to skip __init__ entirely, because _NormalBaeTorchGPU is
+            # NOT a subclass of NormalBaeTensorrtPreprocessor.  The resulting object
+            # would have no self._detector, self.params, or self.device and raise
+            # AttributeError on the first frame.  Calling the class directly runs
+            # _NormalBaeTorchGPU.__init__ correctly (Finding A fix).
+            return _NormalBaeTorchGPU(**kwargs)
 
         obj = object.__new__(cls)
         return obj
 
     def __init__(self, **kwargs):
-        # Avoid re-initializing if __new__ returned a _NormalBaeTorchGPU instance
-        if type(self) is _NormalBaeTorchGPU:
-            return
+        # __new__ now returns a fully-constructed _NormalBaeTorchGPU when TRT is
+        # unavailable, so CPython never calls this __init__ for the fallback path.
+        # The guard that was here ("if type(self) is _NormalBaeTorchGPU: return")
+        # was dead code and has been removed.
         super().__init__(**kwargs)
 
     def _export_onnx(self, onnx_path: Path) -> None:
@@ -291,7 +303,7 @@ class NormalBaeTensorrtPreprocessor(SelfBuildingTRTPreprocessor):
         Convert TRT output (B, 3, H, W) [0,1] to CHW GPU tensor.
         The export wrapper already applies the [0,1] normalisation.
         """
-        out = engine_outputs["output"].float()
+        out = _first_output(engine_outputs).float()
         if out.dim() == 4:
             out = out.squeeze(0)  # (3, H, W)
         return out.clamp(0.0, 1.0)
