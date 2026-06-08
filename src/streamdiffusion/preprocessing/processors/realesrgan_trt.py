@@ -173,14 +173,12 @@ class RealESRGANProcessor(BasePreprocessor):
         # Model state
         self.pytorch_model = None
         self._engine = None  # Lazy loading like depth processor
+        self._model_ready = False  # Guards one-time lazy load
 
         # Thread safety for engine initialization
         import threading
 
         self._engine_lock = threading.Lock()
-
-        # Initialize
-        self._ensure_model_ready()
 
     @property
     def engine(self):
@@ -223,6 +221,16 @@ class RealESRGANProcessor(BasePreprocessor):
             for data in response.iter_content(chunk_size=1024):
                 size = file.write(data)
                 progress_bar.update(size)
+
+    def _ensure_loaded_once(self):
+        """Idempotent, thread-safe lazy loader — called at the top of every process path."""
+        if self._model_ready:
+            return
+        with self._engine_lock:
+            if self._model_ready:  # double-checked locking
+                return
+            self._ensure_model_ready()
+            self._model_ready = True
 
     def _ensure_model_ready(self):
         """Ensure PyTorch model is downloaded and loaded"""
@@ -408,6 +416,7 @@ class RealESRGANProcessor(BasePreprocessor):
 
     def _process_core(self, image: Image.Image) -> Image.Image:
         """Core processing using PIL Image"""
+        self._ensure_loaded_once()
         # Convert to tensor for processing
         tensor = self.pil_to_tensor(image)
         if tensor.dim() == 3:
@@ -450,6 +459,7 @@ class RealESRGANProcessor(BasePreprocessor):
 
     def _process_tensor_core(self, tensor: torch.Tensor) -> torch.Tensor:
         """Core tensor processing"""
+        self._ensure_loaded_once()
         if tensor.dim() == 3:
             tensor = tensor.unsqueeze(0)
             squeeze_output = True

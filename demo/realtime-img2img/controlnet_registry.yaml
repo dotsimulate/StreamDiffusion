@@ -116,8 +116,27 @@ available_controlnets:
     - id: "tile_sdxl"
       name: "Tile/Feedback"
       model_id: "xinsir/controlnet-tile-sdxl-1.0"
-      default_preprocessor: "feedback" 
+      default_preprocessor: "feedback"
       default_scale: 0.6
       description: "Uses image feedback for enhanced details (SDXL)"
+      preprocessor_params:
+        image_resolution: 512
+
+    - id: "depth_xinsir_sdxl"
+      name: "Depth Detection (xinsir)"
+      model_id: "xinsir/controlnet-depth-sdxl-1.0"
+      default_preprocessor: "depth_tensorrt"
+      default_scale: 0.8
+      description: "Estimates depth information from images — xinsir SDXL variant"
+      preprocessor_params:
+        detect_resolution: 518
+        image_resolution: 512
+
+    - id: "scribble_sdxl"
+      name: "Scribble"
+      model_id: "xinsir/controlnet-scribble-sdxl-1.0"
+      default_preprocessor: "scribble"
+      default_scale: 0.8
+      description: "Produces sketch-like scribble edge conditioning (SDXL)"
       preprocessor_params:
         image_resolution: 512

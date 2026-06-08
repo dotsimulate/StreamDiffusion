@@ -176,30 +176,23 @@ class StandardLineartPreprocessor(BasePreprocessor):
 
         return img_padded, remove_pad
 
-    def _process_core(self, image: Image.Image) -> Image.Image:
+    def _compute_lineart_hwc(self, input_image: torch.Tensor) -> torch.Tensor:
         """
-        Apply standard line art detection to the input image
+        Core line art computation on an HWC float tensor in [0, 255] on self.device.
+
+        Args:
+            input_image: HWC float32 tensor in [0, 255] already on device, already padded
+                         to the detect_resolution (with remove_pad closure returned separately).
+
+        Returns:
+            HWC float32 tensor in [0, 255] (3-channel) on the same device.
         """
-        time.time()
-
-        if isinstance(image, Image.Image):
-            input_image_cpu = np.array(image, dtype=np.uint8)
-        else:
-            input_image_cpu = image.astype(np.uint8)
-
-        input_image = torch.from_numpy(input_image_cpu).float().to(self.device)
-
-        detect_resolution = self.params.get("detect_resolution", 512)
         gaussian_sigma = self.params.get("gaussian_sigma", 6.0)
         intensity_threshold = self.params.get("intensity_threshold", 8)
 
-        input_image, remove_pad = self._resize_image_with_pad_torch(input_image, detect_resolution)
+        g = self._gaussian_blur_torch(input_image, gaussian_sigma)
 
-        x = input_image
-
-        g = self._gaussian_blur_torch(x, gaussian_sigma)
-
-        intensity = torch.min(g - x, dim=2)[0]
+        intensity = torch.min(g - input_image, dim=2)[0]
         intensity = torch.clamp(intensity, 0, 255)
 
         threshold_mask = intensity > intensity_threshold
@@ -215,10 +208,49 @@ class StandardLineartPreprocessor(BasePreprocessor):
         detected_map = torch.clamp(intensity, 0, 255).byte()
         detected_map = detected_map.unsqueeze(-1)
         detected_map = self._ensure_hwc3_torch(detected_map.float())
+        return detected_map
 
+    def _process_core(self, image: Image.Image) -> Image.Image:
+        """
+        Apply standard line art detection to the input image (PIL I/O path).
+        """
+        time.time()
+
+        if isinstance(image, Image.Image):
+            input_image_cpu = np.array(image, dtype=np.uint8)
+        else:
+            input_image_cpu = image.astype(np.uint8)
+
+        input_image = torch.from_numpy(input_image_cpu).float().to(self.device)
+
+        detect_resolution = self.params.get("detect_resolution", 512)
+        input_image, remove_pad = self._resize_image_with_pad_torch(input_image, detect_resolution)
+
+        detected_map = self._compute_lineart_hwc(input_image)
         detected_map = remove_pad(detected_map)
 
         detected_map_cpu = detected_map.byte().cpu().numpy()
-        lineart_image = Image.fromarray(detected_map_cpu)
+        return Image.fromarray(detected_map_cpu)
 
-        return lineart_image
+    def _process_tensor_core(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        GPU-native line art detection — no PIL round-trip.
+
+        Receives a CHW float32 tensor in [0, 1] on device (guaranteed by validate_tensor_input).
+        Returns a CHW float32 tensor in [0, 1] on the same device.
+        """
+        detect_resolution = self.params.get("detect_resolution", 512)
+
+        # CHW [0,1] → HWC [0,255]
+        hwc = tensor.permute(1, 2, 0) * 255.0
+
+        # Ensure on the right device
+        if hwc.device != torch.device(self.device):
+            hwc = hwc.to(self.device)
+
+        hwc, remove_pad = self._resize_image_with_pad_torch(hwc, detect_resolution)
+        detected_map = self._compute_lineart_hwc(hwc)
+        detected_map = remove_pad(detected_map)
+
+        # HWC [0,255] → CHW [0,1]
+        return detected_map.permute(2, 0, 1) / 255.0

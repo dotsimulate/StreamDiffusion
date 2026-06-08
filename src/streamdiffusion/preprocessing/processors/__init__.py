@@ -14,6 +14,7 @@ from .lineart import LineartPreprocessor
 from .openpose import OpenPosePreprocessor
 from .passthrough import PassthroughPreprocessor
 from .realesrgan_trt import RealESRGANProcessor
+from .scribble import ScribblePreprocessor
 from .sharpen import SharpenPreprocessor
 from .soft_edge import SoftEdgePreprocessor
 from .standard_lineart import StandardLineartPreprocessor
@@ -72,6 +73,7 @@ _preprocessor_registry = {
     "external": ExternalPreprocessor,
     "soft_edge": SoftEdgePreprocessor,
     "hed": HEDPreprocessor,
+    "scribble": ScribblePreprocessor,
     "feedback": FeedbackPreprocessor,
     "latent_feedback": LatentFeedbackPreprocessor,
     "sharpen": SharpenPreprocessor,
@@ -182,6 +184,7 @@ __all__ = [
     "ExternalPreprocessor",
     "SoftEdgePreprocessor",
     "HEDPreprocessor",
+    "ScribblePreprocessor",
     "IPAdapterEmbeddingPreprocessor",
     "FaceIDEmbeddingPreprocessor",
     "FeedbackPreprocessor",
