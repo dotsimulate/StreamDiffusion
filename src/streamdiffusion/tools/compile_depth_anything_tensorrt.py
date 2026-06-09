@@ -20,11 +20,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 try:
-    import tensorrt as trt
+    import tensorrt as trt  # noqa: E402
+
+    from streamdiffusion.acceleration.tensorrt.utilities import BUILD_TRT_LOGGER
 
     TENSORRT_AVAILABLE = True
 except ImportError:
     TENSORRT_AVAILABLE = False
+    BUILD_TRT_LOGGER = None
     logger.warning("TensorRT not available. Please install it first.")
 
 try:
@@ -120,10 +123,9 @@ def build_tensorrt_engine(
     logger.info(f"Building TensorRT engine: {engine_path}")
 
     try:
-        trt_logger = trt.Logger(trt.Logger.INFO)
-        builder = trt.Builder(trt_logger)
+        builder = trt.Builder(BUILD_TRT_LOGGER)
         network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
-        parser = trt.OnnxParser(network, trt_logger)
+        parser = trt.OnnxParser(network, BUILD_TRT_LOGGER)
 
         # Parse ONNX
         with open(onnx_path, "rb") as f:
