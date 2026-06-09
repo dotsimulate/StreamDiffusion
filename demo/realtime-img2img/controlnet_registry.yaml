@@ -55,7 +55,7 @@ available_controlnets:
     - id: "tile_sd15"
       name: "Tile/Feedback"
       model_id: "lllyasviel/control_v11f1e_sd15_tile"
-      default_preprocessor: "feedback"
+      default_preprocessor: "passthrough"
       default_scale: 0.6
       description: "Uses image feedback for enhanced details"
       preprocessor_params:
@@ -116,7 +116,7 @@ available_controlnets:
     - id: "tile_sdxl"
       name: "Tile/Feedback"
       model_id: "xinsir/controlnet-tile-sdxl-1.0"
-      default_preprocessor: "feedback"
+      default_preprocessor: "passthrough"
       default_scale: 0.6
       description: "Uses image feedback for enhanced details (SDXL)"
       preprocessor_params:
@@ -135,7 +135,7 @@ available_controlnets:
     - id: "scribble_sdxl"
       name: "Scribble"
       model_id: "xinsir/controlnet-scribble-sdxl-1.0"
-      default_preprocessor: "scribble"
+      default_preprocessor: "scribble_tensorrt"
       default_scale: 0.8
       description: "Produces sketch-like scribble edge conditioning (SDXL)"
       preprocessor_params:
