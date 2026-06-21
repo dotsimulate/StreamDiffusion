@@ -12,17 +12,30 @@ def _check_torch_installed():
     except Exception:
         msg = (
             "Missing required pre-installed packages: torch, torchvision\n"
-            "Install the PyTorch CUDA wheels from the appropriate index first, e.g.:\n"
-            "  pip install --index-url https://download.pytorch.org/whl/cu12x torch torchvision\n"
-            "Replace the index URL and versions to match your CUDA runtime."
+            "On Linux/Windows: pip install --index-url https://download.pytorch.org/whl/cu12x torch torchvision\n"
+            "On Mac: pip install torch torchvision  (MPS acceleration is used automatically)"
         )
         raise RuntimeError(msg)
 
-    if not torch.version.cuda:
-        raise RuntimeError("Detected CPU-only PyTorch. Install CUDA-enabled torch/vision/audio before installing this package.")
+    is_mac = sys.platform == "darwin"
+    has_cuda = bool(torch.version.cuda)
+    has_mps = getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+
+    if not has_cuda and not has_mps and not is_mac:
+        raise RuntimeError(
+            "Detected CPU-only PyTorch on a non-Mac platform. "
+            "Install CUDA-enabled torch/torchvision before installing this package."
+        )
+
+
+def is_mac():
+    return sys.platform == "darwin"
 
 
 def get_cuda_constraint():
+    if is_mac():
+        return None  # cuda-python not used on Mac
+
     cuda_version = os.environ.get("STREAMDIFFUSION_CUDA_VERSION") or \
                     os.environ.get("CUDA_VERSION")
 
@@ -46,8 +59,9 @@ def get_cuda_constraint():
 if any(cmd in sys.argv for cmd in ("install", "develop")):
     _check_torch_installed()
 
+_cuda_constraint = get_cuda_constraint()
 _deps = [
-    f"cuda-python{get_cuda_constraint()}",
+    *([] if _cuda_constraint is None else [f"cuda-python{_cuda_constraint}"]),
     "xformers==0.0.30",
     "diffusers @ git+https://github.com/varshith15/diffusers.git@3e3b72f557e91546894340edabc845e894f00922",
     "transformers==4.56.0",
@@ -82,7 +96,10 @@ def deps_list(*pkgs):
 extras = {}
 extras["xformers"] = deps_list("xformers")
 extras["torch"] = deps_list("torch", "accelerate")
-extras["tensorrt"] = deps_list("protobuf", "cuda-python", "onnx", "onnxruntime", "onnxruntime-gpu", "colored", "polygraphy", "onnx-graphsurgeon")
+_tensorrt_pkgs = ["protobuf", "onnx", "onnxruntime", "onnxruntime-gpu", "colored", "polygraphy", "onnx-graphsurgeon"]
+if not is_mac():
+    _tensorrt_pkgs.insert(0, "cuda-python")
+extras["tensorrt"] = deps_list(*_tensorrt_pkgs)
 extras["controlnet"] = deps_list("onnx-graphsurgeon", "controlnet-aux")
 extras["ipadapter"] = deps_list("diffusers-ipadapter", "mediapipe", "insightface")
 

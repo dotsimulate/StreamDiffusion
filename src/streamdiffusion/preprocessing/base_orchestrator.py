@@ -50,8 +50,8 @@ class BaseOrchestrator(Generic[T, R], ABC):
         
         # Cleanup CUDA stream if it exists
         if hasattr(self, '_background_stream') and self._background_stream is not None:
-            # Synchronize the stream before cleanup
-            torch.cuda.synchronize()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             self._background_stream = None
     
     def __del__(self):

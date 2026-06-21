@@ -968,9 +968,14 @@ class StreamDiffusion:
     def __call__(
         self, x: Union[torch.Tensor, PIL.Image.Image, np.ndarray] = None
     ) -> torch.Tensor:
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
+        _use_cuda_timing = torch.cuda.is_available()
+        if _use_cuda_timing:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+        else:
+            import time as _time
+            _t0 = _time.perf_counter()
         
         if x is not None:
             x = self.image_processor.preprocess(x, self.height, self.width).to(
@@ -1012,9 +1017,12 @@ class StreamDiffusion:
 
         # Clone for skip-frame cache — TRT VAE buffer is reused on next decode call
         self.prev_image_result = x_output.clone()
-        end.record()
-        end.synchronize()  # Wait only for this event, not all streams globally
-        inference_time = start.elapsed_time(end) / 1000
+        if _use_cuda_timing:
+            end.record()
+            end.synchronize()
+            inference_time = start.elapsed_time(end) / 1000
+        else:
+            inference_time = _time.perf_counter() - _t0
         self.inference_time_ema = 0.9 * self.inference_time_ema + 0.1 * inference_time
         
         return x_output
