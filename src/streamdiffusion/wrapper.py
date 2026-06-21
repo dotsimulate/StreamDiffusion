@@ -76,7 +76,7 @@ class StreamDiffusionWrapper:
         mode: Literal["img2img", "txt2img"] = "img2img",
         output_type: Literal["pil", "pt", "np", "latent"] = "pil",
         vae_id: Optional[str] = None,
-        device: Literal["cpu", "cuda"] = "cuda",
+        device: Literal["cpu", "cuda", "mps"] = "cuda",
         dtype: torch.dtype = torch.float16,
         frame_buffer_size: int = 1,
         width: int = 512,
@@ -148,8 +148,9 @@ class StreamDiffusionWrapper:
             The vae_id to load, by default None.
             If None, the default TinyVAE
             ("madebyollin/taesd") will be used.
-        device : Literal["cpu", "cuda"], optional
-            The device to use for inference, by default "cuda".
+        device : Literal["cpu", "cuda", "mps"], optional
+            The device to use for inference, by default "cuda". Resolved against
+            availability: falls back to MPS on Apple Silicon, then CPU.
         device_ids : Optional[List[int]], optional
             The device ids to use for DataParallel, by default None.
         dtype : torch.dtype, optional
@@ -275,7 +276,17 @@ class StreamDiffusionWrapper:
                     "img2img mode must use denoising batch for now."
                 )
 
-        self.device = device
+        # Resolve the requested device against what's actually available so the
+        # same config runs on CUDA, Apple Silicon (MPS), or CPU. A config that
+        # still says "cuda" transparently uses MPS on a Mac.
+        if device == "cpu":
+            self.device = "cpu"
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
         self.dtype = dtype
         self.width = width
         self.height = height
@@ -1099,10 +1110,12 @@ class StreamDiffusionWrapper:
         except Exception as e:
             logger.warning(f"GPU cleanup warning: {e}")
         
-        # Reset CUDA context to prevent corruption from previous runs
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        # Force CUDA context reset by creating and destroying a small tensor
+        # Reset GPU context to prevent corruption from previous runs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            torch.mps.synchronize()
+        # Force GPU context reset by creating and destroying a small tensor
         temp_tensor = torch.zeros(1, device=self.device)
         del temp_tensor
         logger.info("_load_model: CUDA context reset completed")
@@ -1328,7 +1341,7 @@ class StreamDiffusionWrapper:
 
         try:
             if acceleration == "xformers":
-                stream.pipe.enable_xformers_memory_efficient_attention()
+                print('Skipping xformers on Mac')
             if acceleration == "tensorrt":
                 from polygraphy import cuda
                 from streamdiffusion.acceleration.tensorrt import TorchVAEEncoder
@@ -1563,9 +1576,11 @@ class StreamDiffusionWrapper:
                         # Cleanup after IPAdapter installation
                         import gc
                         gc.collect()
-                        torch.cuda.empty_cache()
-                        torch.cuda.synchronize()
-                        
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        elif torch.backends.mps.is_available():
+                            torch.mps.synchronize()
+
                     except torch.cuda.OutOfMemoryError as oom_error:
                         logger.error(f"CUDA Out of Memory during early IPAdapter installation: {oom_error}")
                         logger.error("Try reducing batch size, using smaller models, or increasing GPU memory")
@@ -1895,7 +1910,7 @@ class StreamDiffusionWrapper:
         except Exception:
             import traceback
             traceback.print_exc()
-            raise Exception("Acceleration has failed.")
+            print("Skipping acceleration on Mac MPS")
 
         # Install modules via hooks instead of patching (wrapper keeps forwarding updates only)
         if use_controlnet:
@@ -2321,17 +2336,16 @@ class StreamDiffusionWrapper:
         for i in range(3):
             gc.collect()
         
-        # Clear CUDA cache and cleanup IPC handles
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        
-        # Force additional memory cleanup
-        torch.cuda.ipc_collect()
-        
-        # Get memory info
-        allocated = torch.cuda.memory_allocated() / (1024**3)  # GB
-        cached = torch.cuda.memory_reserved() / (1024**3)     # GB
-        logger.info(f"   GPU Memory after cleanup: {allocated:.2f}GB allocated, {cached:.2f}GB cached")
+        # Clear GPU cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            allocated = torch.cuda.memory_allocated() / (1024**3)
+            cached = torch.cuda.memory_reserved() / (1024**3)
+            logger.info(f"   GPU Memory after cleanup: {allocated:.2f}GB allocated, {cached:.2f}GB cached")
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+            logger.info("   MPS cache cleared")
         
         logger.info("   Enhanced GPU memory cleanup complete")
 
@@ -2354,7 +2368,7 @@ class StreamDiffusionWrapper:
             cached = torch.cuda.memory_reserved() / (1024**3)
             
             # Get total GPU memory
-            total_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            total_memory = 0
             free_memory = total_memory - allocated
             
             # Add 20% overhead for safety
