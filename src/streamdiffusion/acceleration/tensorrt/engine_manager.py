@@ -116,6 +116,7 @@ class EngineManager:
         resolution: Optional[tuple] = None,
         builder_optimization_level: Optional[int] = None,
         build_static_batch: Optional[bool] = None,
+        static_batch_size: Optional[int] = None,
     ) -> Path:
         """
         Generate engine path using wrapper.py's current logic.
@@ -180,6 +181,13 @@ class EngineManager:
                 # because the loaded engine has a symbolic batch dim.
                 if build_static_batch is not None:
                     prefix += f"--sbatch{int(build_static_batch)}"
+                # A static-batch engine only accepts the exact batch it was built
+                # with (= steps x frame_buffer x cfg factor), so that value must be
+                # part of the cache key: without it a 1-step config resolves to an
+                # engine frozen at batch 2 and fails set_input_shape on the first
+                # frame. min_batch/max_batch above are only the capacity range.
+                if build_static_batch and static_batch_size is not None:
+                    prefix += f"--batch-{static_batch_size}"
 
             prefix += optlvl_suffix
 

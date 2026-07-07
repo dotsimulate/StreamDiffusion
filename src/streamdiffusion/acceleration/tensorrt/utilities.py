@@ -924,6 +924,19 @@ class Engine:
         logger.info(f"Loading TensorRT engine: {self.engine_path}")
         self.engine = engine_from_bytes(bytes_from_path(self.engine_path))
 
+    def get_input_profile_bounds(self, name: str):
+        """Return (min, opt, max) shapes of input `name` from optimization profile 0,
+        or None if the engine is not loaded / the tensor does not exist. Lets callers
+        validate a requested shape (e.g. UNet batch = steps * frame_buffer) against
+        what the serialized engine actually supports, instead of failing inside
+        set_input_shape mid-stream."""
+        if self.engine is None:
+            return None
+        try:
+            return self.engine.get_tensor_profile_shape(name, 0)
+        except Exception:
+            return None
+
     def activate(self, reuse_device_memory=None):
         if reuse_device_memory:
             self.context = self.engine.create_execution_context_without_device_memory()
@@ -981,7 +994,15 @@ class Engine:
 
             if mode == trt.TensorIOMode.INPUT:
                 if not self.context.set_input_shape(name, shape):
-                    raise RuntimeError(f"TensorRT: set_input_shape failed for '{name}' with shape {shape}")
+                    bounds = self.get_input_profile_bounds(name)
+                    hint = ""
+                    if bounds is not None:
+                        hint = (
+                            f" Engine profile for '{name}': min={tuple(bounds[0])} opt={tuple(bounds[1])} "
+                            f"max={tuple(bounds[-1])}. The engine was built for a fixed shape range — "
+                            f"revert the parameter change or rebuild the engine for the new shape."
+                        )
+                    raise RuntimeError(f"TensorRT: set_input_shape failed for '{name}' with shape {shape}.{hint}")
 
             tensor = torch.empty(tuple(shape), dtype=torch_dtype).to(device=device)
             self.tensors[name] = tensor

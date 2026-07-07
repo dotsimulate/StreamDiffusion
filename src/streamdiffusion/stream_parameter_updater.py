@@ -240,6 +240,30 @@ class StreamParameterUpdater(OrchestratorUser):
                 new_cache[cache_idx - 1] = cache_data
         return new_cache
 
+    def _trt_unet_batch_bounds(self) -> Optional[Tuple[int, int]]:
+        """(min, max) batch the loaded TRT UNet engine accepts, or None when the
+        UNet is not a TRT engine (PyTorch fallback -> no batch restriction)."""
+        engine = getattr(getattr(self.stream, "unet", None), "engine", None)
+        get_bounds = getattr(engine, "get_input_profile_bounds", None)
+        if get_bounds is None:
+            return None
+        bounds = get_bounds("sample")
+        if bounds is None:
+            return None
+        return int(bounds[0][0]), int(bounds[-1][0])
+
+    def _prospective_unet_batch(self, num_steps: int) -> int:
+        """UNet batch a step count would need — mirrors pipeline.py's
+        trt_unet_batch_size computation (cfg factor + denoising batch)."""
+        s = self.stream
+        if not getattr(s, "use_denoising_batch", False):
+            return s.frame_bff_size
+        if s.cfg_type == "initialize":
+            return (num_steps + 1) * s.frame_bff_size
+        if s.cfg_type == "full":
+            return 2 * num_steps * s.frame_bff_size
+        return num_steps * s.frame_bff_size
+
     @torch.inference_mode()
     def update_stream_params(
         self,
@@ -270,6 +294,29 @@ class StreamParameterUpdater(OrchestratorUser):
         """Update streaming parameters efficiently in a single call."""
 
         with self._update_lock:
+            # Guard: changing the number of t_index entries changes the UNet batch
+            # (steps x frame_buffer x cfg factor). A TRT engine only accepts batches
+            # inside its built profile (static engines: exactly one). Reject the
+            # change here with a warning instead of letting set_input_shape kill the
+            # streaming loop; all other parameter updates in this call still apply.
+            if t_index_list is not None:
+                cur_len = len(self.stream.t_list) if self.stream.t_list else len(t_index_list)
+                if len(t_index_list) != cur_len:
+                    bounds = self._trt_unet_batch_bounds()
+                    if bounds is not None:
+                        new_batch = self._prospective_unet_batch(len(t_index_list))
+                        if not (bounds[0] <= new_batch <= bounds[1]):
+                            logger.warning(
+                                f"update_stream_params: step count change {cur_len} -> "
+                                f"{len(t_index_list)} needs UNet batch {new_batch}, but the "
+                                f"loaded TRT engine supports batch {bounds[0]}"
+                                + (f"-{bounds[1]}" if bounds[1] != bounds[0] else " only")
+                                + ". Ignoring the step change — restart the stream with the "
+                                "new step count to build/load a matching engine "
+                                "(or use the Flexible TRT profile for runtime step changes)."
+                            )
+                            t_index_list = None
+
             # First, update num_inference_steps if needed (this changes the timesteps array size)
             if num_inference_steps is not None:
                 # Safety check: Ensure num_inference_steps is at least as large as max t_index value

@@ -1893,9 +1893,11 @@ class StreamDiffusionWrapper:
                     fp8=fp8,
                     resolution=(self.height, self.width),
                     builder_optimization_level=self.builder_optimization_level,
-                    # Must match the hardcoded build_static_batch value below so the cache
-                    # key reflects the actual TRT profile policy (static vs dynamic batch).
-                    build_static_batch=True,
+                    # Must match the build_static_batch value in _unet_build_opts below so
+                    # the cache key reflects the actual TRT profile policy. Static engines
+                    # additionally encode the exact batch they are frozen at.
+                    build_static_batch=self.static_shapes,
+                    static_batch_size=stream.trt_unet_batch_size if self.static_shapes else None,
                 )
                 # Effective VAE optlvl: per-engine override first, then global fallback.
                 _vae_optlvl = (
@@ -2269,19 +2271,21 @@ class StreamDiffusionWrapper:
                 vae_dtype = stream.vae.dtype
 
                 try:
-                    # Note: the UNet always builds with build_static_batch=True /
-                    # build_dynamic_shape=False regardless of self.static_shapes.
-                    # static_shapes only controls the VAE enc/dec build flags.
+                    # The UNet honors self.static_shapes for the batch dimension
+                    # (TRT profile 'flexible' -> dynamic batch, step count changeable at
+                    # runtime; static profiles -> batch frozen at trt_unet_batch_size for
+                    # speed). Resolution is always fixed (build_dynamic_shape=False) —
+                    # the engine dir name carries --res-WxH either way.
                     logger.warning(
                         f"[TRT] UNet engine: fp8={fp8}, "
-                        f"build_static_batch=True, build_dynamic_shape=False, "
-                        f"engine_path={unet_path}"
+                        f"build_static_batch={self.static_shapes}, build_dynamic_shape=False, "
+                        f"batch={stream.trt_unet_batch_size}, engine_path={unet_path}"
                     )
                     _unet_build_opts = {
                         "opt_image_height": self.height,
                         "opt_image_width": self.width,
                         "build_dynamic_shape": False,
-                        "build_static_batch": True,
+                        "build_static_batch": self.static_shapes,
                     }
                     if self.builder_optimization_level is not None:
                         _unet_build_opts["builder_optimization_level"] = self.builder_optimization_level
@@ -2323,6 +2327,22 @@ class StreamDiffusionWrapper:
                     )
                     if load_engine:
                         logger.info("TensorRT UNet engine loaded successfully")
+                        # Guard: a cached engine may not cover the requested batch
+                        # (engine dirs from before the --batch-N cache-key suffix, or
+                        # hand-copied engines). Fail here with a readable message
+                        # instead of set_input_shape blowing up on the first frame.
+                        _bounds = stream.unet.engine.get_input_profile_bounds("sample")
+                        if _bounds is not None:
+                            _min_b, _max_b = int(_bounds[0][0]), int(_bounds[-1][0])
+                            _req = stream.trt_unet_batch_size
+                            if not (_min_b <= _req <= _max_b):
+                                raise RuntimeError(
+                                    f"UNet engine batch mismatch: engine supports batch {_min_b}"
+                                    + (f"-{_max_b}" if _max_b != _min_b else " only")
+                                    + f", config needs {_req} (steps x frame_buffer x cfg factor). "
+                                    f"Change the step count to match the engine, or delete the "
+                                    f"engine dir to rebuild for the new batch: {Path(unet_path).parent}"
+                                )
 
                 except Exception as e:
                     error_msg = str(e).lower()
