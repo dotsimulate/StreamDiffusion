@@ -145,6 +145,11 @@ class StreamDiffusionWrapper:
         use_cuda_ipc_output: bool = False,
         cuda_ipc_shm_name: Optional[str] = None,
         cuda_ipc_num_slots: int = 2,
+        # CUDA IPC CN-preview (SD→TD zero-copy preprocessor output display, fixed name, display-only)
+        cuda_ipc_cn_processed_shm_name: Optional[str] = None,
+        # When True, forces the preprocessor to run even when conditioning_scale==0 so that
+        # controlnet_images[index] is populated for the preview. No diffusion effect.
+        controlnet_preview_passthrough: bool = False,
         # Debug mode — gates IPC health tracking and other diagnostic instrumentation
         debug_mode: bool = False,
         vae_builder_optimization_level: Optional[int] = None,
@@ -335,6 +340,9 @@ class StreamDiffusionWrapper:
         self._cuda_ipc_shm_name = cuda_ipc_shm_name
         self._cuda_ipc_num_slots = cuda_ipc_num_slots
         self._cuda_ipc_exporter = None  # lazy-init on first frame via _lazy_init_ipc_exporter
+        self._cuda_ipc_cn_processed_shm_name = cuda_ipc_cn_processed_shm_name
+        self._cuda_ipc_cn_exporter = None  # lazy-init on first CN frame via _lazy_init_cn_ipc_exporter
+        self._controlnet_preview_passthrough = controlnet_preview_passthrough
         self.debug_mode = debug_mode
         # IPC health tracking — updated per-frame only when debug_mode is True
         self._ipc_consecutive_failures: int = 0
@@ -971,7 +979,20 @@ class StreamDiffusionWrapper:
 
             bgra = self._ipc_pack_rgba(image_tensor)
             exporter = self._lazy_init_ipc_exporter(bgra.shape[0], bgra.shape[1])
-            outcome = exporter.export(GpuFrame(ptr=bgra.data_ptr(), size=bgra.numel()))
+            # Pass the producer stream so the Exporter issues a GPU-side stream_wait_event
+            # before the D2D memcpy. Without this the high-priority non-blocking IPC stream
+            # can launch the memcpy before the default-stream pack kernels finish, reading
+            # a half-written BGRA buffer and producing a gray-washed torn frame every frame
+            # when blend-weight updates are in flight (they extend default-stream work).
+            # producer_stream=0 (legacy default stream) is valid: 0 is not None, and
+            # cudaEventRecord(event, 0) captures all prior default-stream work correctly.
+            outcome = exporter.export(
+                GpuFrame(
+                    ptr=bgra.data_ptr(),
+                    size=bgra.numel(),
+                    producer_stream=torch.cuda.current_stream().cuda_stream,
+                )
+            )
             if self.debug_mode:
                 # Health tracking — diagnostic only; gated behind debug_mode (par.Debugmode in TD UI).
                 # Reads private attr defensively; safe if vendored exporter.py is re-synced.
@@ -1043,7 +1064,17 @@ class StreamDiffusionWrapper:
         """Initialize Exporter on first frame (lazy to defer CUDA IPC SHM creation)."""
         if self._cuda_ipc_exporter is not None:
             return self._cuda_ipc_exporter
-        from cuda_link import Exporter, FrameSpec
+        from dataclasses import replace as _dc_replace
+
+        from cuda_link import Exporter, ExportPolicy, FrameSpec
+
+        # SD source buffers (_ipc_pack_rgba output) are transient torch tensors recycled by
+        # PyTorch's caching allocator the moment the caller returns.  Async export would read
+        # recycled memory → torn frames (ADR-0001 source-buffer lifetime race).  Force
+        # blocking unless the user explicitly opted into async with CUDALINK_EXPORT_SYNC=0.
+        policy = ExportPolicy.from_env()
+        if os.environ.get("CUDALINK_EXPORT_SYNC") is None:
+            policy = _dc_replace(policy, export_sync=True)
 
         self._cuda_ipc_exporter = Exporter.open(
             FrameSpec(
@@ -1054,9 +1085,80 @@ class StreamDiffusionWrapper:
                 dtype="uint8",
                 num_slots=self._cuda_ipc_num_slots,
             ),
-            # policy=None → ExportPolicy.from_env() respects all CUDALINK_* env vars
+            policy=policy,
         )
         return self._cuda_ipc_exporter
+
+    def _ipc_pack_unit_rgba(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        """Convert a [0,1] CHW/NCHW tensor to HWC uint8 BGRA on GPU for cuda-link wire contract.
+
+        Like _ipc_pack_rgba but skips _denormalize_on_gpu — the ControlNet preprocessor
+        output is already in [0, 1] (not the diffusion [-1, 1] range).
+        """
+        with profiler.region("glue.ipc_pack_unit_rgba"):
+            t = image_tensor
+            if t.dim() == 4:
+                t = t[0]  # NCHW → CHW [0,1]
+            rgb_u8 = (t * 255).clamp(0, 255).to(torch.uint8)  # CHW uint8
+            rgb_hwc = rgb_u8.permute(1, 2, 0).contiguous()  # HWC RGB
+            alpha = torch.full_like(rgb_hwc[..., :1], 255)
+            return torch.cat([rgb_hwc[..., 2:3], rgb_hwc[..., 1:2], rgb_hwc[..., 0:1], alpha], dim=-1).contiguous()
+
+    def _lazy_init_cn_ipc_exporter(self, height: int, width: int):
+        """Initialize the CN-preview Exporter on first frame (lazy, mirrors _lazy_init_ipc_exporter)."""
+        if self._cuda_ipc_cn_exporter is not None:
+            return self._cuda_ipc_cn_exporter
+        from dataclasses import replace as _dc_replace
+
+        from cuda_link import Exporter, ExportPolicy, FrameSpec
+
+        # Same source-buffer lifetime race as _lazy_init_ipc_exporter: _ipc_pack_unit_rgba
+        # returns a transient tensor that the caching allocator recycles on return.
+        # Force blocking unless CUDALINK_EXPORT_SYNC=0 explicitly opts into async.
+        policy = ExportPolicy.from_env()
+        if os.environ.get("CUDALINK_EXPORT_SYNC") is None:
+            policy = _dc_replace(policy, export_sync=True)
+
+        self._cuda_ipc_cn_exporter = Exporter.open(
+            FrameSpec(
+                shm_name=self._cuda_ipc_cn_processed_shm_name,
+                height=height,
+                width=width,
+                channels=4,
+                dtype="uint8",
+                num_slots=self._cuda_ipc_num_slots,
+            ),
+            policy=policy,
+        )
+        return self._cuda_ipc_cn_exporter
+
+    def export_controlnet_preview_ipc(self, tensor: torch.Tensor) -> None:
+        """Export a ControlNet preprocessor output tensor to TD via zero-copy GPU IPC.
+
+        The tensor must be in [0, 1] range (CHW or NCHW); it is NOT denormalized.
+        This is a display-only path — no health tracking, no return value.
+        No-op if cuda_ipc_cn_processed_shm_name was not configured.
+        """
+        logger.info(  # [DEBUG-cnprev] — remove after preview confirmed
+            "[DEBUG-cnprev] export_controlnet_preview_ipc called, shm_name=%r",
+            self._cuda_ipc_cn_processed_shm_name,
+        )
+        if not self._cuda_ipc_cn_processed_shm_name:
+            return
+        try:
+            from cuda_link import GpuFrame
+
+            bgra = self._ipc_pack_unit_rgba(tensor)
+            exporter = self._lazy_init_cn_ipc_exporter(bgra.shape[0], bgra.shape[1])
+            exporter.export(
+                GpuFrame(
+                    ptr=bgra.data_ptr(),
+                    size=bgra.numel(),
+                    producer_stream=torch.cuda.current_stream().cuda_stream,
+                )
+            )
+        except Exception:
+            logger.debug("export_controlnet_preview_ipc: export failed", exc_info=True)
 
     def get_ipc_health_status(self) -> str:
         """Return a short health string for the CUDA-IPC zero-copy output path.
@@ -1086,13 +1188,19 @@ class StreamDiffusionWrapper:
         return "ok"
 
     def cleanup_cuda_ipc(self) -> None:
-        """Tear down the CUDA IPC exporter and release its SHM + GPU resources."""
+        """Tear down the CUDA IPC exporters and release their SHM + GPU resources."""
         if self._cuda_ipc_exporter is not None:
             try:
                 self._cuda_ipc_exporter.close()
             except Exception:
                 logger.debug("cleanup_cuda_ipc: _cuda_ipc_exporter.close() failed", exc_info=True)
             self._cuda_ipc_exporter = None
+        if self._cuda_ipc_cn_exporter is not None:
+            try:
+                self._cuda_ipc_cn_exporter.close()
+            except Exception:
+                logger.debug("cleanup_cuda_ipc: _cuda_ipc_cn_exporter.close() failed", exc_info=True)
+            self._cuda_ipc_cn_exporter = None
 
     def _denormalize_on_gpu(self, image_tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -2399,6 +2507,10 @@ class StreamDiffusionWrapper:
                     cn_module.add_controlnet(cn_cfg, control_image=cfg.get("control_image"))
                 # Expose for later updates if needed by caller code
                 stream._controlnet_module = cn_module
+                # Enable always_preprocess so controlnet_images is populated even at scale==0,
+                # which is required for the IPC/CPU preview path to have something to export.
+                if self._controlnet_preview_passthrough:
+                    cn_module.always_preprocess = True
                 # Apply startup cache interval from config (1 = disabled, no-op).
                 if cn_cache_interval > 1:
                     cn_module.set_cn_cache_interval(cn_cache_interval)

@@ -188,6 +188,11 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
     param_map["use_cuda_ipc_output"] = config.get("use_cuda_ipc_output", False)
     param_map["cuda_ipc_shm_name"] = config.get("cuda_ipc_shm_name")
     param_map["cuda_ipc_num_slots"] = config.get("cuda_ipc_num_slots", 2)
+    # CUDA IPC CN-preview — fixed-name zero-copy path for preprocessor output display
+    param_map["cuda_ipc_cn_processed_shm_name"] = config.get("cuda_ipc_cn_processed_shm_name")
+    # Force preprocessor to run even at scale==0 so controlnet_images is populated for preview.
+    # Piggy-backs on send_controlnet_preview so no new config key is needed.
+    param_map["controlnet_preview_passthrough"] = config.get("send_controlnet_preview", False)
     param_map["debug_mode"] = config.get("debug_mode", False)
 
     # Pipeline hook configurations (Phase 4: Configuration Integration)

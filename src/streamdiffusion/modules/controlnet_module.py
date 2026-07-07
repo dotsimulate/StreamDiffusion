@@ -17,6 +17,9 @@ from streamdiffusion.preprocessing.orchestrator_user import OrchestratorUser
 from streamdiffusion.tools.gpu_profiler import profiler
 
 
+logger = logging.getLogger(__name__)
+
+
 @dataclass
 class ControlNetConfig:
     model_id: str
@@ -71,6 +74,12 @@ class ControlNetModule(OrchestratorUser):
 
         # Cache engine type detection to avoid repeated hasattr calls
         self._engine_type_cache: Dict[str, bool] = {}
+
+        # When True, runs the preprocessor even when conditioning_scale == 0, so that
+        # controlnet_images[index] is populated for the preview path. Does NOT affect
+        # self.controlnet_scales — CN forward still uses the real scale (0 ⇒ skipped at
+        # line 439, zero diffusion influence). Set by wrapper when send_controlnet_preview is on.
+        self.always_preprocess: bool = False
 
         # Residual caching: skip the CN engine forward for intermediate frames and reuse the last result.
         # interval=1 disables caching (run every frame). interval=2 halves CN cost; control latency = 1 frame.
@@ -180,12 +189,26 @@ class ControlNetModule(OrchestratorUser):
                 scales = [sc if bool(self.enabled_list[i]) else 0.0 for i, sc in enumerate(scales)]
             preprocessors = [self.preprocessors[i] if i < len(self.preprocessors) else None for i in range(total)]
 
+        # Gate-scale array for the preprocessor: when always_preprocess is set (preview path),
+        # replace scale-0 entries with 1.0 so _process_single_controlnet does not short-circuit.
+        # self.controlnet_scales is never modified — the diffusion forward still uses the real scale.
+        gate_scales = scales
+        if getattr(self, "always_preprocess", False):
+            gate_scales = [s if s != 0 else 1.0 for s in scales]
+
         # Single-index fast path
         if index is not None:
             results = self._preprocessing_orchestrator.process_sync(
-                control_image, preprocessors, scales, self._stream.width, self._stream.height, index
+                control_image, preprocessors, gate_scales, self._stream.width, self._stream.height, index
             )
             processed = results[index] if results and len(results) > index else None
+            logger.info(  # [DEBUG-cnprev] — remove after preview confirmed
+                "[DEBUG-cnprev] update_control_image_efficient idx=%d scale=%.3f gate=%.3f processed=%s",
+                index,
+                scales[index] if index < len(scales) else -1,
+                gate_scales[index] if index < len(gate_scales) else -1,
+                processed is not None,
+            )
             with self._collections_lock:
                 if processed is not None and index < len(self.controlnet_images):
                     self.controlnet_images[index] = processed
@@ -199,7 +222,7 @@ class ControlNetModule(OrchestratorUser):
 
         # Use intelligent pipelining (automatically detects feedback preprocessors and switches to sync)
         processed_images = self._preprocessing_orchestrator.process_pipelined(
-            control_image, preprocessors, scales, self._stream.width, self._stream.height
+            control_image, preprocessors, gate_scales, self._stream.width, self._stream.height
         )
 
         # If orchestrator returns empty list, it indicates no update needed for this frame
