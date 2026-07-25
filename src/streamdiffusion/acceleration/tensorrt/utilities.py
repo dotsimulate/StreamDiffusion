@@ -452,7 +452,7 @@ def CUASSERT(cuda_ret):
     return None
 
 
-def _atomic_write_bytes(path: str, data) -> None:
+def _atomic_write_bytes(path: str, data: bytes) -> None:
     """Write `data` to `path` atomically via a temp file + os.replace.
 
     A crash/interrupt mid-write leaves at most a stale ``.tmp`` file; ``path`` is only
@@ -742,10 +742,13 @@ class Engine:
                 logger.warning(f"No refit weights for layer: {layer_name}")
 
         # Refit reads/writes the engine's weight buffers directly; synchronize first so it
-        # cannot race in-flight inference that is still reading those buffers. Defensive
+        # cannot race in-flight inference that is still reading those buffers. Use a
+        # device-wide sync (not current-stream-only) since inference may run on a
+        # different stream than the one active here (e.g. an external stream handed to
+        # TensorRT) — current-stream sync alone would not wait for that work. Defensive
         # only — refit is unreachable unless the engine was built with enable_refit=True
         # (default False), but the guard is cheap and correct either way.
-        torch.cuda.current_stream().synchronize()
+        torch.cuda.synchronize()
         if not refitter.refit_cuda_engine():
             logger.error("Failed to refit!")
             raise RuntimeError("TensorRT engine refit failed")
