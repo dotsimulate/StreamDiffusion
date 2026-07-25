@@ -2,7 +2,7 @@ import hashlib
 import logging
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,12 @@ class EngineManager:
         Moves and consolidates create_prefix() function from wrapper.py lines 995-1014.
         Special handling for ControlNet engines which use model_id-based directories.
         """
-        filename = self._configs[engine_type]["filename"]
+        # self._configs' inner dicts also hold compile_fn/loader callables under other
+        # keys, so the type checker infers "filename" as str | Callable | Callable across
+        # the whole dict shape rather than narrowing per-key. The "filename" value is
+        # always a plain str at runtime (see __init__); cast pins that down for the
+        # `self.engine_dir / prefix / filename` join below.
+        filename = cast(str, self._configs[engine_type]["filename"])
         optlvl_suffix = f"--optlvl{builder_optimization_level}" if builder_optimization_level is not None else ""
 
         if engine_type == EngineType.CONTROLNET:
@@ -216,7 +221,37 @@ class EngineManager:
             if resolution is not None:
                 prefix += f"--res-{resolution[0]}x{resolution[1]}"
 
-            return self.engine_dir / prefix / filename
+            if engine_type == EngineType.UNET:
+                # The UNet prefix above encodes every build flag verbatim and can exceed
+                # ~170 chars. Combined with a real-world engine_dir root, that pushes
+                # unet.engine.onnx / .opt.onnx past Windows' 260-char MAX_PATH — the
+                # directory itself fits (mkdir succeeds) but torch.onnx.export's
+                # open(path, "wb") then fails with a bare FileNotFoundError. Compact the
+                # directory name to a short hash of the full prefix (same idea as
+                # _lora_signature) so every distinct config still maps to a distinct,
+                # stable directory, just without spelling out every flag on disk.
+                canonical = prefix
+                short_hash = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:12]
+                fp8_tag = "--fp8v3" if fp8 else ""
+                res_tag = f"--res-{resolution[0]}x{resolution[1]}" if resolution is not None else ""
+                prefix = f"{base_name}{fp8_tag}--h{short_hash}{res_tag}"
+                logger.debug(f"EngineManager: UNet cache key h{short_hash} = {canonical}")
+
+            engine_path = self.engine_dir / prefix / filename
+
+            # Belt-and-suspenders: warn (rather than silently mkdir-then-fail-on-write)
+            # if the longest artifact derived from this path would still exceed Windows'
+            # 260-char MAX_PATH — e.g. an unusually deep user-configured engine_dir.
+            # ".opt.onnx" is the longest suffix appended to engine_path (see builder.py).
+            longest_derived = len(str(engine_path)) + len(".opt.onnx")
+            if longest_derived >= 250:
+                logger.warning(
+                    f"EngineManager: engine path is {longest_derived} chars once .opt.onnx is "
+                    f"appended (Windows MAX_PATH=260). Move engine_dir closer to the drive root "
+                    f"if TensorRT export fails with FileNotFoundError: {engine_path}"
+                )
+
+            return engine_path
 
     def _get_embedding_dim_for_model_type(self, model_type: str) -> int:
         """Get embedding dimension based on model type."""
