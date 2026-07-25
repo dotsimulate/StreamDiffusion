@@ -997,14 +997,23 @@ class StreamDiffusion:
                 if hook_mid_res is not None:
                     ip_scale_kw["mid_block_additional_residual"] = hook_mid_res
 
+                # kvo_cache (StreamV2V cached-attention) is understood by both the
+                # TensorRT engine and the diffusers UNet (patched at import time via
+                # _patches/diffusers_kvo_patch.py), so it's always safe to pass. Feature
+                # injection (fio_cache/fi_strength/fi_threshold), however, is a
+                # TensorRT-engine-only capability — the patched PyTorch UNet's forward()
+                # has no such parameters and raises TypeError if passed one.
+                is_tensorrt_engine = self._check_unet_tensorrt()
+                if is_tensorrt_engine:
+                    ip_scale_kw["fio_cache"] = self.fio_cache
+                    ip_scale_kw["fi_strength"] = self._fi_strength_tensor
+                    ip_scale_kw["fi_threshold"] = self._fi_threshold_tensor
+
                 _unet_result = self.unet(
                     x_t_latent_plus_uc,
                     t_list,
                     encoder_hidden_states=self.prompt_embeds,
                     kvo_cache=self.kvo_cache,
-                    fio_cache=self.fio_cache,
-                    fi_strength=self._fi_strength_tensor,
-                    fi_threshold=self._fi_threshold_tensor,
                     return_dict=False,
                     **ip_scale_kw,
                 )
