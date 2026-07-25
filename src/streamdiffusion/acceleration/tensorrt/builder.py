@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import *
 
+import onnx
 import torch
 
 from .models.models import BaseModel
@@ -25,6 +26,29 @@ class StageStatus:
     BUILT = "built"
     CACHED = "cached"
     FAILED = "failed"
+
+
+def _onnx_cache_valid(path: str) -> bool:
+    """Check a cached source ONNX is usable before reusing it, skipping export.
+
+    A prior run killed mid-export (OOM, crash, manual kill) can leave a
+    syntactically-valid-but-empty protobuf at onnx_path. os.path.exists() alone
+    can't tell that apart from a real export, and a 0-node / opset-less graph
+    makes polygraphy's constant folding blow up downstream with an opaque
+    'NoneType' object has no attribute 'graph' (ORT symbolic shape inference
+    refuses opset < 7 and returns None). Load structure-only (no external
+    weight data) and reject anything that looks truncated.
+    """
+    try:
+        if os.path.getsize(path) == 0:
+            return False
+        model = onnx.load(path, load_external_data=False)
+        if len(model.graph.node) == 0:
+            return False
+        opset = max((o.version for o in model.opset_import), default=0)
+        return opset >= 7
+    except Exception:
+        return False
 
 
 def _write_build_stats(engine_path: str, stats: dict):
@@ -235,10 +259,16 @@ class EngineBuilder:
         _fp8_onnx_path = os.path.join(engine_dir_early, f"{artifact_prefix}.fp8.onnx")
 
         # --- ONNX Export ---
-        if not force_onnx_export and os.path.exists(onnx_path):
+        if not force_onnx_export and os.path.exists(onnx_path) and _onnx_cache_valid(onnx_path):
             print(f"Found cached model: {onnx_path}")
             stats["stages"]["onnx_export"] = {"status": "cached"}
         else:
+            if not force_onnx_export and os.path.exists(onnx_path):
+                _build_logger.warning(
+                    f"[BUILD] Cached ONNX at {onnx_path} is empty/corrupt (likely from an "
+                    f"interrupted prior export) -- discarding and re-exporting."
+                )
+                os.remove(onnx_path)
             print(f"Exporting model: {onnx_path}")
             t0 = time.perf_counter()
             _export_kwargs = {

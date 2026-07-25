@@ -203,6 +203,15 @@ class BaseModel:
     def optimize(self, onnx_graph):
         opt = Optimizer(onnx_graph, verbose=self.verbose)
         opt.info(self.name + ": original")
+        if len(opt.graph.nodes) == 0:
+            # Guards against a corrupt/truncated source ONNX (e.g. left behind by an
+            # interrupted export) slipping into fold_constants, where it would otherwise
+            # surface as an opaque polygraphy "'NoneType' object has no attribute 'graph'"
+            # once ORT shape inference bails on the missing/invalid opset.
+            raise RuntimeError(
+                f"{self.name}: input ONNX graph has 0 nodes -- the source ONNX is empty or "
+                f"corrupt. Delete the cached .onnx file for this engine and rebuild."
+            )
         opt.cleanup()
         opt.info(self.name + ": cleanup")
         opt.fold_constants()
