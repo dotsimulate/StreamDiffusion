@@ -45,10 +45,17 @@ def install(cu: Optional[Literal["11", "12"]] = get_cuda_major()):
         "install onnx==1.19.1 onnxruntime-gpu==1.24.4 onnxoptimizer==0.4.2 onnxslim==0.1.91 onnxscript==0.6.2 --no-cache-dir"
     )
 
-    # FP8 quantization dependencies (CUDA 12 only)
-    # nvidia-modelopt requires cupy; pin cupy 13.x + numpy<2 for mediapipe compat
+    # FP8 quantization dependencies (CUDA 12 only). Pin modelopt==0.43.0 and skip its [onnx] extra:
+    # an unbounded modelopt floats to 0.45.0 (force-upgrades onnx to 1.21.0 -> breaks FP8 quant), and
+    # the [onnx] extra downgrades onnxruntime-gpu off our onnx==1.19.1 / onnxruntime-gpu==1.24.4 pins
+    # (installed just above). Enumerate the extra's remaining deps; onnxslim/onnxscript (above),
+    # onnx-graphsurgeon/polygraphy (above) are already satisfied.
     if cu == "12":
-        run_pip("install nvidia-modelopt[onnx] cupy-cuda12x==13.6.0 numpy==1.26.4 --no-cache-dir")
+        run_pip(
+            "install nvidia-modelopt==0.43.0 "
+            "cppimport lief ml_dtypes onnxconverter-common~=1.16.0 "
+            "cupy-cuda12x==13.6.0 numpy==1.26.4 --no-cache-dir"
+        )
 
 
 if __name__ == "__main__":
