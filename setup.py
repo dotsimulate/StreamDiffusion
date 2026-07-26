@@ -61,6 +61,9 @@ _deps = [
     # bump, verified 2026-07-15 deps-audit
     "fire==0.7.1",
     "omegaconf==2.3.0",
+    "requests",  # hf_download.py imports this at module scope (wrapper.py imports hf_download
+    # at module scope too), already resolved transitively via huggingface_hub, declared directly
+    # now that it's on the core import path
     "onnx==1.19.1",  # IR 11; modelopt FLOAT4E2M1 (1.18+); 1.21.0 breaks FP8 quant (external-data loading → negative QDQ scale); 6 path-traversal CVEs accepted: require untrusted model loading
     "onnxruntime-gpu==1.24.4",  # TRT EP, supports IR 11; never co-install CPU onnxruntime — shared files conflict
     "onnxoptimizer==0.4.2",
@@ -110,6 +113,7 @@ extras["dev"] = extras["xformers"] + extras["torch"] + extras["tensorrt"] + extr
 install_requires = [
     deps["fire"],
     deps["omegaconf"],
+    deps["requests"],
     deps["diffusers"],
     deps["transformers"],
     deps["accelerate"],

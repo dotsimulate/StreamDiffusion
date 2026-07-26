@@ -683,20 +683,31 @@ class ControlNetModule(OrchestratorUser):
         self, model_id: str, conditioning_channels: Optional[int] = None
     ) -> ControlNetModel:
         import os
+        import traceback
         from pathlib import Path
+
+        from streamdiffusion.utils.hf_download import (
+            NETWORK_HINT,
+            is_network_error,
+            is_xet_download_error,
+            xet_disabled,
+        )
 
         logger = logging.getLogger(__name__)
 
-        try:
+        # Check if offline mode is enabled via environment variables
+        is_offline = os.environ.get("HF_HUB_OFFLINE", "0") == "1" or os.environ.get("TRANSFORMERS_OFFLINE", "0") == "1"
+
+        def _attempt(force_download: bool = False) -> ControlNetModel:
             # Prepare loading kwargs
             load_kwargs = {"torch_dtype": self.dtype}
             if conditioning_channels is not None:
                 load_kwargs["conditioning_channels"] = conditioning_channels
-
-            # Check if offline mode is enabled via environment variables
-            is_offline = (
-                os.environ.get("HF_HUB_OFFLINE", "0") == "1" or os.environ.get("TRANSFORMERS_OFFLINE", "0") == "1"
-            )
+            if force_download:
+                # A failed Xet transfer can leave a partial `.incomplete` file behind; force a
+                # clean re-download so the plain-HTTPS retry doesn't try to resume a byte offset
+                # written by a different transfer format.
+                load_kwargs["force_download"] = True
 
             if Path(model_id).exists():
                 model_path = Path(model_id)
@@ -735,16 +746,46 @@ class ControlNetModule(OrchestratorUser):
                     controlnet = ControlNetModel.from_pretrained(repo_id, subfolder=subfolder, **load_kwargs)
                 else:
                     controlnet = ControlNetModel.from_pretrained(model_id, **load_kwargs)
-            controlnet = controlnet.to(device=self.device, dtype=self.dtype)
-            # Track model_id for updater diffing
-            try:
-                controlnet.model_id = model_id
-            except Exception as e:
-                logger.debug(f"Failed to set model_id attribute on controlnet: {e}", exc_info=True)
             return controlnet
-        except Exception as e:
-            import traceback
 
-            logger.error(f"ControlNetModule: failed to load model '{model_id}': {e}")
-            logger.error(traceback.format_exc())
-            raise
+        try:
+            controlnet = _attempt()
+        except Exception as e:
+            # A HuggingFace Xet transfer-layer failure surfaces as a generic OSError that
+            # diffusers rewrites into a misleading "can't find the model" message (the real
+            # cause survives only in __cause__). Retry once over plain HTTPS instead of
+            # propagating that misleading message - self-healing for the common case where the
+            # Xet CAS endpoints are blocked (corporate proxy/firewall) but regular HTTPS works.
+            if is_offline or not is_xet_download_error(e):
+                logger.error(f"ControlNetModule: failed to load model '{model_id}': {e}")
+                logger.error(traceback.format_exc())
+                if not is_offline and is_network_error(e):
+                    raise RuntimeError(
+                        f"ControlNetModule: failed to load model '{model_id}': {e}.{NETWORK_HINT}"
+                    ) from e
+                raise
+
+            logger.warning(
+                f"ControlNetModule._load_pytorch_controlnet_model: HuggingFace Xet transfer failed for "
+                f"'{model_id}' ({e}); retrying with Xet disabled (plain HTTPS download)."
+            )
+            try:
+                with xet_disabled():
+                    controlnet = _attempt(force_download=True)
+            except Exception as retry_error:
+                logger.error(
+                    f"ControlNetModule: failed to load model '{model_id}' after Xet-disabled retry: {retry_error}"
+                )
+                logger.error(traceback.format_exc())
+                raise RuntimeError(
+                    f"ControlNetModule: failed to load model '{model_id}' after retrying without Xet: "
+                    f"{retry_error}.{NETWORK_HINT}"
+                ) from retry_error
+
+        controlnet = controlnet.to(device=self.device, dtype=self.dtype)
+        # Track model_id for updater diffing
+        try:
+            controlnet.model_id = model_id
+        except Exception as e:
+            logger.debug(f"Failed to set model_id attribute on controlnet: {e}", exc_info=True)
+        return controlnet
