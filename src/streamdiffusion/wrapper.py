@@ -15,6 +15,7 @@ from .pipeline import StreamDiffusion
 from .tools.gpu_profiler import configure as _configure_profiler
 from .tools.gpu_profiler import profiler
 from .utils.diagnostics import write_error_report as _write_error_report_util
+from .utils.hf_download import NETWORK_HINT, is_network_error
 
 logger = logging.getLogger(__name__)
 
@@ -1660,8 +1661,17 @@ class StreamDiffusionWrapper:
                     (StableDiffusionPipeline.from_single_file, "SD from_single_file"),
                     (StableDiffusionXLPipeline.from_single_file, "SDXL from_single_file"),
                 ]
+        elif not os.path.exists(model_id_or_path):
+            # A bare HuggingFace repo id (no local path, no .safetensors extension) can only be
+            # loaded via from_pretrained. from_single_file requires an actual file/URL and is
+            # structurally guaranteed to fail here — attempting it anyway just overwrites a real
+            # error (e.g. a network timeout downloading the repo) with a meaningless
+            # "Invalid pretrained_model_name_or_path".
+            loading_methods = [
+                (AutoPipelineForText2Image.from_pretrained, "AutoPipeline from_pretrained"),
+            ]
         else:
-            # For regular model directories or checkpoints, use the original order
+            # Local model directories or single-file checkpoints (e.g. .ckpt) - original order.
             loading_methods = [
                 (AutoPipelineForText2Image.from_pretrained, "AutoPipeline from_pretrained"),
                 (StableDiffusionPipeline.from_single_file, "SD from_single_file"),
@@ -1669,7 +1679,7 @@ class StreamDiffusionWrapper:
             ]
 
         pipe = None
-        last_error = None
+        load_errors = []  # (method_name, exception) for every failed attempt, in order
         for method, method_name in loading_methods:
             try:
                 logger.info(f"_load_model: Attempting to load with {method_name}...")
@@ -1682,7 +1692,18 @@ class StreamDiffusionWrapper:
                     # Try to explicitly load with SDXL pipeline instead
                     try:
                         logger.info("_load_model: Retrying with StableDiffusionXLPipeline...")
-                        pipe = StableDiffusionXLPipeline.from_single_file(model_id_or_path).to(dtype=self.dtype)
+                        # Mirror the same single-file-vs-repo-id test used to build
+                        # loading_methods above: a .safetensors suffix or an existing local
+                        # path is a real file/URL that from_single_file can handle even if it
+                        # doesn't happen to exist yet (e.g. a bad path - that should fail with
+                        # a file-not-found error, not silently be treated as a repo id). Only a
+                        # bare repo id (e.g. one that merely contains "xl") skips
+                        # from_single_file, which requires a local file/URL and would fail
+                        # structurally here.
+                        if model_id_or_path.endswith(".safetensors") or os.path.exists(model_id_or_path):
+                            pipe = StableDiffusionXLPipeline.from_single_file(model_id_or_path).to(dtype=self.dtype)
+                        else:
+                            pipe = StableDiffusionXLPipeline.from_pretrained(model_id_or_path).to(dtype=self.dtype)
                         logger.info("_load_model: Successfully loaded using SDXL pipeline on retry")
                     except Exception as retry_error:
                         # Discard the mismatched-type pipe so a subsequent loading-method
@@ -1696,20 +1717,29 @@ class StreamDiffusionWrapper:
                 break
             except Exception as e:
                 logger.warning(f"_load_model: {method_name} failed: {e}")
-                last_error = e
+                load_errors.append((method_name, e))
                 continue
 
         if pipe is None:
-            error_msg = (
-                f"_load_model: All loading methods failed for model '{model_id_or_path}'. Last error: {last_error}"
-            )
-            logger.error(error_msg)
-            if last_error:
-                logger.warning("Full traceback of last error:")
-                import traceback
+            # Prefer a network-class error when picking which one to surface: a HF download
+            # timeout/connection/Xet-transfer failure is the actual cause far more often than the
+            # structurally-guaranteed from_single_file failures on a bare repo id (see the
+            # loading_methods construction above), and burying it behind those is exactly what
+            # produced the misleading "Invalid pretrained_model_name_or_path" report.
+            chosen_name, chosen_error = load_errors[0]
+            for name, err in load_errors:
+                if is_network_error(err):
+                    chosen_name, chosen_error = name, err
+                    break
 
-                traceback.print_exc()
-            raise RuntimeError(error_msg)
+            hint = NETWORK_HINT if is_network_error(chosen_error) else ""
+            attempts_summary = "; ".join(f"{name}: {err}" for name, err in load_errors)
+            error_msg = (
+                f"_load_model: All loading methods failed for model '{model_id_or_path}'. "
+                f"Reporting error from {chosen_name}: {chosen_error}.{hint} All attempts: {attempts_summary}"
+            )
+            logger.error(error_msg, exc_info=chosen_error)
+            raise RuntimeError(error_msg) from chosen_error
         else:
             if hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
                 pipe.text_encoder = pipe.text_encoder.to(device=self.device)
