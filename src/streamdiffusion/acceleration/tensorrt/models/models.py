@@ -60,6 +60,15 @@ class Optimizer:
         # quantize), so is_fp8 is always False here for the UNet/ControlNet path. Gate on size
         # too (same >2GB threshold Optimizer.infer_shapes uses below) so the doomed ORT attempt
         # is skipped for any large graph. Small fp16/CLIP/VAE graphs keep the faster ORT path.
+        if len(self.graph.nodes) == 0:
+            # Catches a corrupt/truncated source ONNX (e.g. left behind by an interrupted
+            # export) here too -- CLIP's optimize() override (below) calls fold_constants()
+            # directly without going through BaseModel.optimize()'s equivalent guard, so that
+            # check alone doesn't cover every caller.
+            raise RuntimeError(
+                "Optimizer.fold_constants: input ONNX graph has 0 nodes -- the source ONNX is "
+                "empty or corrupt. Delete the cached .onnx file for this engine and rebuild."
+            )
         onnx_graph = gs.export_onnx(self.graph)
         is_fp8 = any(n.op in ("QuantizeLinear", "DequantizeLinear") for n in self.graph.nodes)
         is_large = onnx_graph.ByteSize() > 2147483648
