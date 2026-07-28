@@ -686,16 +686,23 @@ class StreamDiffusion:
         """Re-create tensors derived from batch_size/scheduler state but NOT rebuilt by
         StreamParameterUpdater._update_timestep_calculations.
 
-        Called by the error-fallback handler in __call__ after
-        _param_updater._update_timestep_calculations() has already refreshed
-        sub_timesteps_tensor, c_skip/c_out, alpha/beta_prod_t_sqrt.
+        Called after _param_updater._update_timestep_calculations() has already
+        refreshed sub_timesteps_tensor, c_skip/c_out, alpha/beta_prod_t_sqrt — by
+        the error-fallback handler in __call__ and by the updater's live
+        t_index_list length-change path (_recalculate_timestep_dependent_params).
         """
-        # init_noise + stock_noise — re-sampled so the fallback frame is coherent
+        # init_noise + stock_noise — re-sampled so the next frame is coherent
         self.init_noise = torch.randn(
             (self.batch_size, 4, self.latent_height, self.latent_width),
             generator=self.generator,
         ).to(device=self.device, dtype=self.dtype)
         self.stock_noise = self.init_noise.clone()
+
+        # Ping-pong buffers for the stock_noise rotation (see prepare()) — batch-sized,
+        # so any batch_size change without this rebuild leaves predict_x0_batch's
+        # copy_ failing every frame with no way to self-heal.
+        self._stock_noise_bufs = [self.stock_noise.clone(), torch.empty_like(self.stock_noise)]
+        self._stock_noise_pong = 0
 
         # Pre-computed shifted tensors (depend on alpha/beta already refreshed above)
         if self.use_denoising_batch and (self.cfg_type == "self" or self.cfg_type == "initialize"):

@@ -978,13 +978,18 @@ class StreamParameterUpdater(OrchestratorUser):
         # init_noise every frame (pipeline.py, elif after the ping-pong block) — do not
         # reintroduce logic here that assumes stock_noise persists across frames at n==1.
         # F2: Keep pre-computed shifted tensors in sync with the new alpha/beta values.
-        # _alpha_next / _beta_next / _init_noise_rotated are built only in prepare()
-        # (pipeline.py:595-605) and the error-fallback _refresh_derived_tensors().
-        # Without this sync they go stale when t_index_list is updated at runtime,
-        # causing incorrect stock_noise rotation at guidance > 1.0 (RCFG-self path,
-        # pipeline.py:979-984).  _init_noise_rotated is a rotation of init_noise which
-        # is unchanged by a t_index value-only update, so we re-derive from the live tensor
-        # rather than re-sampling (mirrors the _update_seed precedent at :749-753).
+        # _alpha_next / _beta_next / _init_noise_rotated are built in prepare()
+        # (pipeline.py:595-605) and in _refresh_derived_tensors() (called by the
+        # __call__ error fallback AND by the length-change path of
+        # _recalculate_timestep_dependent_params, which delegates its whole
+        # batch-sized rebuild there). This block covers the remaining live path:
+        # a same-length t_index VALUE update, where batch size is unchanged and
+        # only alpha/beta moved. On the length-change path it runs transiently
+        # against the old-size init_noise and is immediately overwritten by the
+        # delegate — no frame runs in between (updater holds _lock).
+        # _init_noise_rotated is a rotation of init_noise which is unchanged by a
+        # value-only update, so we re-derive from the live tensor rather than
+        # re-sampling (mirrors the _update_seed precedent at :749-753).
         if (
             self.stream.use_denoising_batch
             and (self.stream.cfg_type == "self" or self.stream.cfg_type == "initialize")
@@ -1071,13 +1076,6 @@ class StreamParameterUpdater(OrchestratorUser):
         else:
             self.stream.x_t_latent_buffer = None
 
-        self.stream.init_noise = torch.randn(
-            (self.stream.batch_size, 4, self.stream.latent_height, self.stream.latent_width),
-            generator=self.stream.generator,
-        ).to(device=self.stream.device, dtype=self.stream.dtype)
-
-        # Clone (not zeros) to match prepare()'s stock_noise semantics
-        self.stream.stock_noise = self.stream.init_noise.clone()
         self.stream.prompt_embeds = self.stream.prompt_embeds[0].repeat(self.stream.batch_size, 1, 1)
 
         # Resize kvo_cache tensors if batch size changed
@@ -1112,6 +1110,13 @@ class StreamParameterUpdater(OrchestratorUser):
 
         # Update timestep-dependent calculations (shared with value-only path)
         self._update_timestep_calculations()
+
+        # Rebuild every batch-sized derived tensor — init_noise, stock_noise, the
+        # ping-pong _stock_noise_bufs, _combined_latent_buf, _cfg_latent_buf/_cfg_t_buf,
+        # _alpha_next/_beta_next/_init_noise_rotated — through the single shared
+        # implementation (prepare() parity). Must run after
+        # _update_timestep_calculations(): it consumes the refreshed alpha/beta.
+        self.stream._refresh_derived_tensors()
 
     def _regenerate_resolution_tensors(self) -> None:
         """This method is no longer used - resolution updates now restart the pipeline"""
