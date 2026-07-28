@@ -1043,7 +1043,11 @@ class StreamDiffusion:
         if self.use_denoising_batch:
             denoised_batch = self.scheduler_step_batch(model_pred, x_t_latent, idx)
 
-            if self.cfg_type == "self" or self.cfg_type == "initialize":
+            # Residual propagation only matters when a next step exists to consume it.
+            # At denoising_steps_num == 1 the write would persist a value the n>1 design
+            # treats as a throwaway (_alpha_next/_beta_next degenerate to 1.0), and
+            # predict_x0_batch reseeds stock_noise from init_noise every frame anyway.
+            if (self.cfg_type == "self" or self.cfg_type == "initialize") and self.denoising_steps_num > 1:
                 scaled_noise = self.beta_prod_t_sqrt * self.stock_noise
                 delta_x = self.scheduler_step_batch(model_pred, scaled_noise, idx)
                 delta_x = self._alpha_next * delta_x
@@ -1140,6 +1144,14 @@ class StreamDiffusion:
                     _sn_dst[1:].copy_(self.stock_noise[:-1])
                     self.stock_noise = _sn_dst
                     self._stock_noise_pong = 1 - self._stock_noise_pong
+                elif self.cfg_type == "self" or self.cfg_type == "initialize":
+                    # denoising_steps_num == 1: no ping-pong slot exists to reseed, and the
+                    # RCFG cross-frame recurrence has growth factor |A| > 1 at typical
+                    # single-step timesteps — without this per-frame reseed stock_noise
+                    # diverges geometrically and guidance > 1 renders black (fp16 Inf→NaN).
+                    # Per paper Eq. 5, the Self-Negative residual at the first (only) step
+                    # is exactly init_noise.
+                    self.stock_noise.copy_(self.init_noise)
                 with profiler.region("unet_step"):
                     x_0_pred_batch, model_pred = self.unet_step(x_t_latent, t_list)
 

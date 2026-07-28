@@ -883,8 +883,10 @@ class StreamParameterUpdater(OrchestratorUser):
             generator=self.stream.generator,
         ).to(device=self.stream.device, dtype=self.stream.dtype)
 
-        # Reset stock_noise to match the new init_noise
-        self.stream.stock_noise = torch.zeros_like(self.stream.init_noise)
+        # Reset stock_noise to match the new init_noise (same semantics as prepare():
+        # a zeros reset makes the RCFG uncond term start from nothing instead of a
+        # coherent residual, visible as a guidance glitch right after a seed change)
+        self.stream.stock_noise = self.stream.init_noise.clone()
 
         # Keep pre-computed rotation in sync with new init_noise
         if self.stream._init_noise_rotated is not None:
@@ -972,6 +974,9 @@ class StreamParameterUpdater(OrchestratorUser):
             dim=0,
         )
 
+        # F3: At denoising_steps_num == 1 predict_x0_batch reseeds stock_noise from
+        # init_noise every frame (pipeline.py, elif after the ping-pong block) — do not
+        # reintroduce logic here that assumes stock_noise persists across frames at n==1.
         # F2: Keep pre-computed shifted tensors in sync with the new alpha/beta values.
         # _alpha_next / _beta_next / _init_noise_rotated are built only in prepare()
         # (pipeline.py:595-605) and the error-fallback _refresh_derived_tensors().
@@ -1071,7 +1076,8 @@ class StreamParameterUpdater(OrchestratorUser):
             generator=self.stream.generator,
         ).to(device=self.stream.device, dtype=self.stream.dtype)
 
-        self.stream.stock_noise = torch.zeros_like(self.stream.init_noise)
+        # Clone (not zeros) to match prepare()'s stock_noise semantics
+        self.stream.stock_noise = self.stream.init_noise.clone()
         self.stream.prompt_embeds = self.stream.prompt_embeds[0].repeat(self.stream.batch_size, 1, 1)
 
         # Resize kvo_cache tensors if batch size changed
