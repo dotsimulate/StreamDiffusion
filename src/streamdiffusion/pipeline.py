@@ -24,7 +24,11 @@ from streamdiffusion.hooks import (
 )
 from streamdiffusion.image_filter import SimilarImageFilter
 from streamdiffusion.model_detection import detect_model
-from streamdiffusion.param_schema import VALID_CFG_TYPES
+from streamdiffusion.param_schema import (
+    VALID_CFG_TYPES,
+    clamp_delta,
+    delta_noise_cancellation_ceiling,
+)
 from streamdiffusion.stream_parameter_updater import StreamParameterUpdater
 from streamdiffusion.tools.gpu_profiler import profiler
 
@@ -445,7 +449,19 @@ class StreamDiffusion:
             self.guidance_scale = 1.0
         else:
             self.guidance_scale = guidance_scale
-        self.delta = delta
+        clamped_delta, was_clamped = clamp_delta(delta)
+        if was_clamped:
+            logger.warning(
+                f"prepare: delta={delta} outside the valid R-CFG range [1.0, 5.0]; clamped to {clamped_delta}"
+            )
+        self.delta = clamped_delta
+        _ceiling = delta_noise_cancellation_ceiling(self.guidance_scale)
+        if self.delta > _ceiling:
+            logger.warning(
+                f"prepare: delta={self.delta} exceeds the noise-cancellation ceiling "
+                f"gamma/(gamma-1)={_ceiling:.2f} at guidance_scale={self.guidance_scale} — "
+                "output will re-inject noise"
+            )
 
         do_classifier_free_guidance = False
         if self.guidance_scale > 1.0:

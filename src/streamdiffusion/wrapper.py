@@ -515,6 +515,9 @@ class StreamDiffusionWrapper:
             The guidance scale to use, by default 1.2.
         delta : float, optional
             The delta multiplier of virtual residual noise, by default 1.0.
+            Valid range [1.0, 5.0] (clamped); only used by cfg_type
+            'self'/'initialize' at guidance_scale > 1. Values above
+            guidance_scale/(guidance_scale-1) re-inject noise.
         prompt_interpolation_method : Literal["linear", "slerp"], optional
             Method for interpolating between prompt embeddings (only used for prompt blending),
             by default "slerp".
@@ -738,7 +741,9 @@ class StreamDiffusionWrapper:
         guidance_scale : Optional[float]
             The guidance scale to use for CFG.
         delta : Optional[float]
-            The delta multiplier of virtual residual noise.
+            The delta multiplier of virtual residual noise. Valid range
+            [1.0, 5.0] (clamped); only used by cfg_type 'self'/'initialize'
+            at guidance_scale > 1.
         t_index_list : Optional[List[int]]
             The t_index_list to use for inference.
         seed : Optional[int]

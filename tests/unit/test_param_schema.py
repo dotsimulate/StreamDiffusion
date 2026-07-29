@@ -16,10 +16,14 @@ no tensor is ever created).
 
 import inspect
 
+import pytest
+
 from streamdiffusion.param_schema import (
     DEFAULTS,
     PARAM_NAMES,
     UPDATER_PARAM_NAMES,
+    clamp_delta,
+    delta_noise_cancellation_ceiling,
     floor_num_inference_steps,
     rescale_t_index_list,
 )
@@ -125,6 +129,45 @@ class TestFloorNumInferenceSteps:
 
     def test_boundary_one_above_max_t_index_is_fine(self):
         assert floor_num_inference_steps(46, 45) == 46
+
+
+class TestClampDelta:
+    def test_in_range_unchanged(self):
+        assert clamp_delta(1.5) == (1.5, False)
+
+    def test_below_min_clamped_to_one(self):
+        # delta < 1 over-subtracts the residual (c = gamma - (gamma-1)*delta > 1)
+        # and adds Gaussian grain — empirically confirmed in TD.
+        assert clamp_delta(0.5) == (1.0, True)
+
+    def test_negative_clamped_to_one(self):
+        assert clamp_delta(-0.1) == (1.0, True)
+
+    def test_above_max_clamped_to_max(self):
+        assert clamp_delta(6.0) == (5.0, True)
+
+    def test_boundary_min_not_clamped(self):
+        assert clamp_delta(1.0) == (1.0, False)
+
+    def test_boundary_max_not_clamped(self):
+        assert clamp_delta(5.0) == (5.0, False)
+
+
+class TestDeltaCeiling:
+    """delta_noise_cancellation_ceiling: gamma/(gamma-1) — the delta at which
+    the CFG combine's residual-noise removal coefficient c = gamma-(gamma-1)*delta
+    reaches zero; above it, inverted noise is re-injected."""
+
+    def test_gamma_1_4(self):
+        assert delta_noise_cancellation_ceiling(1.4) == pytest.approx(3.5)
+
+    def test_gamma_2_0(self):
+        assert delta_noise_cancellation_ceiling(2.0) == pytest.approx(2.0)
+
+    def test_gamma_at_or_below_one_is_unbounded(self):
+        # At gamma <= 1 the uncond term never enters the combine — no ceiling.
+        assert delta_noise_cancellation_ceiling(1.0) == float("inf")
+        assert delta_noise_cancellation_ceiling(0.5) == float("inf")
 
 
 class TestRescaleTIndexList:

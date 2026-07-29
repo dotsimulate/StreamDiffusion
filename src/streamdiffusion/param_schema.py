@@ -126,6 +126,42 @@ def floor_num_inference_steps(num_inference_steps: int, max_t_index: int) -> int
     return max(num_inference_steps, max_t_index + 1)
 
 
+# R-CFG delta bounds. The paper (2312.12491 Eq. 7) states no range for delta —
+# it is only "a magnitude moderation coefficient for the virtual residual
+# noise". The bounds below come from the combine's residual-noise-removal
+# coefficient c = gamma - (gamma-1)*delta (pipeline.unet_step):
+#   delta = 1 -> c = 1, exact cancellation (analytic optimum at
+#     denoising_steps_num == 1, where stock_noise == the injected init_noise);
+#   delta < 1 -> c > 1, over-subtraction -> additive Gaussian grain
+#     (empirically confirmed in TD — hence the hard floor);
+#   delta > 1 -> softening, useful up to gamma/(gamma-1) (see
+#     delta_noise_cancellation_ceiling); 5.0 leaves headroom for low-guidance
+#     use (gamma=1.2 -> ceiling 6.0) without letting fp16 magnitudes run away.
+DELTA_MIN: float = 1.0
+DELTA_MAX: float = 5.0
+
+
+def clamp_delta(delta: float) -> Tuple[float, bool]:
+    """Clamp ``delta`` to [DELTA_MIN, DELTA_MAX] = [1.0, 5.0]; returns
+    ``(clamped, was_clamped)``. See the DELTA_MIN/DELTA_MAX comment for the
+    derivation. Callers own their warning text.
+    """
+    clamped = min(max(delta, DELTA_MIN), DELTA_MAX)
+    return clamped, clamped != delta
+
+
+def delta_noise_cancellation_ceiling(guidance_scale: float) -> float:
+    """The delta at which the R-CFG combine's residual-noise removal
+    coefficient c = gamma - (gamma-1)*delta reaches zero: gamma/(gamma-1).
+    Above it, the combine re-injects inverted noise (degraded output, not a
+    crash). Unbounded (inf) at guidance_scale <= 1, where the uncond term
+    never enters the combine.
+    """
+    if guidance_scale <= 1.0:
+        return float("inf")
+    return guidance_scale / (guidance_scale - 1.0)
+
+
 def rescale_t_index_list(old_t_list: List[int], old_num_steps: int, new_num_steps: int) -> List[int]:
     """Proportionally rescale t_index values from an old step-count space to a
     new one, clamped to the new space's valid range.
