@@ -373,7 +373,21 @@ class StreamParameterUpdater(OrchestratorUser):
                     logger.warning(
                         "update_stream_params: Warning: guidance_scale > 1.0 with cfg_type='none' will have no effect"
                     )
+                _old_gs_gt1 = self.stream.guidance_scale > 1.0
                 self.stream.guidance_scale = guidance_scale
+                # G3: for cfg_type in (initialize, full), _cfg_latent_buf/_cfg_t_buf
+                # (pipeline.py _refresh_derived_tensors) and prompt_embeds's [uncond|cond]
+                # layout both exist only when guidance_scale > 1.0. A live crossing of that
+                # boundary left them stale (None -> TypeError in unet_step, or a shape from
+                # the old regime) until the next batch-size-changing call happened to reach
+                # _refresh_derived_tensors. Rebuild in step instead.
+                if (self.stream.guidance_scale > 1.0) != _old_gs_gt1 and self.stream.cfg_type in (
+                    "initialize",
+                    "full",
+                ):
+                    self.stream._refresh_derived_tensors()
+                    if self._current_prompt_list:
+                        self._apply_prompt_blending(self._last_prompt_interpolation_method)
 
             if delta is not None:
                 self.stream.delta = delta
@@ -581,9 +595,6 @@ class StreamParameterUpdater(OrchestratorUser):
 
         # Handle CFG properly - need to set both conditional and unconditional if using CFG
         if self.stream.cfg_type in ["full", "initialize"] and self.stream.guidance_scale > 1.0:
-            # For CFG, prompt_embeds contains [uncond, cond] concatenated
-            batch_size = self.stream.batch_size // 2 if self.stream.cfg_type == "full" else self.stream.batch_size
-
             # Get unconditional embeddings (empty prompt)
             uncond_output = self.stream.pipe.encode_prompt(
                 prompt="",
@@ -592,10 +603,26 @@ class StreamParameterUpdater(OrchestratorUser):
                 do_classifier_free_guidance=False,
                 negative_prompt=self._current_negative_prompt,
             )
-            uncond_embeds = uncond_output[0].repeat(batch_size, 1, 1)
 
-            # Combine with conditional embeddings
-            cond_embeds = combined_embeds.repeat(batch_size, 1, 1)
+            # G2 (extends the original row-[0]-repeat fix): row counts must match what
+            # prepare() built (pipeline.py's [uncond|cond] cat) and what unet_step's
+            # _cfg_latent_buf actually holds, or the encoder_hidden_states batch dim
+            # mismatches the UNet's latent batch dim.
+            if self.stream.cfg_type == "initialize":
+                # prepare() shares ONE uncond block per frame_bff_size slot (:518) —
+                # _cfg_latent_buf is (frame_bff_size + batch_size) rows (pipeline.py
+                # :902-908), not 2*batch_size. Previously this branch repeated uncond
+                # by the full batch_size, silently wrong for denoising_steps_num > 1
+                # (only masked at n==1, where frame_bff_size == batch_size).
+                uncond_embeds = uncond_output[0].repeat(self.stream.frame_bff_size, 1, 1)
+                cond_embeds = combined_embeds.repeat(self.stream.batch_size, 1, 1)
+            else:
+                # "full" (G5 — not fixed): reproduces the existing baseline batch_size//2
+                # + batch_size//2 shape verbatim, not the 2*batch_size unet_step expects.
+                half = self.stream.batch_size // 2
+                uncond_embeds = uncond_output[0].repeat(half, 1, 1)
+                cond_embeds = combined_embeds.repeat(half, 1, 1)
+
             final_prompt_embeds = torch.cat([uncond_embeds, cond_embeds], dim=0)
             final_negative_embeds = None  # CFG mode combines everything into prompt_embeds
         else:
@@ -1029,11 +1056,50 @@ class StreamParameterUpdater(OrchestratorUser):
                     _BLEED_THRESHOLD,
                 )
 
+        # G1: _sub_timesteps_expanded (pipeline.py's precomputed per-step timestep
+        # table for the TCD / non-batched sequential loop) derives from
+        # sub_timesteps_tensor, just refreshed above, but was previously rebuilt
+        # only in prepare() — a live t_index_list VALUE change (same length, the
+        # _update_timestep_values_only path below, which calls this method and
+        # returns without ever reaching _refresh_derived_tensors()) left it
+        # silently stale. This method is the one funnel shared by that path, the
+        # length-changed path, and __call__'s error fallback, so rebuilding here
+        # covers all three; the length-changed path's separate call inside
+        # _refresh_derived_tensors() (a few lines below its own call to this
+        # method) makes this redundant there but idempotent, not harmful.
+        self.stream._rebuild_sub_timesteps_expanded()
+
     def _update_timestep_values_only(self, t_index_list: List[int]) -> None:
         """Update only timestep-dependent values when t_index_list values change but length stays same.
         This preserves the working branch behavior for value-only changes."""
         self.stream.t_list = t_index_list
         self._update_timestep_calculations()
+
+    def _resize_cache_tensors(self, cache_list: List[torch.Tensor], old_b: int, new_b: int, batch_dim: int) -> None:
+        """Resize every tensor in ``cache_list`` in place along ``batch_dim`` to
+        ``new_b``, zero-padding on growth and truncating on shrink while preserving
+        as much of the old cached content as possible.
+
+        Shared by the kvo_cache and fio_cache resize paths (G7/G8), which have
+        different tensor ranks and batch-dimension positions — ``batch_dim`` is
+        NOT cosmetic. Per-layer shapes (see create_kvo_cache / create_fi_cache in
+        acceleration/tensorrt/models/utils.py):
+          - kvo_cache: (2, cache_maxframes, batch_size, seq_len, hidden_dim) — 5-D,
+            the leading 2 is K+V; batch at dim 2.
+          - fio_cache: (cache_maxframes, batch_size, seq_len, hidden_dim) — 4-D,
+            output only, no K/V dim; batch at dim 1.
+        Reusing one cache's hardcoded slicing on the other's rank would resize the
+        wrong axis (or index out of range).
+        """
+        min_batch = min(old_b, new_b)
+        for i, cache_tensor in enumerate(cache_list):
+            new_shape = list(cache_tensor.shape)
+            new_shape[batch_dim] = new_b
+            new_cache_tensor = torch.zeros(tuple(new_shape), dtype=cache_tensor.dtype, device=cache_tensor.device)
+            old_slice = [slice(None)] * cache_tensor.dim()
+            old_slice[batch_dim] = slice(0, min_batch)
+            new_cache_tensor[tuple(old_slice)] = cache_tensor[tuple(old_slice)]
+            cache_list[i] = new_cache_tensor
 
     def _recalculate_timestep_dependent_params(self, t_index_list: List[int]) -> None:
         """Recalculate all parameters that depend on t_index_list."""
@@ -1048,7 +1114,11 @@ class StreamParameterUpdater(OrchestratorUser):
         self.stream.t_list = t_index_list
         self.stream.denoising_steps_num = len(self.stream.t_list)
 
-        old_batch_size = self.stream.batch_size
+        # G7/G8: the caches are allocated against trt_unet_batch_size (wrapper.py's
+        # create_kvo_cache/create_fi_cache), which differs from batch_size exactly when
+        # cfg_type is "initialize" ((n+1)*f) or "full" (2*n*f) — track it separately so
+        # the resize below is driven by what was actually allocated.
+        old_trt_batch_size = self.stream.trt_unet_batch_size
 
         if self.stream.use_denoising_batch:
             self.stream.batch_size = self.stream.denoising_steps_num * self.stream.frame_bff_size
@@ -1076,37 +1146,57 @@ class StreamParameterUpdater(OrchestratorUser):
         else:
             self.stream.x_t_latent_buffer = None
 
-        self.stream.prompt_embeds = self.stream.prompt_embeds[0].repeat(self.stream.batch_size, 1, 1)
+        # G2: row [0] is the *uncond* row for cfg_type in (initialize, full) — see
+        # prepare()'s [uncond|cond] cat — so repeating it silently turned every row
+        # into uncond (wrong content, and for "full" also the wrong count vs. the
+        # 2*batch_size UNet expects). Re-run the one function that already knows
+        # every cfg layout instead of hand-rolling the shape here; it reads from
+        # _prompt_cache so the positive prompt is not re-encoded. Falls back to the
+        # old row-0 repeat only when there's no cached prompt yet to re-blend from.
+        if self._current_prompt_list:
+            self._apply_prompt_blending(self._last_prompt_interpolation_method)
+        else:
+            self.stream.prompt_embeds = self.stream.prompt_embeds[0].repeat(self.stream.batch_size, 1, 1)
 
-        # Resize kvo_cache tensors if batch size changed
-        if self.stream.kvo_cache and old_batch_size != self.stream.batch_size:
-            logger.info(
-                f"_recalculate_timestep_dependent_params: Resizing kvo_cache tensors from batch_size {old_batch_size} to {self.stream.batch_size}"
-            )
-            for i, cache_tensor in enumerate(self.stream.kvo_cache):
-                # KVO cache shape: (2, cache_maxframes, batch_size, seq_length, hidden_dim)
-                current_shape = cache_tensor.shape
-                new_shape = (
-                    current_shape[0],
-                    current_shape[1],
-                    self.stream.batch_size,
-                    current_shape[3],
-                    current_shape[4],
+        # G7/G8: resize kvo_cache / fio_cache if the TensorRT UNet batch size changed.
+        # Driven by trt_unet_batch_size (what wrapper.py's create_kvo_cache/create_fi_cache
+        # actually allocated with), NOT batch_size — the two differ exactly when cfg_type
+        # is "initialize" or "full" (see old_trt_batch_size comment above). Previously only
+        # kvo_cache was resized, keyed on batch_size, and fio_cache was never touched at
+        # all — stale on every live t_index change, including the shipped cfg_type="self"
+        # path.
+        if old_trt_batch_size != self.stream.trt_unet_batch_size:
+            if self.stream.kvo_cache:
+                logger.info(
+                    "_recalculate_timestep_dependent_params: Resizing kvo_cache tensors from "
+                    f"trt_unet_batch_size {old_trt_batch_size} to {self.stream.trt_unet_batch_size}"
                 )
-                new_cache_tensor = torch.zeros(new_shape, dtype=cache_tensor.dtype, device=cache_tensor.device)
-
-                # Copy over as much data as possible from old cache
-                min_batch = min(old_batch_size, self.stream.batch_size)
-                new_cache_tensor[:, :, :min_batch, :, :] = cache_tensor[:, :, :min_batch, :, :]
-
-                self.stream.kvo_cache[i] = new_cache_tensor
-            # Drop bucketed storage refs so update_kvo_cache falls back to
-            # per-layer writes against the new tensors.
-            self.stream._kvo_buckets = None
-            self.stream._kvo_outputs_by_bucket = None
-            logger.info(
-                f"_recalculate_timestep_dependent_params: KVO cache tensors resized to new batch_size {self.stream.batch_size}"
-            )
+                self._resize_cache_tensors(
+                    self.stream.kvo_cache, old_trt_batch_size, self.stream.trt_unet_batch_size, batch_dim=2
+                )
+                # Drop bucketed storage refs so update_kvo_cache falls back to per-layer
+                # writes against the new tensors. fio_cache has no equivalent bucket
+                # storage — wrapper.py discards create_fi_cache's bucket returns at
+                # allocation (fio_cache, _, _, _ = create_fi_cache(...)) — so no
+                # invalidation is needed there.
+                self.stream._kvo_buckets = None
+                self.stream._kvo_outputs_by_bucket = None
+                logger.info(
+                    "_recalculate_timestep_dependent_params: KVO cache tensors resized to new "
+                    f"trt_unet_batch_size {self.stream.trt_unet_batch_size}"
+                )
+            if self.stream.fio_cache:
+                logger.info(
+                    "_recalculate_timestep_dependent_params: Resizing fio_cache tensors from "
+                    f"trt_unet_batch_size {old_trt_batch_size} to {self.stream.trt_unet_batch_size}"
+                )
+                self._resize_cache_tensors(
+                    self.stream.fio_cache, old_trt_batch_size, self.stream.trt_unet_batch_size, batch_dim=1
+                )
+                logger.info(
+                    "_recalculate_timestep_dependent_params: fio_cache tensors resized to new "
+                    f"trt_unet_batch_size {self.stream.trt_unet_batch_size}"
+                )
 
         # Update timestep-dependent calculations (shared with value-only path)
         self._update_timestep_calculations()

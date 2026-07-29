@@ -37,6 +37,12 @@ from typing import Any, Dict, List, Literal, Tuple
 PromptInterpolationMethod = Literal["linear", "slerp", "cosine_weighted"]
 SeedInterpolationMethod = Literal["linear", "slerp"]
 
+# The four cfg_type values StreamDiffusion.__init__ accepts (pipeline.py's single
+# assignment choke point, :85). cfg_type is construction-time only — it is not in
+# PARAM_NAMES/UPDATER_PARAM_NAMES, so there is no live-update validation path to
+# also guard; this constant is consumed once, at __init__.
+VALID_CFG_TYPES: Tuple[str, ...] = ("none", "full", "self", "initialize")
+
 
 @dataclass(frozen=True)
 class ParamSpec:

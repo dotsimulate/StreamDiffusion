@@ -62,6 +62,17 @@ def _make_stream(
     stream.batch_size = batch_size
     stream.cfg_type = cfg_type
     stream.use_denoising_batch = True
+    # G7/G8: _recalculate_timestep_dependent_params reads trt_unet_batch_size
+    # unconditionally (it differs from batch_size for "initialize"/"full" --
+    # see pipeline.py's __init__ formula, :113-118) -- the object.__new__ stub
+    # must set it too, or the resize path raises AttributeError before ever
+    # reaching the buffer-rebuild logic downstream tests exercise.
+    if cfg_type == "initialize":
+        stream.trt_unet_batch_size = (n + 1) * frame_bff_size
+    elif cfg_type == "full":
+        stream.trt_unet_batch_size = 2 * n * frame_bff_size
+    else:
+        stream.trt_unet_batch_size = n * frame_bff_size
     stream.guidance_scale = guidance_scale
     stream.delta = delta
     stream.do_add_noise = True

@@ -66,6 +66,12 @@ def _make_updater(stream):
     updater = object.__new__(StreamParameterUpdater)
     updater.stream = stream
     updater._lock = __import__("threading").Lock()
+    # G2/G3 (_recalculate_timestep_dependent_params, update_stream_params) read
+    # these unconditionally -- real __init__ always sets them; the object.__new__
+    # stub must too, or the resize path raises AttributeError before it ever
+    # reaches the buffer-rebuild logic this file actually tests.
+    updater._current_prompt_list = []
+    updater._last_prompt_interpolation_method = "linear"
     return updater
 
 
