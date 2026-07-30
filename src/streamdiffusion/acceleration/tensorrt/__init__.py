@@ -136,6 +136,7 @@ def compile_unet(
     calibration_prompts = build_options.pop("calibration_prompts", None)
     calibration_steps = build_options.pop("calibration_steps", 20)
     fp8_allow_fp16_fallback = build_options.pop("fp8_allow_fp16_fallback", False)
+    fp8_mha_qdq = build_options.pop("fp8_mha_qdq", False)
     fp8_use_cached_attn = build_options.pop("fp8_use_cached_attn", False)
     fp8_use_feature_injection = build_options.pop("fp8_use_feature_injection", False)
     fp8_use_controlnet = build_options.pop("fp8_use_controlnet", False)
@@ -162,6 +163,7 @@ def compile_unet(
         calibration_prompts=calibration_prompts,
         calibration_steps=calibration_steps,
         fp8_allow_fp16_fallback=fp8_allow_fp16_fallback,
+        fp8_mha_qdq=fp8_mha_qdq,
         fp8_use_cached_attn=fp8_use_cached_attn,
         fp8_use_feature_injection=fp8_use_feature_injection,
         fp8_use_controlnet=fp8_use_controlnet,

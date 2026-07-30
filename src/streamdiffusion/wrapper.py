@@ -150,6 +150,9 @@ class StreamDiffusionWrapper:
         fp8: bool = False,
         static_shapes: bool = False,
         fp8_allow_fp16_fallback: bool = False,
+        # Experimental: include attention BMM1/BMM2 in FP8 Q/DQ (modelopt disable_mha_qdq=False).
+        # Forks the engine cache tag to --fp8v3-mhaq; default False keeps production identity.
+        fp8_mha_qdq: bool = False,
         builder_optimization_level: Optional[int] = None,
         # CUDA IPC output (SD→TD zero-copy GPU transport via cuda-link)
         use_cuda_ipc_output: bool = False,
@@ -396,6 +399,7 @@ class StreamDiffusionWrapper:
         self.fp8 = fp8
         self.static_shapes = static_shapes
         self.fp8_allow_fp16_fallback = fp8_allow_fp16_fallback
+        self.fp8_mha_qdq = fp8_mha_qdq
         self.builder_optimization_level = builder_optimization_level
         # Per-engine VAE optlvl (None → inherit builder_optimization_level).
         # Tiny-VAE engines are small and gain little from optlvl 4 — defaulting to
@@ -2103,6 +2107,7 @@ class StreamDiffusionWrapper:
                     use_feature_injection=use_feature_injection,
                     use_controlnet=use_controlnet_trt,
                     fp8=fp8,
+                    fp8_mha_qdq=self.fp8_mha_qdq,
                     resolution=(self.height, self.width),
                     builder_optimization_level=self.builder_optimization_level,
                     # Must match the build_static_batch value in _unet_build_opts below so
@@ -2500,7 +2505,7 @@ class StreamDiffusionWrapper:
                     # speed). Resolution is always fixed (build_dynamic_shape=False) —
                     # the engine dir name carries --res-WxH either way.
                     logger.warning(
-                        f"[TRT] UNet engine: fp8={fp8}, "
+                        f"[TRT] UNet engine: fp8={fp8}, fp8_mha_qdq={self.fp8_mha_qdq}, "
                         f"build_static_batch={self.static_shapes}, build_dynamic_shape=False, "
                         f"batch={stream.trt_unet_batch_size}, engine_path={unet_path}"
                     )
@@ -2523,6 +2528,7 @@ class StreamDiffusionWrapper:
                         _unet_build_opts["calibration_steps"] = 4 if _is_turbo else 20
                         _unet_build_opts["fp8_guidance_scale"] = 0.0 if _is_turbo else 7.5
                         _unet_build_opts["fp8_allow_fp16_fallback"] = self.fp8_allow_fp16_fallback
+                        _unet_build_opts["fp8_mha_qdq"] = self.fp8_mha_qdq
                         _unet_build_opts["fp8_use_cached_attn"] = use_cached_attn
                         _unet_build_opts["fp8_use_feature_injection"] = use_feature_injection
                         _unet_build_opts["fp8_use_controlnet"] = use_controlnet_trt

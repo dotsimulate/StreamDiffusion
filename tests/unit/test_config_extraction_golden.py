@@ -51,6 +51,7 @@ EXPECTED_WRAPPER_PARAMS = {
     "vae_builder_optimization_level": 3,
     "build_engines_if_missing": True,
     "fp8_allow_fp16_fallback": False,
+    "fp8_mha_qdq": False,
     "use_controlnet": False,
     "use_ipadapter": False,
     "use_cached_attn": False,

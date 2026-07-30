@@ -142,6 +142,7 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
         "vae_builder_optimization_level": config.get("vae_builder_optimization_level", 3),
         "build_engines_if_missing": config.get("build_engines_if_missing", True),
         "fp8_allow_fp16_fallback": config.get("fp8_allow_fp16_fallback", False),
+        "fp8_mha_qdq": config.get("fp8_mha_qdq", False),
     }
     if config.get("controlnets"):
         param_map["use_controlnet"] = True
