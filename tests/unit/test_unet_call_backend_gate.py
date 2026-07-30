@@ -112,6 +112,7 @@ def _make_pipeline(unet, *, prompt_tokens: int = 4) -> StreamDiffusion:
 
     sd.guidance_scale = 1.0  # skip CFG latent-doubling branch entirely
     sd.cfg_type = "none"
+    sd.denoising_steps_num = 1  # read by the RCFG recurrence gate in unet_step
 
     sd.prompt_embeds = torch.randn(1, prompt_tokens, 8)
     sd.kvo_cache: List[torch.Tensor] = []
@@ -161,8 +162,7 @@ class TestSd15Sd21UnetCallBackendGate:
         assert "kvo_cache" in recording_unet.last_kwargs
         for key in ("fio_cache", "fi_strength", "fi_threshold"):
             assert key not in recording_unet.last_kwargs, (
-                f"non-TRT UNet call must not receive {key!r}; got kwargs="
-                f"{sorted(recording_unet.last_kwargs)}"
+                f"non-TRT UNet call must not receive {key!r}; got kwargs={sorted(recording_unet.last_kwargs)}"
             )
 
     def test_tensorrt_engine_still_receives_feature_injection_kwargs(self):
@@ -176,6 +176,5 @@ class TestSd15Sd21UnetCallBackendGate:
 
         for key in ("kvo_cache", "fio_cache", "fi_strength", "fi_threshold"):
             assert key in fake_engine.last_kwargs, (
-                f"TRT engine call must still receive {key!r}; got kwargs="
-                f"{sorted(fake_engine.last_kwargs)}"
+                f"TRT engine call must still receive {key!r}; got kwargs={sorted(fake_engine.last_kwargs)}"
             )

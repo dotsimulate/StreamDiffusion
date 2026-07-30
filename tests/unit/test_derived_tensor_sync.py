@@ -80,6 +80,12 @@ def _make_stream_shell(
     stream.t_list = t_index_list
     stream.sub_timesteps = [int(timesteps_raw[i]) for i in t_index_list]
     stream.sub_timesteps_tensor = torch.tensor(stream.sub_timesteps, dtype=torch.long)
+    # G1: _update_timestep_calculations() now unconditionally calls
+    # stream._rebuild_sub_timesteps_expanded() (see test_sub_timesteps_expanded_refresh.py).
+    # This shell is a bare SimpleNamespace, not a real StreamDiffusion, and this
+    # file doesn't exercise that table -- stub it out rather than reimplementing
+    # pipeline.py's logic here.
+    stream._rebuild_sub_timesteps_expanded = lambda: None
 
     # Build initial alpha/beta matching the logic in _update_timestep_calculations
     a_list, b_list = [], []

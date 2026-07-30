@@ -24,6 +24,11 @@ from streamdiffusion.hooks import (
 )
 from streamdiffusion.image_filter import SimilarImageFilter
 from streamdiffusion.model_detection import detect_model
+from streamdiffusion.param_schema import (
+    VALID_CFG_TYPES,
+    clamp_delta,
+    delta_noise_cancellation_ceiling,
+)
 from streamdiffusion.stream_parameter_updater import StreamParameterUpdater
 from streamdiffusion.tools.gpu_profiler import profiler
 
@@ -81,6 +86,12 @@ class StreamDiffusion:
         self.frame_bff_size = frame_buffer_size
         self.denoising_steps_num = len(t_index_list)
 
+        # G6: cfg_type is Literal-hinted but that's not enforced at runtime — a typo
+        # previously behaved like "none" until the guidance combine, then raised an
+        # opaque UnboundLocalError. Validate here, the one choke point every
+        # construction path (direct + wrapper.py) flows through.
+        if cfg_type not in VALID_CFG_TYPES:
+            raise ValueError(f"cfg_type must be one of {VALID_CFG_TYPES}, got {cfg_type!r}")
         self.cfg_type = cfg_type
         self.scheduler_type = scheduler
         self.sampler_type = sampler
@@ -438,11 +449,36 @@ class StreamDiffusion:
             self.guidance_scale = 1.0
         else:
             self.guidance_scale = guidance_scale
-        self.delta = delta
+        clamped_delta, was_clamped = clamp_delta(delta)
+        if was_clamped:
+            logger.warning(
+                f"prepare: delta={delta} outside the valid R-CFG range [1.0, 5.0]; clamped to {clamped_delta}"
+            )
+        self.delta = clamped_delta
+        _ceiling = delta_noise_cancellation_ceiling(self.guidance_scale)
+        if self.delta > _ceiling:
+            logger.warning(
+                f"prepare: delta={self.delta} exceeds the noise-cancellation ceiling "
+                f"gamma/(gamma-1)={_ceiling:.2f} at guidance_scale={self.guidance_scale} — "
+                "output will re-inject noise"
+            )
 
         do_classifier_free_guidance = False
         if self.guidance_scale > 1.0:
             do_classifier_free_guidance = True
+
+        # G5 (not fixed — see plan): cfg_type="full" has been broken at baseline since
+        # _apply_prompt_blending's live-update path builds batch_size//2 uncond+cond rows
+        # (stream_parameter_updater.py, batch_size == frame_bff_size collapses that to 0
+        # at denoising_steps_num == 1) while unet_step doubles the latent to 2*batch_size.
+        # No shipped config uses cfg_type="full", so this has never been observed in
+        # practice. Warn loudly rather than silently producing garbage/shape-error output.
+        if self.cfg_type == "full" and self.guidance_scale > 1.0:
+            logger.warning(
+                "prepare: cfg_type='full' is known-broken (embeds row count vs. UNet batch "
+                "mismatch after the first prompt update) — not repaired by this change; "
+                "use cfg_type='self' or 'initialize' instead."
+            )
 
         # Handle SDXL vs SD1.5/SD2.1 text encoding differently
         if self.is_sdxl:
@@ -473,12 +509,26 @@ class StreamDiffusion:
                 base_prompt_embeds = prompt_embeds.repeat(self.batch_size, 1, 1)
 
                 # Handle CFG for prompt embeddings
+                # G4: uncond_prompt_embeds is only assigned under specific
+                # use_denoising_batch/cfg_type combos but consumed unconditionally below
+                # whenever guidance_scale>1 and cfg_type is initialize/full. TCD forces
+                # use_denoising_batch=False, so {scheduler: tcd, cfg_type: full} left this
+                # unbound. Initialize it and turn the unreachable-combo case into a legible
+                # error instead of UnboundLocalError.
+                uncond_prompt_embeds = None
                 if self.use_denoising_batch and self.cfg_type == "full":
                     uncond_prompt_embeds = negative_prompt_embeds.repeat(self.batch_size, 1, 1)
                 elif self.cfg_type == "initialize":
                     uncond_prompt_embeds = negative_prompt_embeds.repeat(self.frame_bff_size, 1, 1)
 
                 if self.guidance_scale > 1.0 and (self.cfg_type == "initialize" or self.cfg_type == "full"):
+                    if uncond_prompt_embeds is None:
+                        raise ValueError(
+                            f"prepare: cfg_type={self.cfg_type!r} with guidance_scale>1.0 requires "
+                            f"use_denoising_batch=True (got {self.use_denoising_batch}); cfg_type='full' "
+                            "is not supported with use_denoising_batch=False (e.g. the TCD scheduler, "
+                            "which forces it off)."
+                        )
                     base_prompt_embeds = torch.cat([uncond_prompt_embeds, base_prompt_embeds], dim=0)
 
                 # Set up SDXL-specific conditioning (added_cond_kwargs)
@@ -521,12 +571,21 @@ class StreamDiffusion:
             )
             base_prompt_embeds = encoder_output[0].repeat(self.batch_size, 1, 1)
 
+            # G4 (see the SDXL branch above for the full explanation).
+            uncond_prompt_embeds = None
             if self.use_denoising_batch and self.cfg_type == "full":
                 uncond_prompt_embeds = encoder_output[1].repeat(self.batch_size, 1, 1)
             elif self.cfg_type == "initialize":
                 uncond_prompt_embeds = encoder_output[1].repeat(self.frame_bff_size, 1, 1)
 
             if self.guidance_scale > 1.0 and (self.cfg_type == "initialize" or self.cfg_type == "full"):
+                if uncond_prompt_embeds is None:
+                    raise ValueError(
+                        f"prepare: cfg_type={self.cfg_type!r} with guidance_scale>1.0 requires "
+                        f"use_denoising_batch=True (got {self.use_denoising_batch}); cfg_type='full' "
+                        "is not supported with use_denoising_batch=False (e.g. the TCD scheduler, "
+                        "which forces it off)."
+                    )
                 base_prompt_embeds = torch.cat([uncond_prompt_embeds, base_prompt_embeds], dim=0)
 
             # Run embedding hooks (no-op unless modules register)
@@ -631,16 +690,8 @@ class StreamDiffusion:
         self.c_skip = self.c_skip.to(self.device)
         self.c_out = self.c_out.to(self.device)
 
-        # Precompute per-step expanded timestep tensors for the TCD / non-batched sequential loop.
-        # Avoids per-step t.view(1).repeat(frame_bff_size) tensor allocations inside predict_x0_batch.
-        # Only valid when sub_timesteps_tensor is a 1-D sequence (not the collapsed-scalar LCM path).
-        _use_seq_loop = not (self.use_denoising_batch and isinstance(self.scheduler, LCMScheduler))
-        if _use_seq_loop and self.sub_timesteps_tensor.dim() >= 1:
-            self._sub_timesteps_expanded = (
-                self.sub_timesteps_tensor.view(-1).unsqueeze(1).expand(-1, self.frame_bff_size).contiguous()
-            )  # shape [loop_steps, frame_bff_size]
-        else:
-            self._sub_timesteps_expanded = None
+        # Precompute per-step expanded timestep tensors for the TCD / non-batched sequential loop (G1).
+        self._rebuild_sub_timesteps_expanded()
 
         # Pre-compute shifted alpha/beta/init_noise (eliminates 5 mallocs + 8 kernel launches per frame)
         if self.use_denoising_batch and (self.cfg_type == "self" or self.cfg_type == "initialize"):
@@ -682,20 +733,51 @@ class StreamDiffusion:
         # Seed _unet_kwargs with the constant key so per-frame code only updates values
         self._unet_kwargs = {"return_dict": False}
 
+    def _rebuild_sub_timesteps_expanded(self) -> None:
+        """(Re)build the per-step expanded timestep table consumed by the TCD /
+        non-batched sequential loop in predict_x0_batch. Avoids per-step
+        t.view(1).repeat(frame_bff_size) tensor allocations. Only valid when
+        sub_timesteps_tensor is a 1-D sequence (not the collapsed-scalar LCM path).
+
+        Called from prepare() and from _refresh_derived_tensors() (G1) — a live
+        t_index_list length change previously left this table at its old length,
+        raising IndexError on the sequential path (predict_x0_batch indexes it by
+        loop position) rather than the RuntimeError __call__'s fallback catches.
+        Idempotent, so the extra call from that fallback is harmless.
+        """
+        _use_seq_loop = not (self.use_denoising_batch and isinstance(self.scheduler, LCMScheduler))
+        if _use_seq_loop and self.sub_timesteps_tensor.dim() >= 1:
+            self._sub_timesteps_expanded = (
+                self.sub_timesteps_tensor.view(-1).unsqueeze(1).expand(-1, self.frame_bff_size).contiguous()
+            )  # shape [loop_steps, frame_bff_size]
+        else:
+            self._sub_timesteps_expanded = None
+
     def _refresh_derived_tensors(self) -> None:
         """Re-create tensors derived from batch_size/scheduler state but NOT rebuilt by
         StreamParameterUpdater._update_timestep_calculations.
 
-        Called by the error-fallback handler in __call__ after
-        _param_updater._update_timestep_calculations() has already refreshed
-        sub_timesteps_tensor, c_skip/c_out, alpha/beta_prod_t_sqrt.
+        Called after _param_updater._update_timestep_calculations() has already
+        refreshed sub_timesteps_tensor, c_skip/c_out, alpha/beta_prod_t_sqrt — by
+        the error-fallback handler in __call__ and by the updater's live
+        t_index_list length-change path (_recalculate_timestep_dependent_params).
         """
-        # init_noise + stock_noise — re-sampled so the fallback frame is coherent
+        # G1: keep the sequential-loop timestep table in sync with the just-refreshed
+        # sub_timesteps_tensor (its own length may have just changed).
+        self._rebuild_sub_timesteps_expanded()
+
+        # init_noise + stock_noise — re-sampled so the next frame is coherent
         self.init_noise = torch.randn(
             (self.batch_size, 4, self.latent_height, self.latent_width),
             generator=self.generator,
         ).to(device=self.device, dtype=self.dtype)
         self.stock_noise = self.init_noise.clone()
+
+        # Ping-pong buffers for the stock_noise rotation (see prepare()) — batch-sized,
+        # so any batch_size change without this rebuild leaves predict_x0_batch's
+        # copy_ failing every frame with no way to self-heal.
+        self._stock_noise_bufs = [self.stock_noise.clone(), torch.empty_like(self.stock_noise)]
+        self._stock_noise_pong = 0
 
         # Pre-computed shifted tensors (depend on alpha/beta already refreshed above)
         if self.use_denoising_batch and (self.cfg_type == "self" or self.cfg_type == "initialize"):
@@ -1043,7 +1125,11 @@ class StreamDiffusion:
         if self.use_denoising_batch:
             denoised_batch = self.scheduler_step_batch(model_pred, x_t_latent, idx)
 
-            if self.cfg_type == "self" or self.cfg_type == "initialize":
+            # Residual propagation only matters when a next step exists to consume it.
+            # At denoising_steps_num == 1 the write would persist a value the n>1 design
+            # treats as a throwaway (_alpha_next/_beta_next degenerate to 1.0), and
+            # predict_x0_batch reseeds stock_noise from init_noise every frame anyway.
+            if (self.cfg_type == "self" or self.cfg_type == "initialize") and self.denoising_steps_num > 1:
                 scaled_noise = self.beta_prod_t_sqrt * self.stock_noise
                 delta_x = self.scheduler_step_batch(model_pred, scaled_noise, idx)
                 delta_x = self._alpha_next * delta_x
@@ -1145,6 +1231,14 @@ class StreamDiffusion:
                     _sn_dst[1:].copy_(self.stock_noise[:-1])
                     self.stock_noise = _sn_dst
                     self._stock_noise_pong = 1 - self._stock_noise_pong
+                elif self.cfg_type == "self" or self.cfg_type == "initialize":
+                    # denoising_steps_num == 1: no ping-pong slot exists to reseed, and the
+                    # RCFG cross-frame recurrence has growth factor |A| > 1 at typical
+                    # single-step timesteps — without this per-frame reseed stock_noise
+                    # diverges geometrically and guidance > 1 renders black (fp16 Inf→NaN).
+                    # Per paper Eq. 5, the Self-Negative residual at the first (only) step
+                    # is exactly init_noise.
+                    self.stock_noise.copy_(self.init_noise)
                 with profiler.region("unet_step"):
                     x_0_pred_batch, model_pred = self.unet_step(x_t_latent, t_list)
 

@@ -30,7 +30,7 @@ seed: 789
 
 # Temporal consistency and optimization
 frame_buffer_size: 1
-delta: 0.7
+delta: 1.0
 use_denoising_batch: true
 # LoRA configuration - use lora_dict to load LCM LoRA and other LoRAs
 lora_dict:
