@@ -1097,6 +1097,16 @@ class StreamDiffusionWrapper:
         else:
             return postprocess_image(image_tensor.cpu(), output_type=output_type)[0]
 
+    @staticmethod
+    def _pack_bgra(rgb_hwc: torch.Tensor, dst_bgra: torch.Tensor) -> None:
+        """Write the BGR channels of an HWC RGB uint8 tensor into dst_bgra[..., :3].
+
+        flip(-1) reverses the 3-wide channel axis (RGB→BGR) in a single fused
+        kernel instead of three per-channel copies; the alpha channel of dst_bgra
+        is left untouched (set once at buffer allocation).
+        """
+        dst_bgra[..., :3] = rgb_hwc.flip(-1)
+
     def _ipc_pack_rgba(self, image_tensor: torch.Tensor) -> torch.Tensor:
         """Convert pipeline output to HWC uint8 BGRA on GPU for cuda-link wire contract.
 
@@ -1123,9 +1133,7 @@ class StreamDiffusionWrapper:
             ):
                 self._ipc_pack_buf = torch.empty((h, w, 4), dtype=torch.uint8, device=rgb_hwc.device)
                 self._ipc_pack_buf[..., 3] = 255  # constant alpha, set once at (re)allocation
-            self._ipc_pack_buf[..., 0] = rgb_hwc[..., 2]  # B
-            self._ipc_pack_buf[..., 1] = rgb_hwc[..., 1]  # G
-            self._ipc_pack_buf[..., 2] = rgb_hwc[..., 0]  # R
+            self._pack_bgra(rgb_hwc, self._ipc_pack_buf)
             return self._ipc_pack_buf
 
     def _lazy_init_ipc_exporter(self, height: int, width: int):
@@ -1183,9 +1191,7 @@ class StreamDiffusionWrapper:
             ):
                 self._ipc_pack_unit_buf = torch.empty((h, w, 4), dtype=torch.uint8, device=rgb_hwc.device)
                 self._ipc_pack_unit_buf[..., 3] = 255  # constant alpha, set once at (re)allocation
-            self._ipc_pack_unit_buf[..., 0] = rgb_hwc[..., 2]  # B
-            self._ipc_pack_unit_buf[..., 1] = rgb_hwc[..., 1]  # G
-            self._ipc_pack_unit_buf[..., 2] = rgb_hwc[..., 0]  # R
+            self._pack_bgra(rgb_hwc, self._ipc_pack_unit_buf)
             return self._ipc_pack_unit_buf
 
     def _lazy_init_cn_ipc_exporter(self, height: int, width: int):
