@@ -58,6 +58,7 @@ EXPECTED_WRAPPER_PARAMS = {
     "cache_maxframes": 1,
     "cache_interval": 1,
     "cn_cache_interval": 1,
+    "cn_cache_decay": 0.0,
     "use_feature_injection": True,
     "fi_strength": 0.75,
     "fi_threshold": 0.98,

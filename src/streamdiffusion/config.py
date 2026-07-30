@@ -167,6 +167,11 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
     # 1 (default) = disabled, run CN every frame.
     # N > 1 = run CN once every N frames; reuse residuals between (control latency = N-1 frames).
     param_map["cn_cache_interval"] = config.get("cn_cache_interval", DEFAULTS["cn_cache_interval"])
+    # cn_cache_decay: EMA low-pass on the applied CN residual (0.0-1.0).
+    # 0.0 (default) = legacy behavior (control-image updates invalidate the hold).
+    # > 0 = cn_cache_interval becomes authoritative even on live feeds; the applied
+    # residual eases toward the newest computed one (applied.lerp_(target, decay)).
+    param_map["cn_cache_decay"] = config.get("cn_cache_decay", DEFAULTS["cn_cache_decay"])
 
     # Feature Injection (StreamV2V §3.4.2) — requires use_cached_attn=True
     if "use_feature_injection" not in config:

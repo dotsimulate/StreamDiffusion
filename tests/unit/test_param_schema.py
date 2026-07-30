@@ -31,10 +31,10 @@ WRAPPER_ONLY_PARAMS = {"use_safety_checker", "safety_checker_threshold"}
 
 class TestParamNames:
     def test_param_names_count(self):
-        assert len(PARAM_NAMES) == 25
+        assert len(PARAM_NAMES) == 26
 
     def test_updater_param_names_count(self):
-        assert len(UPDATER_PARAM_NAMES) == 23
+        assert len(UPDATER_PARAM_NAMES) == 24
 
     def test_updater_param_names_is_ordered_subsequence_of_param_names(self):
         """Dropping the two wrapper-only names from PARAM_NAMES, in place,
@@ -91,6 +91,7 @@ class TestDefaultsGolden:
         assert DEFAULTS["cache_maxframes"] == 1
         assert DEFAULTS["cache_interval"] == 1
         assert DEFAULTS["cn_cache_interval"] == 1
+        assert DEFAULTS["cn_cache_decay"] == 0.0
         assert DEFAULTS["fi_strength"] == 0.75
         assert DEFAULTS["fi_threshold"] == 0.98
 

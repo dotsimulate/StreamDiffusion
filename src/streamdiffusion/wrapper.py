@@ -144,6 +144,7 @@ class StreamDiffusionWrapper:
         max_cache_maxframes: int = 4,
         pin_cache_frames: bool = False,
         cn_cache_interval: int = 1,
+        cn_cache_decay: float = 0.0,
         use_feature_injection: bool = False,
         fi_strength: float = 0.75,
         fi_threshold: float = 0.98,
@@ -442,6 +443,7 @@ class StreamDiffusionWrapper:
             max_cache_maxframes=max_cache_maxframes,
             pin_cache_frames=pin_cache_frames,
             cn_cache_interval=cn_cache_interval,
+            cn_cache_decay=cn_cache_decay,
             use_feature_injection=use_feature_injection,
             fi_strength=fi_strength,
             fi_threshold=fi_threshold,
@@ -728,6 +730,8 @@ class StreamDiffusionWrapper:
         cache_interval: Optional[int] = None,
         # ControlNet residual cache interval (1=off, N>1=reuse residuals for N-1 frames)
         cn_cache_interval: Optional[int] = None,
+        # ControlNet residual decay (0=legacy version-gated hold, >0=interval authoritative + EMA)
+        cn_cache_decay: Optional[float] = None,
         # Feature Injection live-tunable params (in-place tensor update, no engine rebuild)
         fi_strength: Optional[float] = None,
         fi_threshold: Optional[float] = None,
@@ -776,6 +780,25 @@ class StreamDiffusionWrapper:
             Whether to use the safety checker. Only supported for TensorRT acceleration.
         safety_checker_threshold : Optional[float]
             The threshold for the safety checker.
+        cache_maxframes : Optional[int]
+            Logical write window of the KVO/FI cache ring buffers (bounded by the
+            allocated buffer size).
+        cache_interval : Optional[int]
+            KVO/FI cache write-pointer advance interval (1 = advance every frame).
+        cn_cache_interval : Optional[int]
+            ControlNet residual reuse interval. 1 = off (CN every frame); N > 1 = run
+            CN once every N frames and reuse residuals between. With cn_cache_decay
+            at 0.0 a control-image update invalidates the hold, so live feeds
+            recompute every frame regardless of N.
+        cn_cache_decay : Optional[float]
+            EMA low-pass on the applied CN residual (clamped to [0.0, 1.0]).
+            0.0 = legacy behavior; > 0 makes cn_cache_interval authoritative even on
+            live feeds and eases the applied residual toward the newest computed one
+            (higher = faster tracking, 1.0 = snap). Suggested range 0.3-0.6.
+        fi_strength : Optional[float]
+            Feature Injection blend weight alpha (0.0-1.0).
+        fi_threshold : Optional[float]
+            Feature Injection cosine-similarity gate (0.0-1.0).
         """
         # Skip re-encoding if the incoming prompt_list is identical to the cached one.
         # OSC delivers list-of-lists from JSON; normalise to (str, float) tuples before
@@ -821,6 +844,7 @@ class StreamDiffusionWrapper:
                 cache_maxframes=cache_maxframes,
                 cache_interval=cache_interval,
                 cn_cache_interval=cn_cache_interval,
+                cn_cache_decay=cn_cache_decay,
                 fi_strength=fi_strength,
                 fi_threshold=fi_threshold,
             )
@@ -1520,6 +1544,7 @@ class StreamDiffusionWrapper:
         max_cache_maxframes: int = 4,
         pin_cache_frames: bool = False,
         cn_cache_interval: int = 1,
+        cn_cache_decay: float = 0.0,
         use_feature_injection: bool = False,
         fi_strength: float = 0.75,
         fi_threshold: float = 0.98,
@@ -2751,6 +2776,9 @@ class StreamDiffusionWrapper:
                 # Apply startup cache interval from config (1 = disabled, no-op).
                 if cn_cache_interval > 1:
                     cn_module.set_cn_cache_interval(cn_cache_interval)
+                # Apply startup residual decay from config (0.0 = disabled, no-op).
+                if cn_cache_decay > 0.0:
+                    cn_module.set_cn_cache_decay(cn_cache_decay)
 
                 if acceleration == "tensorrt":
                     try:

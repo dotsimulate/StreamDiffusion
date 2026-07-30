@@ -95,6 +95,13 @@ use_controlnet: false
 # Note: cache key does NOT include t_index_list — avoid changing batch config mid-stream
 # while caching is active. Low practical risk but noted.
 cn_cache_interval: 1
+# cn_cache_decay: EMA low-pass on the applied CN residual (0.0-1.0).
+# 0.0 = legacy (default): with a live control feed the interval never engages, because
+# every control-image update invalidates the hold.
+# > 0: the interval becomes authoritative (CN truly runs 1-in-N frames on live feeds)
+# and the applied residual eases toward the newest computed one instead of snapping.
+# Higher = faster tracking, lower = smoother. Suggested range 0.3-0.6.
+cn_cache_decay: 0.0
 
 # IPAdapter configuration (disabled)
 use_ipadapter: false
