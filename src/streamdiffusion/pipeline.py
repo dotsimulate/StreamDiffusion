@@ -1069,10 +1069,15 @@ class StreamDiffusion:
             return
 
         self.frame_idx += 1
-        if self.frame_idx % self.cache_interval != 0:
-            return
 
-        # Circular buffer: overwrite the oldest slot without shifting or cloning.
+        # Slot-latch circular buffer: written on EVERY unet_step call, but the write
+        # pointer advances only every cache_interval calls. The latched slot tracks the
+        # newest output (always exactly one call old — a smooth temporal anchor for
+        # EA/FI), while the remaining slots freeze at ~cache_interval spacing, keeping
+        # the long style-consistency window (worst-case span loss vs the old
+        # write-skipping scheme is cache_interval - 1 calls). Skipping writes instead
+        # made the whole bank's age oscillate and shift by cache_interval at once —
+        # visible judder at FPS/interval.
         # The attention processor reads all slots as an unordered K/V bag, so slot order is irrelevant.
         # Use self.cache_maxframes (not tensor shape) so that when the buffer is allocated at
         # max_cache_maxframes but the logical window is smaller, writes stay within the active range.
