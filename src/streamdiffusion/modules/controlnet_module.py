@@ -86,6 +86,16 @@ class ControlNetModule(OrchestratorUser):
         self._cn_cached_residuals: Optional[UnetKwargsDelta] = None
         self._cn_cache_images_version: int = -1
         self._cn_cache_scale_hash: Optional[tuple] = None
+        self._cn_cache_active_key: Optional[tuple] = None  # (index, id(cn)) of active CNs at last forward
+        # Residual decay: 0.0 (default) keeps the exact interval behavior above. >0 makes
+        # the interval authoritative for live feeds (control-image updates no longer
+        # invalidate the hold) and low-passes the applied residual toward the newest
+        # computed one every frame: applied.lerp_(target, decay). The EMA buffers are
+        # module-owned so the engine's persistent output tensors are never mutated.
+        self._cn_cache_decay: float = 0.0
+        self._cn_ema_down: Optional[List[torch.Tensor]] = None
+        self._cn_ema_mid: Optional[torch.Tensor] = None
+        self._cn_ema_shape_key: Optional[tuple] = None
 
         # Persistent multi-ControlNet residual merge buffers (Phase-2 prep). The naive
         # `merged_down[j] = merged_down[j] + ds[j]` allocates a fresh tensor every frame,
@@ -119,10 +129,15 @@ class ControlNetModule(OrchestratorUser):
         self._sdxl_conditioning_valid = False
         self._engine_type_cache.clear()
         # Reset residual cache on re-install so stale tensors are never reused.
+        # (_cn_cache_interval / _cn_cache_decay are user settings, deliberately kept.)
         self._cn_frame_counter = 0
         self._cn_cached_residuals = None
         self._cn_cache_images_version = -1
         self._cn_cache_scale_hash = None
+        self._cn_cache_active_key = None
+        self._cn_ema_down = None
+        self._cn_ema_mid = None
+        self._cn_ema_shape_key = None
         self._cn_merged_down = None
         self._cn_merged_mid = None
         self._cn_merged_shape_key = None
@@ -264,6 +279,28 @@ class ControlNetModule(OrchestratorUser):
                 self._cn_cache_interval = n
                 self._cn_frame_counter = 0
                 self._cn_cached_residuals = None
+
+    def set_cn_cache_decay(self, f: float) -> None:
+        """Set the residual decay factor (EMA low-pass on the applied residual).
+
+        decay=0.0 (default): disabled — cn_cache_interval keeps its legacy
+        version-gated behavior, where any control-image update forces a
+        recompute (so live feeds recompute every frame regardless of interval).
+        decay>0: the interval becomes authoritative — CN runs 1-in-interval
+        frames even on a live feed — and every frame the applied residual moves
+        a fraction ``decay`` toward the newest computed one
+        (``applied.lerp_(target, decay)``). 1.0 = snap to newest (no smoothing).
+
+        Changing the decay resets only the EMA buffers; the frame counter and
+        cached residuals are kept so the recompute schedule is not disturbed.
+        """
+        f = min(1.0, max(0.0, float(f)))
+        with self._collections_lock:
+            if f != self._cn_cache_decay:
+                self._cn_cache_decay = f
+                self._cn_ema_down = None
+                self._cn_ema_mid = None
+                self._cn_ema_shape_key = None
 
     def update_controlnet_enabled(self, index: int, enabled: bool) -> None:
         with self._collections_lock:
@@ -471,21 +508,38 @@ class ControlNetModule(OrchestratorUser):
                 # Snapshot invalidation keys for residual cache (captured under lock for consistency).
                 curr_images_version = self._images_version
                 scale_hash = tuple(self.controlnet_scales)
+                decay = self._cn_cache_decay
+                # Active-set identity: catches enable/disable toggles and same-index
+                # model swaps that neither scale_hash nor _images_version would reveal.
+                active_key = tuple((i, id(cn)) for cn, _, _, i in active_data)
 
                 if not active_data:
                     return UnetKwargsDelta()
 
             # Residual cache hit: reuse the last forward result when control
             # inputs are unchanged and this is an intermediate frame.
-            if (
-                self._cn_cache_interval > 1
-                and self._cn_cached_residuals is not None
-                and self._cn_cache_images_version == curr_images_version
-                and self._cn_cache_scale_hash == scale_hash
+            if decay <= 0.0:
+                if (
+                    self._cn_cache_interval > 1
+                    and self._cn_cached_residuals is not None
+                    and self._cn_cache_images_version == curr_images_version
+                    and self._cn_cache_scale_hash == scale_hash
+                    and self._cn_frame_counter % self._cn_cache_interval != 0
+                ):
+                    self._cn_frame_counter += 1
+                    return self._cn_cached_residuals
+            # Decay path: the interval is authoritative — a control-image update no
+            # longer forces a recompute (that per-frame invalidation is what made the
+            # interval a no-op on live feeds). Scale/active-set changes and an empty
+            # cache still do.
+            elif (
+                self._cn_cached_residuals is not None
                 and self._cn_frame_counter % self._cn_cache_interval != 0
+                and self._cn_cache_scale_hash == scale_hash
+                and self._cn_cache_active_key == active_key
             ):
                 self._cn_frame_counter += 1
-                return self._cn_cached_residuals
+                return self._apply_residual_decay(self._cn_cached_residuals, decay)
 
             # Cache TRT engines lookup to avoid rebuilding every frame
             if not self._engines_cache_valid:
@@ -656,15 +710,52 @@ class ControlNetModule(OrchestratorUser):
                     mid_block_additional_residual=self._cn_merged_mid,
                 )
 
-            # Residual cache write: store result for reuse on upcoming intermediate frames.
-            if self._cn_cache_interval > 1:
+            # Residual cache write: store result for reuse on upcoming intermediate
+            # frames. With decay > 0 the EMA needs a target even at interval == 1.
+            if self._cn_cache_interval > 1 or decay > 0.0:
                 self._cn_cached_residuals = _result
                 self._cn_cache_images_version = curr_images_version
                 self._cn_cache_scale_hash = scale_hash
+                self._cn_cache_active_key = active_key
             self._cn_frame_counter += 1
+            if decay > 0.0:
+                return self._apply_residual_decay(_result, decay)
             return _result
 
         return _unet_hook
+
+    def _apply_residual_decay(self, target: UnetKwargsDelta, decay: float) -> UnetKwargsDelta:
+        """Low-pass the applied residual toward ``target`` (the newest computed one).
+
+        Writes into module-owned, pointer-stable EMA buffers (mirroring the
+        _cn_merged_* pattern) — never into ``target``'s tensors, which on the
+        single-CN path alias the TRT engine's persistent output buffers.
+        Buffers are (re)allocated on shape/dtype/device change and initialised
+        by copy from the target (no fade-in from zeros).
+        """
+        down = target.down_block_additional_residuals
+        mid = target.mid_block_additional_residual
+        shape_key = (
+            tuple(t.shape for t in down),
+            mid.shape,
+            down[0].dtype,
+            down[0].device,
+        )
+        if self._cn_ema_down is None or self._cn_ema_shape_key != shape_key:
+            self._cn_ema_down = [torch.empty_like(t) for t in down]
+            self._cn_ema_mid = torch.empty_like(mid)
+            self._cn_ema_shape_key = shape_key
+            for j, t in enumerate(down):
+                self._cn_ema_down[j].copy_(t)
+            self._cn_ema_mid.copy_(mid)
+        else:
+            for j, t in enumerate(down):
+                self._cn_ema_down[j].lerp_(t, decay)
+            self._cn_ema_mid.lerp_(mid, decay)
+        return UnetKwargsDelta(
+            down_block_additional_residuals=self._cn_ema_down,
+            mid_block_additional_residual=self._cn_ema_mid,
+        )
 
     def _prepare_control_image(
         self, control_image: Union[str, Any, torch.Tensor], preprocessor: Optional[Any]

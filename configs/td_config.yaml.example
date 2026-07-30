@@ -39,6 +39,7 @@ build_engines_if_missing: true
 static_shapes: true
 fp8: false
 fp8_allow_fp16_fallback: false
+fp8_mha_qdq: false  # quantize attention BMMs (drops disable_mha_qdq); forks engine tag --fp8v3 -> --fp8v3-mhaq
 
 # builder_optimization_level: maps to TensorRT IBuilderConfig.builder_optimization_level
 # Verified against TensorRT 10.x Python API (range 0-5, TRT default 3).
@@ -49,7 +50,8 @@ fp8_allow_fp16_fallback: false
 #                   ~30-40% faster build with minimal runtime loss (build-time tradeoff)
 #   4 = Quality     static_shapes=true  + level 3 — FP16 static, NVIDIA demoDiffusion default
 #                   (level 4 has no NVIDIA-validated benefit for unquantized FP16)
-#   Performance     static_shapes=true  + level 4 — FP8 quantized, NVIDIA TensorRT-Model-Optimizer default
+#   Performance     static_shapes=true  + level 4 — FP8 quantized, NVIDIA TensorRT-Model-Optimizer default;
+#                   also sets fp8_mha_qdq=true (MHA Q/DQ recipe, --fp8v3-mhaq engines)
 # Levels 1 and 5 are valid TRT values but not exposed via TrtProfile UI:
 #   1 = degraded (top-heuristic + low compile optimization on dynamic kernels)
 #   5 = exhaustive (avoided — used by no NVIDIA reference pipeline; community segfault reports)
@@ -93,6 +95,13 @@ use_controlnet: false
 # Note: cache key does NOT include t_index_list — avoid changing batch config mid-stream
 # while caching is active. Low practical risk but noted.
 cn_cache_interval: 1
+# cn_cache_decay: EMA low-pass on the applied CN residual (0.0-1.0).
+# 0.0 = legacy (default): with a live control feed the interval never engages, because
+# every control-image update invalidates the hold.
+# > 0: the interval becomes authoritative (CN truly runs 1-in-N frames on live feeds)
+# and the applied residual eases toward the newest computed one instead of snapping.
+# Higher = faster tracking, lower = smoother. Suggested range 0.3-0.6.
+cn_cache_decay: 0.0
 
 # IPAdapter configuration (disabled)
 use_ipadapter: false

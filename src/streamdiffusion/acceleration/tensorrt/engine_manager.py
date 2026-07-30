@@ -112,6 +112,7 @@ class EngineManager:
         use_feature_injection: bool = False,
         use_controlnet: bool = False,
         fp8: bool = False,
+        fp8_mha_qdq: bool = False,
         resolution: Optional[tuple] = None,
         builder_optimization_level: Optional[int] = None,
         build_static_batch: Optional[bool] = None,
@@ -178,7 +179,11 @@ class EngineManager:
                 if use_controlnet:
                     prefix += "--controlnet"
                 if fp8:
-                    prefix += "--fp8v3"
+                    # Quantization-recipe changes are NOT otherwise part of the cache
+                    # key, so experimental recipe flags must fork the tag here. The
+                    # base "--fp8v3" must stay byte-identical when every recipe flag
+                    # is off — bumping it would orphan the deployed production engines.
+                    prefix += "--fp8v3-mhaq" if fp8_mha_qdq else "--fp8v3"
                 # Encode the actual batch-profile policy so that a static-batch engine
                 # and a dynamic-batch engine never share the same directory.
                 # The capacity range (min_batch / max_batch above) is the same for both,
@@ -232,7 +237,7 @@ class EngineManager:
                 # stable directory, just without spelling out every flag on disk.
                 canonical = prefix
                 short_hash = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:12]
-                fp8_tag = "--fp8v3" if fp8 else ""
+                fp8_tag = ("--fp8v3-mhaq" if fp8_mha_qdq else "--fp8v3") if fp8 else ""
                 res_tag = f"--res-{resolution[0]}x{resolution[1]}" if resolution is not None else ""
                 prefix = f"{base_name}{fp8_tag}--h{short_hash}{res_tag}"
                 logger.debug(f"EngineManager: UNet cache key h{short_hash} = {canonical}")

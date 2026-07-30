@@ -301,6 +301,7 @@ class StreamParameterUpdater(OrchestratorUser):
         cache_maxframes: Optional[int] = None,
         cache_interval: Optional[int] = None,
         cn_cache_interval: Optional[int] = None,
+        cn_cache_decay: Optional[float] = None,
         fi_strength: Optional[float] = None,
         fi_threshold: Optional[float] = None,
     ) -> None:
@@ -472,6 +473,16 @@ class StreamParameterUpdater(OrchestratorUser):
                 if cn_mod is not None:
                     cn_mod.set_cn_cache_interval(int(cn_cache_interval))
                     logger.info(f"update_stream_params: cn_cache_interval -> {int(cn_cache_interval)}")
+
+            # ControlNet residual decay — delegate to CN module if present.
+            # getattr-guarded: _get_controlnet_pipeline() can return the stream or a
+            # legacy pipeline that has no set_cn_cache_decay.
+            if cn_cache_decay is not None:
+                cn_mod = self._get_controlnet_pipeline()
+                setter = getattr(cn_mod, "set_cn_cache_decay", None)
+                if setter is not None:
+                    setter(float(cn_cache_decay))
+                    logger.info(f"update_stream_params: cn_cache_decay -> {float(cn_cache_decay):.3f}")
 
             # Feature Injection live-tunable scalars — write into pre-allocated [1] tensors
             # in-place so CUDA-graph references stay valid (no tensor reallocation).
