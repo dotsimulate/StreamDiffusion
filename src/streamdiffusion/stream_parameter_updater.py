@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from .config import dedupe_controlnet_configs
 from .param_schema import (
     PromptInterpolationMethod,
     SeedInterpolationMethod,
@@ -1479,12 +1480,32 @@ class StreamParameterUpdater(OrchestratorUser):
             )
             return
 
-        current_config = self._get_current_controlnet_config()
+        # Dedup the incoming desired config first. Without this, a caller that hands us
+        # two entries for a model that isn't currently loaded produces two add_controlnet
+        # calls below (existing_index is None for both, since current_models is only
+        # refreshed at the top of this method) — i.e. this method can *create* duplicates,
+        # not just fail to clean up ones created elsewhere.
+        desired_config = dedupe_controlnet_configs(desired_config)
 
         # Simple approach: detect what changed and apply minimal updates
         current_models = {
             i: getattr(cn, "model_id", f"controlnet_{i}") for i, cn in enumerate(controlnet_pipeline.controlnets)
         }
+
+        # Drop any duplicate model_ids already loaded in the pipeline (e.g. left over from
+        # a startup config that predates this dedup, or from a prior version of this
+        # method). Keep the first occurrence of each model_id, remove the rest — this is
+        # what lets an already-running stream self-heal. Must happen before the reorder
+        # below so current_models is recomputed over an already duplicate-free list.
+        seen_model_ids = set()
+        for i in reversed(range(len(controlnet_pipeline.controlnets))):
+            model_id = current_models.get(i, f"controlnet_{i}")
+            if model_id in seen_model_ids:
+                logger.info(f"_update_controlnet_config: Removing pre-existing duplicate ControlNet {model_id}")
+                controlnet_pipeline.remove_controlnet(i)
+            else:
+                seen_model_ids.add(model_id)
+
         desired_models = {cfg["model_id"]: cfg for cfg in desired_config}
 
         # Reorder to match desired order (module supports stable reordering)
@@ -1506,6 +1527,14 @@ class StreamParameterUpdater(OrchestratorUser):
             if model_id not in desired_models:
                 logger.info(f"_update_controlnet_config: Removing ControlNet {model_id}")
                 controlnet_pipeline.remove_controlnet(i)
+
+        # Recompute current models/config after all removals above so indices line up —
+        # current_config captured before these mutations would be stale here and could
+        # read the wrong row (or raise IndexError) when used below.
+        current_models = {
+            i: getattr(cn, "model_id", f"controlnet_{i}") for i, cn in enumerate(controlnet_pipeline.controlnets)
+        }
+        current_config = self._get_current_controlnet_config()
 
         # Add new controlnets and update existing ones
         for desired_cfg in desired_config:
