@@ -265,8 +265,9 @@ def dedupe_controlnet_configs(configs: List[Dict[str, Any]]) -> List[Dict[str, A
         model_id = cfg.get("model_id")
         if model_id is None:
             # No model_id to key on — keep as-is, never collapse.
-            order.append(id(cfg))
-            best_by_model[id(cfg)] = cfg
+            sentinel_key = f"__no_model_id_{id(cfg)}__"
+            order.append(sentinel_key)
+            best_by_model[sentinel_key] = cfg
             continue
         existing = best_by_model.get(model_id)
         if existing is None:
