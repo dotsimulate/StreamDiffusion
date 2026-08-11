@@ -34,7 +34,7 @@ def install(cu: Optional[Literal["11", "12"]] = get_cuda_major()):
     if platform.system() == "Windows" and not is_installed("pywin32"):
         run_pip("install pywin32==311")
     if platform.system() == "Windows" and not is_installed("triton"):
-        run_pip("install triton-windows==3.4.0.post21")
+        run_pip("install triton-windows==3.6.0.post26")
 
     # ONNX stack aligned with FLUX for TRT 10.16:
     #   - onnx 1.19.1 (IR 11); modelopt's FLOAT4E2M1 support landed in 1.18 and stays in 1.19

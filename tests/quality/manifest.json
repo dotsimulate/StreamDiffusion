@@ -1,7 +1,7 @@
 {
     "_note": "Version pins for the quality regression harness. Run regenerate_golden.py --update-manifest after any dep bump to refresh hashes. run_compare.py aborts if installed versions diverge.",
     "versions": {
-        "torch": "2.8.0+cu128",
+        "torch": "2.11.0+cu128",
         "tensorrt": "10.16.1.11",
         "nvidia_modelopt": "0.43.0",
         "diffusers": "0.38.0"

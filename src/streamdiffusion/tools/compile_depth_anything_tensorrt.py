@@ -90,7 +90,7 @@ def export_depth_anything_to_onnx(
                 "output": {0: "batch", 2: "height", 3: "width"},
             },
             opset_version=17,
-            do_constant_folding=True,
+            dynamo=False,
         )
 
         logger.info("ONNX export successful")
