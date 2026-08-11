@@ -14,34 +14,25 @@ contribution too and silently degrade the whole calibration set to zero-pad.
 CLIP-based adapters (regular/plus), `faces/` for FaceID -- resolved once by
 `_resolve_fp8_calibration_dir` and threaded into both the `--ci<hash>`
 cache-key call and the actual image loader, so the two can never disagree
-about which folder is in play. This file pins that resolver, plus the
-`_list_calibration_images` helper now shared by the loader, the resolver,
-and `EngineManager._calibration_image_signature`.
+about which folder is in play. This file pins that resolver.
+
+The companion `_list_calibration_images` helper shared by the loader, the
+resolver, and `EngineManager._calibration_image_signature` is pinned in
+pr/trt-engine-cache-tags instead of here: this PR's cherry-pick does not
+touch engine_manager.py, so a three-way agreement test against it would
+fail against an engine_manager.py that predates that PR's changes.
 """
 
-import hashlib
 import logging
 from pathlib import Path
 
 from PIL import Image
 
-from streamdiffusion.acceleration.tensorrt.engine_manager import EngineManager
-from streamdiffusion.acceleration.tensorrt.fp8_quantize import _list_calibration_images
-from streamdiffusion.wrapper import _load_fp8_calibration_style_images, _resolve_fp8_calibration_dir
+from streamdiffusion.wrapper import _resolve_fp8_calibration_dir
 
 
 def _write_tiny_image(path: Path, fill=(10, 20, 30)) -> None:
     Image.new("RGB", (2, 2), color=fill).save(path)
-
-
-def _make_engine_manager(engine_dir: str) -> EngineManager:
-    """Build an EngineManager without running __init__'s heavy compile-fn
-    imports -- same pattern as test_engine_path_ipadapter_suffixes.py.
-    `_calibration_image_signature` only touches Path/hashlib, so `_configs`
-    is never needed here."""
-    em = EngineManager.__new__(EngineManager)
-    em.engine_dir = Path(engine_dir)
-    return em
 
 
 class TestResolveFp8CalibrationDir:
@@ -107,59 +98,3 @@ class TestResolveFp8CalibrationDir:
         missing = tmp_path / "does_not_exist"
 
         assert _resolve_fp8_calibration_dir(str(missing), "faceid") == str(missing)
-
-
-class TestListLoadHashAgreement:
-    """The three call sites (`_list_calibration_images`,
-    `_load_fp8_calibration_style_images`, `EngineManager.
-    _calibration_image_signature`) must always agree on which files count --
-    a disagreement would mean the `--ci<hash>` cache key could name a
-    different image set than the one actually loaded into calibration."""
-
-    def test_loader_lister_and_hasher_agree_on_which_files_count(self, tmp_path):
-        root = tmp_path / "calibration" / "general"
-        root.mkdir(parents=True)
-        _write_tiny_image(root / "a.png")
-        _write_tiny_image(root / "b.png")
-        em = _make_engine_manager(str(tmp_path / "engines"))
-
-        listed_before = _list_calibration_images(str(root))
-        loaded_before = _load_fp8_calibration_style_images(str(root))
-        sig_before = em._calibration_image_signature(str(root))
-
-        assert len(listed_before) == 2
-        assert loaded_before is not None and len(loaded_before) == 2
-        assert sig_before is not None
-
-        # An unrecognized extension must be invisible to all three -- proves
-        # they're all working from the same file set, not just the same count.
-        (root / "notes.txt").write_text("not an image")
-
-        listed_after = _list_calibration_images(str(root))
-        loaded_after = _load_fp8_calibration_style_images(str(root))
-        sig_after = em._calibration_image_signature(str(root))
-
-        assert len(listed_after) == len(listed_before)
-        assert loaded_after is not None and len(loaded_after) == len(loaded_before)
-        assert sig_after == sig_before
-
-    def test_nested_subdirectory_image_is_invisible_to_all_three(self, tmp_path):
-        """Deliberately non-recursive: a mode-folder split one level below
-        `path` (§10.1's `general/`/`faces/`) must not itself be picked up by
-        a listing rooted at `path`'s parent, and any other accidental
-        nesting must stay invisible too."""
-        root = tmp_path / "calibration" / "general"
-        nested = root / "nested"
-        nested.mkdir(parents=True)
-        _write_tiny_image(root / "a.png")
-        _write_tiny_image(nested / "hidden.png")
-        em = _make_engine_manager(str(tmp_path / "engines"))
-
-        listed = _list_calibration_images(str(root))
-        loaded = _load_fp8_calibration_style_images(str(root))
-        sig = em._calibration_image_signature(str(root))
-
-        assert len(listed) == 1
-        assert loaded is not None and len(loaded) == 1
-        expected_sig = hashlib.sha1((root / "a.png").read_bytes()).hexdigest()[:6]
-        assert sig == expected_sig
