@@ -20,6 +20,7 @@ MINIMAL_CONFIG = {"model_id": "stabilityai/sd-turbo"}
 EXPECTED_WRAPPER_PARAMS = {
     "model_id_or_path": "stabilityai/sd-turbo",
     "t_index_list": [0, 16, 32, 45],
+    "num_inference_steps": 50,
     "mode": "img2img",
     "output_type": "pil",
     "device": "cuda",
@@ -52,6 +53,9 @@ EXPECTED_WRAPPER_PARAMS = {
     "build_engines_if_missing": True,
     "fp8_allow_fp16_fallback": False,
     "fp8_mha_qdq": False,
+    "fp8_scale_headroom": 1.0,
+    "fp8_exclude_attention": False,
+    "fp8_exclude_ipadapter": False,
     "use_controlnet": False,
     "use_ipadapter": False,
     "use_cached_attn": False,

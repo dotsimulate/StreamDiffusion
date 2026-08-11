@@ -41,6 +41,16 @@ fp8: false
 fp8_allow_fp16_fallback: false
 fp8_mha_qdq: false  # quantize attention BMMs (drops disable_mha_qdq); forks engine tag --fp8v3 -> --fp8v3-mhaq
 
+# fp8_calibration_style_image (fp8-round-9.1 §10): a file or a directory of real IP-Adapter
+# calibration images, used instead of the image_proj_model(zeros) surrogate when fp8=true and
+# IP-Adapter is enabled. A directory is redirected at build time to a subfolder keyed on the
+# live ipadapters[0].type — general/ for regular|plus (CLIP-encoded, any subject), faces/ for
+# faceid (ArcFace-encoded, real photographic faces only; a face-less image raises and is
+# skipped rather than aborting the whole calibration set). Missing/empty subfolder falls back
+# to the flat directory with a warning. See src/streamdiffusion/wrapper.py's
+# _resolve_fp8_calibration_dir and images/calibration/README.md.
+# fp8_calibration_style_image: "images/calibration"
+
 # builder_optimization_level: maps to TensorRT IBuilderConfig.builder_optimization_level
 # Verified against TensorRT 10.x Python API (range 0-5, TRT default 3).
 # TrtProfile UI mapping aligned with NVIDIA reference pipelines
