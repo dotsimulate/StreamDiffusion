@@ -253,21 +253,26 @@ class EngineManager:
             # Create prefix (from wrapper.py lines 1005-1013)
             prefix = f"{base_name}--tiny_vae-{use_tiny_vae}--min_batch-{min_batch_size}--max_batch-{max_batch_size}"
 
-            # IP-Adapter differentiation: add type and (optionally) tokens
-            # Keep scale out of identity for runtime control, but include a type flag to separate caches
-            if is_faceid:
-                prefix += "--fid"
-            if ipadapter_tokens is not None:
-                prefix += f"--tokens{ipadapter_tokens}"
-
-            # Fused Loras - use concise hashed signature to avoid long/invalid paths.
-            # Only UNet engines bake LoRA weights; VAE and other standard engines are
-            # LoRA-agnostic, so scoping the suffix to UNET prevents redundant VAE rebuilds
-            # every time the LoRA dict changes.
-            if engine_type == EngineType.UNET and lora_dict is not None and len(lora_dict) > 0:
-                prefix += f"--lora-{self._lora_signature(lora_dict)}"
-
             if engine_type == EngineType.UNET:
+                # IP-Adapter differentiation: add type and (optionally) tokens. Only UNet
+                # engines carry IP-Adapter cross-attention weights; VAE and other standard
+                # engines are IP-Adapter-agnostic, so scoping this suffix to UNET (same
+                # reasoning as the LoRA suffix just below) prevents a redundant VAE rebuild
+                # every time FaceID is toggled or the token count changes.
+                # Keep scale out of identity for runtime control, but include a type flag to
+                # separate caches.
+                if is_faceid:
+                    prefix += "--fid2"
+                if ipadapter_tokens is not None:
+                    prefix += f"--tokens{ipadapter_tokens}"
+
+                # Fused Loras - use concise hashed signature to avoid long/invalid paths.
+                # Only UNet engines bake LoRA weights; VAE and other standard engines are
+                # LoRA-agnostic, so scoping the suffix to UNET prevents redundant VAE rebuilds
+                # every time the LoRA dict changes.
+                if lora_dict is not None and len(lora_dict) > 0:
+                    prefix += f"--lora-{self._lora_signature(lora_dict)}"
+
                 prefix += f"--use_cached_attn-{use_cached_attn}"
                 # FI suffix MUST come right after cached_attn so stale engines
                 # (built without FI bindings) are never loaded when FI is enabled.
