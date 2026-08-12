@@ -108,6 +108,7 @@ def _make_prepare_stub(
     stream.use_denoising_batch = use_denoising_batch
     stream.batch_size = batch_size
     stream.embedding_hooks = []
+    stream.sampler_type = "normal"
     stream.scheduler = _SentinelScheduler()
     stream.pipe = types.SimpleNamespace(
         encode_prompt=_fake_sdxl_encode_prompt if is_sdxl else _fake_sd15_encode_prompt
