@@ -124,6 +124,7 @@ class HEDTensorrtPreprocessor(SelfBuildingTRTPreprocessor):
                     "input": {0: "batch", 2: "height", 3: "width"},
                     "output": {0: "batch", 2: "height", 3: "width"},
                 },
+                dynamo=False,
             )
 
         logger.info(f"HEDTensorrtPreprocessor: ONNX exported → {onnx_path}")

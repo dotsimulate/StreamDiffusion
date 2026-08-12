@@ -459,9 +459,23 @@ class SelfBuildingTRTPreprocessor(BasePreprocessor):
         if not onnx_path.exists():
             raise FileNotFoundError(f"ONNX model not found: {onnx_path}")
 
-        builder = trt.Builder(trt.Logger(trt.Logger.WARNING))
+        # Reuse the shared BUILD_TRT_LOGGER (see acceleration/tensorrt/utilities.py)
+        # instead of throwaway trt.Logger() instances. TRT registers exactly ONE
+        # ILogger globally (first trt.Builder/Runtime/Refitter wins), so a fresh
+        # logger here either loses that race silently or wins it and leaves the main
+        # engine builds without BUILD_TRT_LOGGER's benign myelin/l2tc noise filter.
+        # Falls back to a plain logger if the acceleration package isn't importable
+        # (e.g. a standalone preprocessor-only environment).
+        try:
+            from streamdiffusion.acceleration.tensorrt.utilities import BUILD_TRT_LOGGER
+
+            trt_logger = BUILD_TRT_LOGGER
+        except ImportError:
+            trt_logger = trt.Logger(trt.Logger.WARNING)
+
+        builder = trt.Builder(trt_logger)
         network = builder.create_network()
-        parser = trt.OnnxParser(network, trt.Logger(trt.Logger.WARNING))
+        parser = trt.OnnxParser(network, trt_logger)
 
         with open(onnx_path, "rb") as f:
             if not parser.parse(f.read()):

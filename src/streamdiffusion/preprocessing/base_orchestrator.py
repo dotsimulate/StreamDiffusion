@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextlib
 import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Generic, Optional, TypeVar
@@ -44,9 +45,13 @@ class BaseOrchestrator(Generic[T, R], ABC):
 
         # CUDA stream for background processing to avoid GPU contention
         self._background_stream = None
+        self._bg_pre_event: Optional[torch.cuda.Event] = None  # caller stream -> background stream barrier
+        self._bg_post_event: Optional[torch.cuda.Event] = None  # background stream -> consumer stream barrier
         device_str = str(device)
         if device_str.startswith("cuda") and torch.cuda.is_available():
             self._background_stream = torch.cuda.Stream()
+            self._bg_pre_event = torch.cuda.Event()
+            self._bg_post_event = torch.cuda.Event()
 
     def cleanup(self) -> None:
         """Cleanup thread pool and CUDA stream resources"""
@@ -136,6 +141,11 @@ class BaseOrchestrator(Generic[T, R], ABC):
 
     def _start_next_frame_processing(self, input_data: T, *args, **kwargs) -> None:
         """Start processing for next frame in background thread"""
+        # Pre-exec barrier: order the background stream's work after this (caller)
+        # thread's queued work before handing off to the executor. Must happen here,
+        # not inside _process_frame_background -- a worker thread has no notion of
+        # "the caller's current stream" (see _arm_background_handoff).
+        self._arm_background_handoff()
         # Submit background processing
         self._next_frame_future = self._executor.submit(self._process_frame_background, input_data, *args, **kwargs)
 
@@ -145,6 +155,9 @@ class BaseOrchestrator(Generic[T, R], ABC):
             try:
                 # Use configurable timeout based on orchestrator type
                 self._next_frame_result = self._next_frame_future.result(timeout=self.timeout_ms / 1000.0)
+                # Post-exec barrier: make this (consumer) thread's stream wait for the
+                # background stream's work to land, and record_stream() the results.
+                self._consume_background_handoff(self._next_frame_result)
             except concurrent.futures.TimeoutError:
                 # Non-blocking: skip applying results this frame
                 self._next_frame_result = None
@@ -195,25 +208,98 @@ class BaseOrchestrator(Generic[T, R], ABC):
 
         return result["result"]
 
-    def _set_background_stream_context(self):
-        """
-        Set CUDA stream context for background processing.
+    # ------------------------------------------------------------------
+    # Event-based cross-stream handoff for background processing.
+    #
+    # torch.cuda.Stream() is non-blocking by default, so there is no implicit
+    # legacy-stream synchronization between it and whatever stream the caller/
+    # consumer is on -- an explicit event barrier is required on both ends of the
+    # handoff. Mirrors the producer/consumer event protocol already proven in
+    # preprocessing/processors/trt_base.py's TensorRTEngine.infer():
+    #   producer: pre_event.record(); dedicated_stream.wait_event(pre_event); ... work ...
+    #             post_event.record(dedicated_stream)
+    #   consumer: current_stream().wait_event(post_event); tensor.record_stream(current_stream())
+    #
+    # Split across two call sites because _process_frame_background runs in a
+    # ThreadPoolExecutor worker thread: torch.cuda.current_stream() is thread-local,
+    # so "the caller's current stream" can only be read/recorded on the caller
+    # thread itself, before dispatch -- not from inside the worker. See each
+    # method's docstring for exactly which thread must call it.
+    # ------------------------------------------------------------------
 
-        Returns:
-            The original stream to restore later, or None if no background stream
+    def _arm_background_handoff(self) -> None:
+        """
+        Pre-exec barrier: record an event on the CALLING thread's current stream,
+        then make `_background_stream` wait on it before running anything new.
+
+        Must run on the thread whose queued work the background stream needs to
+        wait behind. For the async pipeline path that's `_start_next_frame_processing`,
+        called on the caller thread before dispatch to the executor. For a
+        same-thread caller (e.g. `process_sync`) there is no thread hop, so it may
+        call this immediately before doing the GPU work itself.
         """
         if self._background_stream is not None:
-            original_stream = torch.cuda.current_stream()
-            torch.cuda.set_stream(self._background_stream)
-            return original_stream
-        return None
+            self._bg_pre_event.record()
+            self._background_stream.wait_event(self._bg_pre_event)
 
-    def _restore_stream_context(self, original_stream):
+    def _background_stream_scope(self):
         """
-        Restore the original CUDA stream context.
+        Scope `torch.cuda.current_stream()` (thread-local) to `_background_stream`
+        for GPU work about to run on the calling thread. Records no barrier --
+        callers that need the pre-exec barrier call `_arm_background_handoff()`
+        themselves first (see that method for why it can't just happen here).
 
-        Args:
-            original_stream: The stream to restore, or None to do nothing
+        Returns a context manager (`torch.cuda.stream(...)`), or a no-op context
+        manager if there is no background stream (CPU device).
         """
-        if self._background_stream is not None and original_stream is not None:
-            torch.cuda.set_stream(original_stream)
+        if self._background_stream is None:
+            return contextlib.nullcontext()
+        return torch.cuda.stream(self._background_stream)
+
+    def _finish_background_handoff(self) -> None:
+        """
+        Post-exec barrier, producer side: record the completion event on
+        `_background_stream`. Must be the last GPU-related action taken for this
+        frame's background work, before the consumer touches results -- called
+        from `_process_frame_background`'s `finally` block (still on the worker
+        thread) or, for a same-thread caller, right after its GPU work.
+        """
+        if self._background_stream is not None:
+            self._bg_post_event.record(self._background_stream)
+
+    def _consume_background_handoff(self, result: Any) -> Any:
+        """
+        Post-exec barrier, consumer side: make the CONSUMING thread's current
+        stream wait on `_background_stream`'s completion event, then
+        `record_stream()` every CUDA tensor found in `result` (recursing through
+        list/tuple/dict containers) so PyTorch's caching allocator can't reclaim a
+        buffer the background stream might still be writing.
+
+        Safe to call even when `_finish_background_handoff()` was never reached
+        this frame (e.g. an exception path bailed out early): waiting on a
+        never-recorded `torch.cuda.Event` is a documented no-op -- "If
+        cudaEventRecord() has not been called on event, this call acts as if the
+        record has already completed."
+
+        Returns `result` unchanged, for call-site chaining.
+        """
+        if self._background_stream is None:
+            return result
+        current = torch.cuda.current_stream()
+        current.wait_event(self._bg_post_event)
+        self._record_stream_on_tensors(result, current)
+        return result
+
+    @staticmethod
+    def _record_stream_on_tensors(obj: Any, stream: "torch.cuda.Stream") -> None:
+        """Recurse through list/tuple/dict containers, calling `tensor.record_stream(stream)`
+        on every CUDA tensor found."""
+        if isinstance(obj, torch.Tensor):
+            if obj.is_cuda:
+                obj.record_stream(stream)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                BaseOrchestrator._record_stream_on_tensors(v, stream)
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                BaseOrchestrator._record_stream_on_tensors(v, stream)
