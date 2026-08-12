@@ -248,6 +248,54 @@ def _extract_prepare_params(config: Dict[str, Any]) -> Dict[str, Any]:
     return prepare_params
 
 
+def dedupe_controlnet_configs(configs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse duplicate ControlNet ``model_id`` entries, keeping the highest
+    ``conditioning_scale`` per model_id and preserving first-occurrence order.
+
+    Mirrors the dedup semantic TouchDesigner's ``Cnblock()`` already applies on its
+    live-update path, so the same model loaded twice at startup (or requested twice in
+    a single live update) behaves the same way the course teaches: highest weight wins.
+    Ties (equal scale) keep the first occurrence. Used both at config-prepare time
+    (`_prepare_controlnet_configs`) and by the stream updater on incoming desired
+    configs, so the rule lives in exactly one place.
+    """
+    best_by_model: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for cfg in configs:
+        model_id = cfg.get("model_id")
+        if model_id is None:
+            # No model_id to key on — keep as-is, never collapse.
+            sentinel_key = f"__no_model_id_{id(cfg)}__"
+            order.append(sentinel_key)
+            best_by_model[sentinel_key] = cfg
+            continue
+        existing = best_by_model.get(model_id)
+        if existing is None:
+            order.append(model_id)
+            best_by_model[model_id] = cfg
+        else:
+            existing_scale = existing.get("conditioning_scale", 1.0)
+            new_scale = cfg.get("conditioning_scale", 1.0)
+            if new_scale > existing_scale:
+                logger.info(
+                    "dedupe_controlnet_configs: dropping duplicate ControlNet model_id=%s "
+                    "(conditioning_scale=%s), keeping conditioning_scale=%s",
+                    model_id,
+                    existing_scale,
+                    new_scale,
+                )
+                best_by_model[model_id] = cfg
+            else:
+                logger.info(
+                    "dedupe_controlnet_configs: dropping duplicate ControlNet model_id=%s "
+                    "(conditioning_scale=%s), keeping conditioning_scale=%s",
+                    model_id,
+                    new_scale,
+                    existing_scale,
+                )
+    return [best_by_model[key] for key in order]
+
+
 def _prepare_controlnet_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Prepare ControlNet configurations for wrapper"""
     controlnet_configs = []
@@ -283,7 +331,7 @@ def _prepare_controlnet_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
 
         controlnet_configs.append(controlnet_config)
 
-    return controlnet_configs
+    return dedupe_controlnet_configs(controlnet_configs)
 
 
 def _prepare_ipadapter_configs(config: Dict[str, Any]) -> List[Dict[str, Any]]:
