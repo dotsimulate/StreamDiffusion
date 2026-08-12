@@ -26,8 +26,11 @@ from streamdiffusion.image_filter import SimilarImageFilter
 from streamdiffusion.model_detection import detect_model
 from streamdiffusion.param_schema import (
     VALID_CFG_TYPES,
+    bleed_risk_message,
     clamp_delta,
+    compute_sub_timesteps,
     delta_noise_cancellation_ceiling,
+    materialise_timestep_grid,
 )
 from streamdiffusion.stream_parameter_updater import StreamParameterUpdater
 from streamdiffusion.tools.gpu_profiler import profiler
@@ -128,10 +131,19 @@ class StreamDiffusion:
         self.t_list = t_index_list
         self.do_add_noise = do_add_noise
 
+        # Schedule-diagnostics dedup state — see _log_schedule_diagnostics.
+        self._last_schedule_signature = None
+        self._last_bleed_message: Optional[str] = None
+
         self.similar_image_filter = False
         self.similar_filter = SimilarImageFilter()
         self.prev_image_result = None
         self.prev_latent_result = None
+        # Published each frame by geometric FX processors (e.g. feedback_loop) as the
+        # [B,2,3] affine theta they applied, or None when identity. Read by unet_step()
+        # to attenuate Feature Injection in proportion to warp magnitude — see
+        # _fi_warp_attenuation().
+        self.fx_frame_transform: Optional[torch.Tensor] = None
         self._latent_cache = None  # pre-allocated buffer; avoids per-frame CUDA malloc for prev_latent_result
         self._noise_buf = None  # pre-allocated buffer for per-step noise in TCD non-batched path
         self._image_decode_buf = None  # pre-allocated buffer for VAE decode output (avoids .clone())
@@ -213,6 +225,11 @@ class StreamDiffusion:
         else:
             self._fi_strength_tensor = None
             self._fi_threshold_tensor = None
+        # User-set Fistrength slider value. unet_step() writes _fi_strength_tensor as
+        # _fi_strength_base * _fi_warp_attenuation() every frame, so a live slider
+        # change (which updates this base, not the tensor) is never clobbered by the
+        # warp attenuation and vice versa.
+        self._fi_strength_base: float = fi_strength
 
         # Pre-allocated CUDA timing events — reused every frame via .record()
         self._timing_start = torch.cuda.Event(enable_timing=True)
@@ -598,20 +615,16 @@ class StreamDiffusion:
                     raise
             self.prompt_embeds = embeds_ctx.prompt_embeds
 
-        self.scheduler.set_timesteps(num_inference_steps, self.device)
         # LCM/TCD ignore timestep_spacing natively. Apply the correct grid for samplers
         # that explicitly request a spacing; leave "normal" on the LCM native schedule.
-        _SPACING_SAMPLERS = {"simple", "sgm_uniform", "ddim"}
-        if self.sampler_type in _SPACING_SAMPLERS:
-            spacing = getattr(self.scheduler.config, "timestep_spacing", "leading")
-            if spacing in ("trailing", "linspace", "leading"):
-                self.scheduler.timesteps = self._get_spaced_timesteps(spacing, num_inference_steps).to(self.device)
-        self.timesteps = self.scheduler.timesteps.to(self.device)
+        # Shared with wrapper.py's fp8-calibration path via materialise_timestep_grid so
+        # the two can never silently drift on what "spacing override" means.
+        self.timesteps = materialise_timestep_grid(
+            self.scheduler, num_inference_steps, self.sampler_type, self.device, self._get_spaced_timesteps
+        )
 
         # make sub timesteps list based on the indices in the t_list list and the values in the timesteps list
-        self.sub_timesteps = []
-        for t in self.t_list:
-            self.sub_timesteps.append(self.timesteps[t])
+        self.sub_timesteps = compute_sub_timesteps(self.timesteps, self.t_list)
 
         sub_timesteps_tensor = torch.tensor(self.sub_timesteps, dtype=torch.long, device=self.device)
         self.sub_timesteps_tensor = torch.repeat_interleave(
@@ -733,6 +746,14 @@ class StreamDiffusion:
         # Seed _unet_kwargs with the constant key so per-frame code only updates values
         self._unet_kwargs = {"return_dict": False}
 
+        # Diagnostics-only: never let a logging failure abort prepare() itself
+        # (e.g. a partially-constructed test/debug shell missing an attribute
+        # this dump reads should not turn a successful prepare() into a crash).
+        try:
+            self._log_schedule_diagnostics("prepare")
+        except Exception as exc:
+            logger.debug("schedule diagnostics (prepare) skipped: %r", exc)
+
     def _rebuild_sub_timesteps_expanded(self) -> None:
         """(Re)build the per-step expanded timestep table consumed by the TCD /
         non-batched sequential loop in predict_x0_batch. Avoids per-step
@@ -815,6 +836,14 @@ class StreamDiffusion:
             self._cfg_latent_buf = None
             self._cfg_t_buf = None
 
+        # Diagnostics-only: never let a logging failure abort the __call__
+        # RuntimeError-fallback rebuild this method also serves as (see the
+        # signature-gate note in _log_schedule_diagnostics's own docstring).
+        try:
+            self._log_schedule_diagnostics("refresh")
+        except Exception as exc:
+            logger.debug("schedule diagnostics (refresh) skipped: %r", exc)
+
     def _get_scheduler_scalings(self, timestep: Union[int, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get LCM/TCD-specific scaling factors for boundary conditions."""
         if isinstance(self.scheduler, LCMScheduler):
@@ -828,9 +857,144 @@ class StreamDiffusion:
             c_out = torch.tensor(1.0, device=self.device, dtype=self.dtype)
             return c_skip, c_out
 
+    def _log_schedule_diagnostics(self, tag: str) -> None:
+        """Log the realised schedule so a do_add_noise / t_index investigation
+        doesn't have to hand-derive its numbers: the grid, the per-index
+        sub_timestep table (t, alpha_sqrt, beta_sqrt, c_skip, c_out), the
+        do_add_noise reachability verdict, RCFG activity, and cross-frame
+        state. Called from the end of prepare() (tag="prepare") and the end
+        of _refresh_derived_tensors() (tag="refresh").
+
+        Gated on a schedule signature — (t_list, num_inference_steps,
+        sampler_type, scheduler class, batch_size, do_add_noise) — because
+        _refresh_derived_tensors() is not only reached at stream start and on
+        a live schedule change: its third caller is __call__'s RuntimeError
+        fallback (an "expanded size ... must match" recovery, __call__
+        ~:1527-1537), which re-runs every frame if the mismatch is
+        persistent rather than transient. Without this gate that path would
+        flood the log with an identical dump every frame; with it, a repeat
+        is one skipped call and a genuine change still re-logs.
+        """
+        num_inference_steps = len(self.timesteps)
+        signature = (
+            tuple(self.t_list),
+            num_inference_steps,
+            self.sampler_type,
+            type(self.scheduler).__name__,
+            self.batch_size,
+            self.do_add_noise,
+        )
+        if signature == self._last_schedule_signature:
+            return
+        self._last_schedule_signature = signature
+
+        n_steps = len(self.t_list)
+
+        def _row(flat: torch.Tensor, i: int) -> float:
+            # alpha/beta/c_skip/c_out may or may not be repeat_interleave'd by
+            # frame_bff_size depending on which code path last touched them —
+            # prepare() never repeat_interleaves c_skip/c_out, but
+            # stream_parameter_updater._update_timestep_calculations does — so
+            # read by size rather than assume one fixed layout. Falls back to
+            # the last element when i is out of range (e.g. the non-batched
+            # LCM scalar collapse in prepare(), :695-699).
+            flat = flat.reshape(-1)
+            n = flat.shape[0]
+            if n == n_steps * self.frame_bff_size and self.frame_bff_size > 1:
+                idx = i * self.frame_bff_size
+            elif n == n_steps:
+                idx = i
+            else:
+                idx = min(i, n - 1)
+            return float(flat[min(idx, n - 1)])
+
+        lines = [
+            f"[schedule:{tag}] grid: scheduler={type(self.scheduler).__name__} "
+            f"sampler={self.sampler_type} steps={num_inference_steps} t_index_list={list(self.t_list)}"
+        ]
+        if tag == "refresh":
+            lines.append(
+                "  note: _refresh_derived_tensors() just re-sampled init_noise -- "
+                "cross-frame grain is NOT preserved across this refresh"
+            )
+        lines.append(" idx |    t |   a_sqrt |  b_sqrt  |   b/a   |   c_skip |    c_out")
+        for i, t_idx in enumerate(self.t_list):
+            sub_t = int(self.sub_timesteps[i])
+            a = _row(self.alpha_prod_t_sqrt, i)
+            b = _row(self.beta_prod_t_sqrt, i)
+            cs = _row(self.c_skip, i)
+            co = _row(self.c_out, i)
+            ratio = (b / a) if a else float("inf")
+            lines.append(f" {t_idx:>3} | {sub_t:>4} | {a:>8.4f} | {b:>8.4f} | {ratio:>7.4f} | {cs:>8.2e} | {co:>8.6f}")
+
+        lines.append(
+            f"denoising_steps_num={self.denoising_steps_num} use_denoising_batch={self.use_denoising_batch} "
+            f"frame_buffer_size={self.frame_bff_size} batch_size={self.batch_size} "
+            f"trt_unet_batch_size={self.trt_unet_batch_size}"
+        )
+
+        # do_add_noise reachability verdict — see predict_x0_batch's three branches.
+        if isinstance(self.scheduler, TCDScheduler):
+            reachable = False
+            reason = "TCD scheduler never reads do_add_noise (predict_x0_batch TCD branch, pipeline.py:1448-1458)"
+        elif self.use_denoising_batch and isinstance(self.scheduler, LCMScheduler):
+            reachable = self.denoising_steps_num > 1
+            reason = (
+                "batched-LCM buffer rebuild only reads do_add_noise when denoising_steps_num > 1 "
+                f"(pipeline.py:1393,1420); denoising_steps_num={self.denoising_steps_num}"
+            )
+        else:
+            reachable = n_steps > 1
+            reason = (
+                "sequential/non-batched loop only reads do_add_noise on a non-final step "
+                f"(pipeline.py:1463-1464); t_index_list has {n_steps} "
+                f"entr{'y' if n_steps == 1 else 'ies'}"
+            )
+        lines.append(
+            f"do_add_noise: configured={self.do_add_noise} EFFECTIVE={reachable}"
+            + ("" if reachable else f"  unreachable: {reason}")
+        )
+
+        rcfg_active = self.guidance_scale > 1.0 and self.cfg_type != "none"
+        lines.append(
+            f"cfg_type={self.cfg_type!r} guidance_scale={self.guidance_scale} delta={self.delta} "
+            f"RCFG_active={rcfg_active}"
+            + ("" if rcfg_active else "  (guidance_scale<=1.0 or cfg_type='none': RCFG combine skipped)")
+        )
+
+        x_t_buf = self.x_t_latent_buffer
+        lines.append(
+            "x_t_latent_buffer="
+            + ("None" if x_t_buf is None else f"shape={tuple(x_t_buf.shape)}")
+            + f" cached_attn_active(kvo_cache)={bool(self.kvo_cache)}"
+            f" use_feature_injection={self.use_feature_injection}"
+            f" similar_image_filter={self.similar_image_filter}"
+        )
+
+        # Ghost-bleed check (param_schema.bleed_risk_message) — the same helper
+        # stream_parameter_updater._update_timestep_calculations calls, so this
+        # is the boot-time counterpart: prepare() never calls that method, so
+        # today a config that boots straight into the bad regime never warns.
+        bleed_msg = bleed_risk_message(
+            [_row(self.beta_prod_t_sqrt, i) for i in range(1, n_steps)],
+            self.t_list,
+            self.use_denoising_batch,
+            self.do_add_noise,
+        )
+        if bleed_msg is not None:
+            lines.append(f"ghost-bleed risk: {bleed_msg}")
+            # Dedup against _update_timestep_calculations's own warning: a live
+            # length-changed t_index update calls both that method and this one
+            # for the same schedule build, and should warn once, not twice.
+            if bleed_msg != self._last_bleed_message:
+                logger.warning(bleed_msg)
+        self._last_bleed_message = bleed_msg
+
+        logger.info("\n".join(lines))
+
     @torch.inference_mode()
     def update_prompt(self, prompt: str) -> None:
-        self._param_updater.update_stream_params(prompt_list=[(prompt, 1.0)], prompt_interpolation_method="linear")
+        self._param_updater.update_stream_params(prompt_list=[(prompt, 1.0)], prompt_interpolation_method="average")
 
     def get_normalize_prompt_weights(self) -> bool:
         """Get the current prompt weight normalization setting."""
@@ -899,12 +1063,31 @@ class StreamDiffusion:
                 denoised_batch = self.c_out[idx] * F_theta + self.c_skip[idx] * x_t_latent_batch
             return denoised_batch
 
+    # Empirical: at zoom=1.02 (warp magnitude ~0.028) attenuates FI to ~0.66x; scales
+    # down smoothly to ~0 by zoom~1.1. FI is a hard per-token gate that fights the warp
+    # (see fx_frame_transform docs) — EA is left untouched since it's soft/attention-weighted.
+    _FI_WARP_ATTENUATION_K = 15.0
+
+    def _fi_warp_attenuation(self) -> float:
+        theta = self.fx_frame_transform
+        if theta is None:
+            return 1.0
+        identity = torch.eye(2, device=theta.device, dtype=theta.dtype)
+        linear_dev = (theta[:, :, :2] - identity).flatten(1).norm(dim=1)
+        translation_dev = theta[:, :, 2].norm(dim=1)
+        warp_mag = (linear_dev + translation_dev).max()
+        return float(torch.exp(-self._FI_WARP_ATTENUATION_K * warp_mag).clamp(0.0, 1.0))
+
     def unet_step(
         self,
         x_t_latent: torch.Tensor,
         t_list: Union[torch.Tensor, list[int]],
         idx: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        with profiler.region("unet_step.fi_attenuation"):
+            if self.use_feature_injection and self._fi_strength_tensor is not None:
+                self._fi_strength_tensor.fill_(self._fi_strength_base * self._fi_warp_attenuation())
+
         with profiler.region("unet_step.prep"):
             if self.guidance_scale > 1.0 and (self.cfg_type == "initialize"):
                 # Pre-allocated buf avoids torch.concat malloc for CFG latent doubling

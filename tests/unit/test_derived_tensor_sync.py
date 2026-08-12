@@ -132,6 +132,33 @@ def _make_updater(stream):
     return updater
 
 
+def _add_diagnostics_attrs(stream, sampler_type="normal", guidance_scale=1.2, delta=1.0):
+    """Add the extra attributes StreamDiffusion._log_schedule_diagnostics reads
+    beyond what _make_stream_shell already provides for StreamParameterUpdater
+    testing (frame_buffer_size / cfg_type / c_skip / c_out / alpha,beta /
+    do_add_noise / use_denoising_batch / scheduler / t_list / sub_timesteps /
+    timesteps / batch_size are already set by _make_stream_shell).
+
+    _log_schedule_diagnostics is a StreamDiffusion (pipeline.py) instance
+    method, not a StreamParameterUpdater one -- it's called unbound
+    (StreamDiffusion._log_schedule_diagnostics(stream, tag)) against this same
+    SimpleNamespace shell rather than constructing a real StreamDiffusion,
+    which would need an already-loaded diffusers pipe.
+    """
+    stream.sampler_type = sampler_type
+    stream.denoising_steps_num = len(stream.t_list)
+    stream.trt_unet_batch_size = stream.batch_size
+    stream.guidance_scale = guidance_scale
+    stream.delta = delta
+    stream.x_t_latent_buffer = None
+    stream.kvo_cache = []
+    stream.use_feature_injection = False
+    stream.similar_image_filter = False
+    stream._last_schedule_signature = None
+    stream._last_bleed_message = None
+    return stream
+
+
 # ---------------------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------------------
@@ -228,3 +255,82 @@ class TestDerivedTensorSync:
 
         bleed_warns = [r for r in caplog.records if "do_add_noise=False" in r.message]
         assert not bleed_warns, f"Unexpected bleed-risk warning when do_add_noise=True: {bleed_warns}"
+
+
+class TestScheduleDiagnosticsBoot:
+    """Deliverable 3 / plan verification step 5: _log_schedule_diagnostics (the
+    prepare()/_refresh_derived_tensors() boot-path dump) must warn on the same
+    ghost-bleed regime as the live _update_timestep_calculations path -- a
+    config that boots straight into it previously warned nowhere. It must also
+    respect the schedule-signature gate: unchanged schedule -> dump once;
+    genuine schedule change -> re-log.
+
+    _log_schedule_diagnostics is a StreamDiffusion (pipeline.py) instance
+    method, so it's invoked unbound against the same SimpleNamespace shell
+    used above, extended with _add_diagnostics_attrs.
+    """
+
+    def test_boot_path_warns_on_do_add_noise_false_high_beta(self, caplog):
+        """Simulates the boot path (prepare()) directly -- no prior call to
+        _update_timestep_calculations -- and confirms the ghost-bleed warning
+        still fires. This is the exact case (Deliverable 3, config DAT ships
+        t_index_list=[6, 15] with do_add_noise=false and never went through
+        _update_timestep_calculations at boot) that motivated the fix."""
+        import logging
+
+        from streamdiffusion.pipeline import StreamDiffusion
+
+        stream = _make_stream_shell([14, 28], do_add_noise=False)
+        _add_diagnostics_attrs(stream)
+
+        with caplog.at_level(logging.WARNING, logger="streamdiffusion.pipeline"):
+            StreamDiffusion._log_schedule_diagnostics(stream, "prepare")
+
+        assert any("do_add_noise=False" in r.message for r in caplog.records), (
+            "Expected boot-time ghost-bleed warning not emitted from _log_schedule_diagnostics"
+        )
+
+    def test_boot_path_no_warn_when_do_add_noise_true(self, caplog):
+        """Mirror no-warn case for the boot path: do_add_noise=True must not
+        trip the ghost-bleed warning at boot either."""
+        import logging
+
+        from streamdiffusion.pipeline import StreamDiffusion
+
+        stream = _make_stream_shell([14, 28], do_add_noise=True)
+        _add_diagnostics_attrs(stream)
+
+        with caplog.at_level(logging.WARNING, logger="streamdiffusion.pipeline"):
+            StreamDiffusion._log_schedule_diagnostics(stream, "prepare")
+
+        bleed_warns = [r for r in caplog.records if "do_add_noise=False" in r.message]
+        assert not bleed_warns, f"Unexpected bleed-risk warning when do_add_noise=True: {bleed_warns}"
+
+    def test_signature_gate_dedupes_repeat_and_relogs_on_change(self, caplog):
+        """Two calls with an unchanged schedule signature must produce exactly
+        one [schedule:...] dump (the gate that keeps the __call__ RuntimeError
+        fallback from flooding the log on a recurring shape mismatch,
+        pipeline.py's except RuntimeError -> _refresh_derived_tensors()
+        re-entry). A genuine schedule change (do_add_noise flips) must
+        re-log."""
+        import logging
+
+        from streamdiffusion.pipeline import StreamDiffusion
+
+        stream = _make_stream_shell([14, 28], do_add_noise=True)
+        _add_diagnostics_attrs(stream)
+
+        with caplog.at_level(logging.INFO, logger="streamdiffusion.pipeline"):
+            StreamDiffusion._log_schedule_diagnostics(stream, "refresh")
+            StreamDiffusion._log_schedule_diagnostics(stream, "refresh")  # unchanged signature -> no-op
+
+        dumps = [r for r in caplog.records if r.message.startswith("[schedule:")]
+        assert len(dumps) == 1, f"Expected exactly one dump for two identical-signature calls, got {len(dumps)}"
+
+        # Genuine schedule change (do_add_noise flips) must re-log.
+        stream.do_add_noise = False
+        with caplog.at_level(logging.INFO, logger="streamdiffusion.pipeline"):
+            StreamDiffusion._log_schedule_diagnostics(stream, "refresh")
+
+        dumps = [r for r in caplog.records if r.message.startswith("[schedule:")]
+        assert len(dumps) == 2, f"Expected a second dump after a signature change, got {len(dumps)}"
