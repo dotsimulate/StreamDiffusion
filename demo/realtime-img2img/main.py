@@ -573,7 +573,7 @@ class AppState:
             del config["prompt_blending"]
 
         if self.seed_blending:
-            config["seed_blending"] = {"seed_list": self.seed_blending, "interpolation_method": "linear"}
+            config["seed_blending"] = {"seed_list": self.seed_blending, "interpolation_method": "average"}
             # Note: seed normalization uses same normalize_weights key
             if not self.prompt_blending:  # Only set if not already set by prompt blending
                 config["normalize_weights"] = self.normalize_seed_weights

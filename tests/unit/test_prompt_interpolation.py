@@ -1,10 +1,16 @@
-"""Unit tests for the new prompt interpolation modes added in
+"""Unit tests for the prompt AND seed interpolation modes in
 stream_parameter_updater.py:
 
-  - ``_multi_slerp``      – N-way iterative SLERP (port of reference multi_slerp)
-  - ``_cosine_weighted_blend`` – genuine cosine-similarity weighting before N-way SLERP
+  - ``_multi_slerp``      – N-way iterative SLERP for embeddings (ported reference multi_slerp)
+  - ``_cosine_weighted_blend`` / ``_cosine_adjusted_weights`` – cosine-similarity
+    reweighting, shared by the prompt and seed paths
   - ``_apply_prompt_blending`` dispatch for "cosine_weighted" and N>2 "slerp" paths
-  - ``_last_prompt_interpolation_method`` attribute is recorded and carries across calls
+  - ``_apply_seed_blending`` dispatch for all three methods, incl. the seed-specific
+    ``_multi_slerp_noise`` (N-way slerp for noise) and ``_linear_blend_noise`` (shared by
+    "average" and "cosine_weighted")
+  - ``_last_prompt_interpolation_method`` / ``_last_seed_interpolation_method`` are
+    sticky: recorded on every explicit call, and preserved (not clobbered) across
+    method-omitted calls to ``update_stream_params`` and the six index-level methods
 
 All tests run on CPU with float32 so no GPU is required.
 """
@@ -34,6 +40,18 @@ def _fake_stream():
     # Attributes accessed by OrchestratorUser.attach_orchestrator
     stream._preprocessing_orchestrator = None
     stream.embedding_hooks = []
+    # Accessed unconditionally near the end of update_stream_params, regardless of
+    # which optional params are passed.
+    stream.kvo_cache = None
+    stream.use_feature_injection = False
+    # Seed-blending attributes: latent shape for _cache_seed_noise/add_seed/
+    # update_seed_at_index, and the init_noise bookkeeping _apply_seed_blending touches.
+    stream.latent_height = 8
+    stream.latent_width = 8
+    stream.generator = None
+    stream.current_seed = 0
+    stream.init_noise = None
+    stream._init_noise_rotated = None
     return stream
 
 
@@ -68,6 +86,27 @@ def _rand_embed(shape=(1, 4, 8), seed=0) -> torch.Tensor:
     g = torch.Generator()
     g.manual_seed(seed)
     return torch.randn(*shape, generator=g)
+
+
+def _rand_noise(shape=(1, 4, 8, 8), seed=0) -> torch.Tensor:
+    """Reproducible random seed-noise tensor on CPU/float32 (matches the
+    (batch, 4, latent_h, latent_w) shape _cache_seed_noise generates)."""
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return torch.randn(*shape, generator=g)
+
+
+def _orthonormal_pair(dim=256):
+    """Two exactly-orthogonal, exactly-unit-norm flat vectors, reshaped to the
+    default seed-noise shape (1, 4, 8, 8) (dim=256). Used where the expected cosine
+    similarity needs to be analytically known rather than statistical."""
+    assert dim % 2 == 0
+    half = dim // 2
+    e1 = torch.zeros(dim)
+    e1[:half] = 1.0 / (half**0.5)
+    e2 = torch.zeros(dim)
+    e2[half:] = 1.0 / (half**0.5)
+    return e1.reshape(1, 4, 8, 8), e2.reshape(1, 4, 8, 8)
 
 
 # ---------------------------------------------------------------------------
@@ -237,9 +276,9 @@ class TestApplyPromptBlendingDispatch:
         self.upd._apply_prompt_blending("cosine_weighted")
         assert self.upd._last_prompt_interpolation_method == "cosine_weighted"
 
-    def test_last_method_recorded_linear(self):
-        self.upd._apply_prompt_blending("linear")
-        assert self.upd._last_prompt_interpolation_method == "linear"
+    def test_last_method_recorded_average(self):
+        self.upd._apply_prompt_blending("average")
+        assert self.upd._last_prompt_interpolation_method == "average"
 
     def test_slerp_2_way_uses_slerp_not_multi_slerp(self):
         """With exactly 2 embeddings, 'slerp' must NOT call _multi_slerp."""
@@ -269,26 +308,26 @@ class TestApplyPromptBlendingDispatch:
         assert hasattr(fresh, "_last_prompt_interpolation_method")
         assert fresh._last_prompt_interpolation_method == "slerp"
 
-    def test_unknown_method_falls_back_to_linear(self):
-        """An unrecognised method string must produce the same output as 'linear'."""
-        # Capture the linear result first on a fresh updater sharing the same embeds.
-        upd_linear = _make_updater()
-        upd_linear._prompt_cache = dict(self.upd._prompt_cache)
-        upd_linear._current_prompt_list = list(self.upd._current_prompt_list)
-        upd_linear._current_negative_prompt = ""
-        upd_linear._apply_prompt_blending("linear")
-        linear_embed = upd_linear.stream.prompt_embeds.clone()
+    def test_unknown_method_falls_back_to_average(self):
+        """An unrecognised method string must produce the same output as 'average'."""
+        # Capture the average result first on a fresh updater sharing the same embeds.
+        upd_average = _make_updater()
+        upd_average._prompt_cache = dict(self.upd._prompt_cache)
+        upd_average._current_prompt_list = list(self.upd._current_prompt_list)
+        upd_average._current_negative_prompt = ""
+        upd_average._apply_prompt_blending("average")
+        average_embed = upd_average.stream.prompt_embeds.clone()
 
         # Now run the typo'd string on our main updater.
         self.upd._apply_prompt_blending("cosine_weignted")
         unknown_embed = self.upd.stream.prompt_embeds
 
-        assert torch.allclose(unknown_embed, linear_embed, atol=1e-5), (
-            "Unknown method should fall back to linear interpolation"
+        assert torch.allclose(unknown_embed, average_embed, atol=1e-5), (
+            "Unknown method should fall back to average interpolation"
         )
 
     def test_unknown_method_warns_once(self, caplog):
-        """Exactly one warning per unique unknown string; 'linear' never warns."""
+        """Exactly one warning per unique unknown string; 'average' never warns."""
         import logging
 
         with caplog.at_level(logging.WARNING, logger="streamdiffusion.stream_parameter_updater"):
@@ -301,8 +340,363 @@ class TestApplyPromptBlendingDispatch:
             f"Expected exactly 1 warning for repeated unknown method, got {len(unknown_warnings)}"
         )
 
-        # A 'linear' call must never produce a warning.
+        # An 'average' call must never produce a warning.
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger="streamdiffusion.stream_parameter_updater"):
-            self.upd._apply_prompt_blending("linear")
-        assert not caplog.records, "No warning expected for the 'linear' method"
+            self.upd._apply_prompt_blending("average")
+        assert not caplog.records, "No warning expected for the 'average' method"
+
+
+# ---------------------------------------------------------------------------
+# _cosine_adjusted_weights — shared reweighting helper (used by both the prompt
+# path via _cosine_weighted_blend and the seed path directly)
+# ---------------------------------------------------------------------------
+
+
+class TestCosineAdjustedWeights:
+    """Test the shared reweighting math directly with exactly-orthogonal,
+    exactly-unit-norm vectors so the expected cosine similarities (and therefore the
+    expected adjusted weights) are analytically known rather than statistical."""
+
+    def setup_method(self):
+        self.upd = _make_updater()
+
+    def test_equal_weights_orthogonal_vectors_stay_equal(self):
+        e1, e2 = _orthonormal_pair()
+        adjusted = self.upd._cosine_adjusted_weights([e1, e2], [0.5, 0.5])
+        assert abs(adjusted[0] - adjusted[1]) < 1e-4
+        assert abs(sum(adjusted) - 1.0) < 1e-4, "total weight mass must be preserved"
+
+    def test_unequal_weights_orthogonal_vectors_sharpen_toward_dominant(self):
+        """For orthogonal (uncorrelated) directions, cosine_weighted sharpens the
+        weight distribution toward the already-dominant entry (adj ~ w_i^2,
+        renormalised): its *share* of the total should increase relative to the raw
+        input weights."""
+        e1, e2 = _orthonormal_pair()
+        raw = [0.7, 0.3]
+        adjusted = self.upd._cosine_adjusted_weights([e1, e2], raw)
+        assert abs(sum(adjusted) - sum(raw)) < 1e-3, "total weight mass must be preserved"
+        assert (adjusted[0] / sum(adjusted)) > (raw[0] / sum(raw)), (
+            "the dominant entry's share should increase, not just its absolute weight"
+        )
+
+    def test_single_tensor_weight_preserved(self):
+        e1, _ = _orthonormal_pair()
+        adjusted = self.upd._cosine_adjusted_weights([e1], [2.0])
+        assert abs(adjusted[0] - 2.0) < 1e-4
+
+
+# ---------------------------------------------------------------------------
+# _multi_slerp_noise — N-way spherical fold for seed noise (no magnitude rescale,
+# unlike _multi_slerp for embeddings)
+# ---------------------------------------------------------------------------
+
+
+class TestMultiSlerpNoise:
+    def setup_method(self):
+        self.upd = _make_updater()
+
+    def test_single_tensor_passthrough(self):
+        n = _rand_noise(seed=70)
+        result = self.upd._multi_slerp_noise([n], [1.0])
+        assert torch.allclose(result, n)
+
+    def test_two_way_matches_slerp_noise(self):
+        """With exactly two tensors, _multi_slerp_noise must reduce to _slerp_noise
+        at the same fold ratio (mirrors _multi_slerp's 2-way parity test)."""
+        n1 = _rand_noise(seed=71)
+        n2 = _rand_noise(seed=72)
+        w1, w2 = 0.7, 0.3
+        result_multi = self.upd._multi_slerp_noise([n1, n2], [w1, w2])
+        t_expected = w2 / (w1 + w2)
+        result_direct = self.upd._slerp_noise(n1, n2, t_expected)
+        assert torch.allclose(result_multi, result_direct, atol=1e-5)
+
+    def test_three_way_preserves_shape_and_norm(self):
+        """Independent Gaussian noise tensors are near-orthogonal in high dimension,
+        so each pairwise fold should be close to norm-preserving -- unlike
+        _multi_slerp for embeddings, there is no max(1, sum(weights)) rescale here."""
+        g = torch.Generator()
+        g.manual_seed(80)
+        shape = (1, 4, 64, 64)  # large enough for near-orthogonality to actually hold
+        ns = [torch.randn(*shape, generator=g) for _ in range(3)]
+        weights = [0.5, 0.3, 0.2]
+        result = self.upd._multi_slerp_noise(ns, weights)
+        assert result.shape == shape
+        avg_norm = sum(n.norm().item() for n in ns) / len(ns)
+        assert abs(result.norm().item() - avg_norm) / avg_norm < 0.1
+
+    def test_zero_weight_entry_skipped(self):
+        n1 = _rand_noise(seed=81)
+        n2 = _rand_noise(seed=82)
+        n_zero = _rand_noise(seed=999)
+        result_with = self.upd._multi_slerp_noise([n1, n2, n_zero], [0.6, 0.4, 0.0])
+        result_without = self.upd._multi_slerp_noise([n1, n2], [0.6, 0.4])
+        assert torch.allclose(result_with, result_without, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# _apply_seed_blending dispatch + all three seed methods + _last_seed_interpolation_method
+# ---------------------------------------------------------------------------
+
+
+class TestApplySeedBlending:
+    """_apply_seed_blending, _slerp_noise, and the cosine_weighted/N-way-slerp seed
+    helpers had zero test coverage before this change -- this is new ground."""
+
+    def setup_method(self):
+        self.upd = _make_updater()
+        n1 = _rand_noise(seed=30)
+        n2 = _rand_noise(seed=31)
+        n3 = _rand_noise(seed=32)
+        self.upd._seed_cache = {
+            0: {"noise": n1, "seed": 30},
+            1: {"noise": n2, "seed": 31},
+            2: {"noise": n3, "seed": 32},
+        }
+        self.upd._current_seed_list = [(30, 0.5), (31, 0.3), (32, 0.2)]
+
+    def test_slerp_2_way_uses_slerp_noise_not_multi(self):
+        """With exactly 2 seeds, 'slerp' must NOT call _multi_slerp_noise."""
+        self.upd._current_seed_list = [(30, 0.6), (31, 0.4)]
+        multi_called = []
+        slerp_called = []
+        orig_multi = self.upd._multi_slerp_noise
+        orig_slerp = self.upd._slerp_noise
+
+        def spy_multi(*a, **kw):
+            multi_called.append(True)
+            return orig_multi(*a, **kw)
+
+        def spy_slerp(*a, **kw):
+            slerp_called.append(True)
+            return orig_slerp(*a, **kw)
+
+        self.upd._multi_slerp_noise = spy_multi
+        self.upd._slerp_noise = spy_slerp
+        self.upd._apply_seed_blending("slerp")
+        assert not multi_called, "2-way slerp should use _slerp_noise directly, not _multi_slerp_noise"
+        assert slerp_called, "2-way slerp should call _slerp_noise"
+
+    def test_slerp_n_gt_2_calls_multi_slerp_noise(self):
+        """With 3+ seeds, 'slerp' must delegate to _multi_slerp_noise (previously this
+        silently fell through to average -- Defect B)."""
+        called = []
+        orig = self.upd._multi_slerp_noise
+
+        def spy(*a, **kw):
+            called.append(True)
+            return orig(*a, **kw)
+
+        self.upd._multi_slerp_noise = spy
+        self.upd._apply_seed_blending("slerp")
+        assert called, "slerp with N>2 seeds should delegate to _multi_slerp_noise"
+
+    def test_cosine_weighted_calls_linear_blend_noise(self):
+        """cosine_weighted must exist for seeds at all (previously absent -- Defect B)
+        and must fold through _linear_blend_noise, not _multi_slerp_noise."""
+        called = []
+        orig = self.upd._linear_blend_noise
+
+        def spy(*a, **kw):
+            called.append(True)
+            return orig(*a, **kw)
+
+        self.upd._linear_blend_noise = spy
+        self.upd._apply_seed_blending("cosine_weighted")
+        assert called, "cosine_weighted should delegate to _linear_blend_noise"
+
+    def test_average_calls_linear_blend_noise(self):
+        called = []
+        orig = self.upd._linear_blend_noise
+
+        def spy(*a, **kw):
+            called.append(True)
+            return orig(*a, **kw)
+
+        self.upd._linear_blend_noise = spy
+        self.upd._apply_seed_blending("average")
+        assert called, "average should delegate to _linear_blend_noise"
+
+    def test_last_seed_interpolation_method_recorded(self):
+        self.upd._apply_seed_blending("cosine_weighted")
+        assert self.upd._last_seed_interpolation_method == "cosine_weighted"
+
+    def test_last_seed_interpolation_method_default(self):
+        """Attribute must exist from __init__ with default 'average'."""
+        fresh = _make_updater()
+        assert hasattr(fresh, "_last_seed_interpolation_method")
+        assert fresh._last_seed_interpolation_method == "average"
+
+    def test_cosine_weighted_equal_weights_matches_average_for_orthogonal_noise(self):
+        """With exactly-orthogonal noise tensors and equal input weights, the cosine
+        reweighting is a no-op (see TestCosineAdjustedWeights), so cosine_weighted and
+        average must produce an identical seed blend."""
+        n1, n2 = _orthonormal_pair()
+        upd_cw = _make_updater()
+        upd_avg = _make_updater()
+        for u in (upd_cw, upd_avg):
+            u._seed_cache = {0: {"noise": n1.clone(), "seed": 50}, 1: {"noise": n2.clone(), "seed": 51}}
+            u._current_seed_list = [(50, 0.5), (51, 0.5)]
+        upd_cw._apply_seed_blending("cosine_weighted")
+        upd_avg._apply_seed_blending("average")
+        assert torch.allclose(upd_cw.stream.init_noise, upd_avg.stream.init_noise, atol=1e-4)
+
+    def test_cosine_weighted_unequal_weights_shifts_toward_dominant_seed(self):
+        """With unequal weights, cosine_weighted should push further toward the
+        dominant seed's direction than plain average blending does."""
+        n1, n2 = _orthonormal_pair()
+        upd_cw = _make_updater()
+        upd_avg = _make_updater()
+        for u in (upd_cw, upd_avg):
+            u._seed_cache = {0: {"noise": n1.clone(), "seed": 50}, 1: {"noise": n2.clone(), "seed": 51}}
+            u._current_seed_list = [(50, 0.7), (51, 0.3)]
+        upd_cw._apply_seed_blending("cosine_weighted")
+        upd_avg._apply_seed_blending("average")
+
+        # Projection onto the dominant seed's direction (n1 is a unit vector).
+        proj_cw = (upd_cw.stream.init_noise.flatten() * n1.flatten()).sum().item()
+        proj_avg = (upd_avg.stream.init_noise.flatten() * n1.flatten()).sum().item()
+        assert proj_cw > proj_avg, "cosine_weighted should shift further toward the dominant seed than average"
+
+    def test_average_and_cosine_weighted_preserve_unit_variance(self):
+        """The whole point of the 1/sqrt(sum(w_i^2)) restoration in _linear_blend_noise:
+        blended noise should stay close to unit variance, not shrink toward the
+        weighted-average's under-dispersion."""
+        g = torch.Generator()
+        g.manual_seed(40)
+        shape = (1, 4, 64, 64)
+        n1 = torch.randn(*shape, generator=g)
+        n2 = torch.randn(*shape, generator=g)
+        n3 = torch.randn(*shape, generator=g)
+        for method in ("average", "cosine_weighted"):
+            upd = _make_updater()
+            upd._seed_cache = {
+                0: {"noise": n1.clone(), "seed": 60},
+                1: {"noise": n2.clone(), "seed": 61},
+                2: {"noise": n3.clone(), "seed": 62},
+            }
+            upd._current_seed_list = [(60, 0.5), (61, 0.3), (62, 0.2)]
+            upd._apply_seed_blending(method)
+            std = upd.stream.init_noise.std().item()
+            assert abs(std - 1.0) < 0.15, f"{method}: blended std={std:.3f}, expected ~1.0"
+
+    def test_unknown_method_falls_back_to_average(self):
+        """An unrecognised method string must produce the same output as 'average'
+        (the seed path previously had no such fallback documented/tested at all)."""
+        n1 = _rand_noise(seed=90)
+        n2 = _rand_noise(seed=91)
+
+        upd_average = _make_updater()
+        upd_average._seed_cache = {0: {"noise": n1.clone(), "seed": 90}, 1: {"noise": n2.clone(), "seed": 91}}
+        upd_average._current_seed_list = [(90, 0.6), (91, 0.4)]
+        upd_average._apply_seed_blending("average")
+        average_noise = upd_average.stream.init_noise.clone()
+
+        upd = _make_updater()
+        upd._seed_cache = {0: {"noise": n1.clone(), "seed": 90}, 1: {"noise": n2.clone(), "seed": 91}}
+        upd._current_seed_list = [(90, 0.6), (91, 0.4)]
+        upd._apply_seed_blending("cosine_weignted")
+
+        assert torch.allclose(upd.stream.init_noise, average_noise, atol=1e-5), (
+            "Unknown method should fall back to average interpolation"
+        )
+
+    def test_unknown_method_warns_once(self, caplog):
+        """Exactly one warning per unique unknown string; 'average' never warns.
+        Shares the same warn-once set as the prompt path."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="streamdiffusion.stream_parameter_updater"):
+            self.upd._apply_seed_blending("cosine_weignted")
+            self.upd._apply_seed_blending("cosine_weignted")
+
+        unknown_warnings = [r for r in caplog.records if "cosine_weignted" in r.message]
+        assert len(unknown_warnings) == 1, (
+            f"Expected exactly 1 warning for repeated unknown method, got {len(unknown_warnings)}"
+        )
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="streamdiffusion.stream_parameter_updater"):
+            self.upd._apply_seed_blending("average")
+        assert not caplog.records, "No warning expected for the 'average' method"
+
+
+# ---------------------------------------------------------------------------
+# Stickiness regression tests (Defect A): a method-only update must take effect
+# immediately, and a subsequent list-only update must not revert to a signature
+# default. Exercised through the real update_stream_params entrypoint plus a
+# representative index-level method on each side (add_prompt / update_seed_at_index).
+# ---------------------------------------------------------------------------
+
+
+class TestStickyInterpolationMethods:
+    def setup_method(self):
+        self.upd = _make_updater()
+        e1 = _rand_embed(seed=100)
+        e2 = _rand_embed(seed=101)
+        self.upd._prompt_cache = {0: {"embed": e1, "text": "cat"}, 1: {"embed": e2, "text": "dog"}}
+        self.upd._current_prompt_list = [("cat", 0.5), ("dog", 0.5)]
+        self.upd._current_negative_prompt = ""
+
+        n1 = _rand_noise(seed=110)
+        n2 = _rand_noise(seed=111)
+        self.upd._seed_cache = {0: {"noise": n1, "seed": 110}, 1: {"noise": n2, "seed": 111}}
+        self.upd._current_seed_list = [(110, 0.5), (111, 0.5)]
+
+    def test_method_only_prompt_update_reblends_immediately(self):
+        """Consequence 1: pre-fix, a method-only change did nothing at all."""
+        assert self.upd.stream.prompt_embeds is None  # nothing blended yet
+        self.upd.update_stream_params(prompt_interpolation_method="cosine_weighted")
+        assert self.upd._last_prompt_interpolation_method == "cosine_weighted"
+        assert self.upd.stream.prompt_embeds is not None
+
+    def test_method_only_seed_update_reblends_immediately(self):
+        assert self.upd.stream.init_noise is None
+        self.upd.update_stream_params(seed_interpolation_method="cosine_weighted")
+        assert self.upd._last_seed_interpolation_method == "cosine_weighted"
+        assert self.upd.stream.init_noise is not None
+
+    def test_list_only_update_preserves_sticky_prompt_method(self):
+        """Consequence 2: a prompt-weight drag must not silently revert the method."""
+        self.upd.update_stream_params(prompt_interpolation_method="average")
+        assert self.upd._last_prompt_interpolation_method == "average"
+        # Weight-drag: new prompt_list, no method specified.
+        self.upd.update_stream_params(prompt_list=[("cat", 0.6), ("dog", 0.4)])
+        assert self.upd._last_prompt_interpolation_method == "average"
+
+    def test_bare_seed_list_update_preserves_sticky_seed_method(self):
+        """Consequence 3: the per-frame seed randomizer sends seed_list alone; it must
+        not re-default the method to 'average' every frame."""
+        self.upd.update_stream_params(seed_interpolation_method="slerp")
+        assert self.upd._last_seed_interpolation_method == "slerp"
+        self.upd.update_stream_params(seed_list=[(110, 0.5), (111, 0.5)])
+        assert self.upd._last_seed_interpolation_method == "slerp"
+
+    def test_add_prompt_preserves_sticky_method(self):
+        """Consequence 4: add_prompt's own signature default must not clobber the
+        sticky value when the caller omits the method."""
+        self.upd.update_stream_params(prompt_interpolation_method="cosine_weighted")
+
+        def fake_encode_prompt(prompt, **kwargs):
+            return (_rand_embed(seed=abs(hash(prompt)) % 1000),)
+
+        self.upd.stream.pipe = types.SimpleNamespace(encode_prompt=fake_encode_prompt)
+        self.upd.add_prompt("bird", weight=0.2)
+        assert self.upd._last_prompt_interpolation_method == "cosine_weighted"
+
+    def test_update_seed_at_index_preserves_sticky_method(self):
+        """Same as above, for the seed-side index methods."""
+        self.upd.update_stream_params(seed_interpolation_method="slerp")
+        self.upd.update_seed_at_index(0, new_seed=999)
+        assert self.upd._last_seed_interpolation_method == "slerp"
+
+    def test_method_only_update_before_any_prompt_or_seed_is_a_noop(self):
+        """A method-only change before any prompt/seed list exists must be recorded but
+        not crash -- both _apply_* early-return on an empty list/cache."""
+        fresh = _make_updater()
+        fresh.update_stream_params(prompt_interpolation_method="slerp", seed_interpolation_method="cosine_weighted")
+        assert fresh._last_prompt_interpolation_method == "slerp"
+        assert fresh._last_seed_interpolation_method == "cosine_weighted"
+        assert fresh.stream.prompt_embeds is None
+        assert fresh.stream.init_noise is None

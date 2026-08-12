@@ -71,7 +71,7 @@ def _make_updater(stream):
     # stub must too, or the resize path raises AttributeError before it ever
     # reaches the buffer-rebuild logic this file actually tests.
     updater._current_prompt_list = []
-    updater._last_prompt_interpolation_method = "linear"
+    updater._last_prompt_interpolation_method = "average"
     return updater
 
 
