@@ -96,3 +96,65 @@ class TestUnetEnginePathLength:
 
         assert path_a != path_b
         assert path_a.parent != path_b.parent
+
+
+class TestFp8RecipeTagV4:
+    """fp8-round-8: the fp8 tag bumped --fp8v3 -> --fp8v4 (the scale-conversion math
+    changed — see fp8_quantize.py::_rescale_fp8_qdq_scales — so every existing v3
+    engine is stale even with every recipe flag at its default) and gained new
+    components for fp8_scale_headroom / fp8_exclude_attention. This tag is built by
+    EngineManager._fp8_recipe_tag and used verbatim (not hashed) in the final UNet
+    directory name at both engine_manager.py:~197 (feeds the canonical/hash string)
+    and :~287 (the literal on-disk suffix) — the two call sites must stay in sync.
+    """
+
+    def test_default_recipe_uses_v4_base_tag(self):
+        em = _make_engine_manager(_CRASH_ENGINE_DIR)
+        path = em.get_engine_path(**dict(_CRASH_UNET_KWARGS, fp8_mha_qdq=False))
+        assert "fp8v3" not in path.parent.name
+        assert "fp8v4" in path.parent.name
+
+    def test_all_new_recipe_flags_stay_under_max_path(self):
+        """Worst case for the length regression this file guards: every fp8-round-8
+        recipe flag active at once, on top of the already-tight crash config."""
+        em = _make_engine_manager(_CRASH_ENGINE_DIR)
+        kwargs = dict(
+            _CRASH_UNET_KWARGS,
+            fp8_mha_qdq=True,
+            fp8_exclude_attention=True,
+            fp8_scale_headroom=2.0,
+        )
+        engine_path = em.get_engine_path(**kwargs)
+        onnx_path = str(engine_path) + ".onnx"
+        opt_onnx_path = str(engine_path) + ".opt.onnx"
+
+        assert len(onnx_path) < 260, f"onnx path is {len(onnx_path)} chars (MAX_PATH=260): {onnx_path}"
+        assert len(opt_onnx_path) < 260, f"opt.onnx path is {len(opt_onnx_path)} chars (MAX_PATH=260): {opt_onnx_path}"
+
+    def test_recipe_flags_fork_the_path_independently(self):
+        em = _make_engine_manager(_CRASH_ENGINE_DIR)
+        base = em.get_engine_path(**_CRASH_UNET_KWARGS)
+        mhaq = em.get_engine_path(**dict(_CRASH_UNET_KWARGS, fp8_mha_qdq=True))
+        noattn = em.get_engine_path(**dict(_CRASH_UNET_KWARGS, fp8_exclude_attention=True))
+        hr2 = em.get_engine_path(**dict(_CRASH_UNET_KWARGS, fp8_scale_headroom=2.0))
+
+        assert len({base, mhaq, noattn, hr2}) == 4, "each recipe flag must fork a distinct engine directory"
+
+    def test_recipe_flags_compose(self):
+        """All three flags together must differ from any single flag alone — guards
+        against one flag's suffix silently overwriting another's in string concat."""
+        em = _make_engine_manager(_CRASH_ENGINE_DIR)
+        mhaq_only = em.get_engine_path(**dict(_CRASH_UNET_KWARGS, fp8_mha_qdq=True))
+        all_three = em.get_engine_path(
+            **dict(_CRASH_UNET_KWARGS, fp8_mha_qdq=True, fp8_exclude_attention=True, fp8_scale_headroom=2.0)
+        )
+        assert mhaq_only != all_three
+
+    def test_recipe_tag_is_deterministic(self):
+        em = _make_engine_manager(_CRASH_ENGINE_DIR)
+        kwargs = dict(_CRASH_UNET_KWARGS, fp8_mha_qdq=True, fp8_exclude_attention=True, fp8_scale_headroom=2.0)
+
+        path_a = em.get_engine_path(**kwargs)
+        path_b = em.get_engine_path(**kwargs)
+
+        assert path_a == path_b

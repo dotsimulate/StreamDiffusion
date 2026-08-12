@@ -733,10 +733,16 @@ class UNet(BaseModel):
             # hardcoded resolution for now due to VRAM limitations
             # NOTE: dim[0]=2 (K/V pair) must stay static — attention Gather nodes
             # index into it at idx=0 and idx=1, so dim[0]<2 causes OOB errors.
-            # The "C" (cache-frames) axis is itself dropped when pin_cache_frames has
+            # The "C" (cache-frames) axis is dropped here when pin_cache_frames has
             # pinned min_cache_maxframes == max_cache_maxframes (has_symbolic_cache_dims
-            # False) so the exported graph has no symbolic dims left and TRT's l2tc
-            # (L2 tiling) pass can validate.
+            # False) -- but that drop is local to kvo/fio bindings. "sample" /
+            # "timestep" / "encoder_hidden_states" above still declare "2B" (and "H"/"W")
+            # unconditionally, so a fully-pinned build's exported ONNX still has plenty
+            # of symbolic dims (verified: 120 of 122 inputs on a current build). What
+            # actually lets TRT's l2tc (L2 tiling) pass validate is that the engine's
+            # single optimization profile has min=opt=max for every dim -- TRT
+            # specializes the network to concrete shapes at build time from that,
+            # independent of what the ONNX itself declares as dynamic.
             for i in range(self.kvo_cache_count):
                 base_axes[f"kvo_cache_in_{i}"] = {1: "C", 2: "2B"} if self.has_symbolic_cache_dims else {2: "2B"}
                 base_axes[f"kvo_cache_out_{i}"] = {2: "2B"}
