@@ -24,7 +24,12 @@ class FaceIDEmbeddingPreprocessor(IPAdapterEmbeddingPreprocessor):
                 "faceid_v2_weight": {
                     "type": "float",
                     "default": 1.0,
-                    "description": "Weight for FaceID v2 models (higher values = stronger identity preservation)",
+                    "description": (
+                        "Weight for FaceID-Plus/v2 models only (passed through to "
+                        "diffusers_ipadapter's is_plus LoRA-scale/shortcut branch). Has "
+                        "no effect on plain (non-Plus) FaceID — the value is accepted "
+                        "but never read outside that branch."
+                    ),
                 }
             },
             "use_cases": [
@@ -76,7 +81,3 @@ class FaceIDEmbeddingPreprocessor(IPAdapterEmbeddingPreprocessor):
             msg = f"FaceIDEmbeddingPreprocessor: Failed to extract face embeddings: {e}"
             report_error(msg)
             raise RuntimeError(msg) from e
-
-    def update_faceid_v2_weight(self, weight: float) -> None:
-        self.faceid_v2_weight = float(weight)
-        print(f"FaceIDEmbeddingPreprocessor.update_faceid_v2_weight: Updated weight to {self.faceid_v2_weight}")

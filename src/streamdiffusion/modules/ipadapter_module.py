@@ -41,6 +41,47 @@ class IPAdapterConfig:
     type: IPAdapterType = IPAdapterType.REGULAR
     insightface_model_name: Optional[str] = None
 
+    @classmethod
+    def from_dict(cls, cfg: Dict[str, Any]) -> IPAdapterConfig:
+        """Build an IPAdapterConfig from a raw config dict (the ``ipadapter_config``
+        shape passed through ``wrapper.py``).
+
+        A4: both wrapper.py install sites (pre-TRT and post-TRT) previously built this
+        by hand with identical inline field lists — centralized here. Not used by
+        ``StreamParameterUpdater._get_current_ipadapter_config``: that dict is
+        deliberately lossy/demo-only (``demo/realtime-img2img``) and must not gain new
+        required-field validation.
+
+        Raises:
+            KeyError: if ``ipadapter_model_path`` or ``image_encoder_path`` is missing.
+            ValueError: if ``type == "faceid"`` and ``insightface_model_name`` is not
+                set. Without it, ``IPAdapter.insightface_model`` silently stays ``None``
+                and the failure only surfaces later, mid-stream, when the first style
+                image update raises inside ``_get_faceid_embeds`` — the same silent/late
+                failure class as B1/B2. Rejecting it here, at construction time, makes
+                the misconfiguration loud immediately.
+        """
+        adapter_type = IPAdapterType(cfg.get("type", "regular"))
+        insightface_model_name = cfg.get("insightface_model_name")
+
+        if adapter_type == IPAdapterType.FACEID and not insightface_model_name:
+            raise ValueError(
+                "IPAdapterConfig.from_dict: type='faceid' requires 'insightface_model_name' "
+                "to be set (e.g. 'buffalo_l') — without it, FaceID processing fails only "
+                "once a style image is actually submitted, mid-stream."
+            )
+
+        return cls(
+            style_image_key=cfg.get("style_image_key") or "ipadapter_main",
+            num_image_tokens=cfg.get("num_image_tokens", 4),
+            ipadapter_model_path=cfg["ipadapter_model_path"],
+            image_encoder_path=cfg["image_encoder_path"],
+            style_image=cfg.get("style_image"),
+            scale=cfg.get("scale", 1.0),
+            type=adapter_type,
+            insightface_model_name=insightface_model_name,
+        )
+
 
 # ---------------------------------------------------------------------------
 # IP-Adapter model path mapping by base model architecture and adapter type
@@ -459,8 +500,16 @@ class IPAdapterModule(OrchestratorUser):
             local_path = hf_hub_download(repo_id=repo_id, filename=subpath)
             return local_path
         else:
-            # Directory download
-            repo_root = snapshot_download(repo_id=repo_id, allow_patterns=[f"{subpath}/*"])
+            # Directory download.
+            # A6: HF image_encoder repos ship both model.safetensors and
+            # pytorch_model.bin (~3.69 GB each) for the same weights — transformers
+            # loads safetensors automatically when present, so the .bin (and other
+            # legacy formats) are pure dead weight on every fresh download.
+            repo_root = snapshot_download(
+                repo_id=repo_id,
+                allow_patterns=[f"{subpath}/*"],
+                ignore_patterns=["*.bin", "*.msgpack", "*.h5"],
+            )
             full_path = os.path.join(repo_root, subpath)
             if not os.path.exists(full_path):
                 raise FileNotFoundError(f"IPAdapterModule._resolve_model_path: Downloaded path not found: {full_path}")

@@ -2248,7 +2248,6 @@ class StreamDiffusionWrapper:
                             from streamdiffusion.modules.ipadapter_module import (
                                 IPAdapterConfig,
                                 IPAdapterModule,
-                                IPAdapterType,
                             )
 
                             logger.info("Installing IPAdapter module before TensorRT compilation...")
@@ -2259,16 +2258,7 @@ class StreamDiffusionWrapper:
 
                             # Use first config if list provided
                             cfg = ipadapter_config[0] if isinstance(ipadapter_config, list) else ipadapter_config
-                            ip_cfg = IPAdapterConfig(
-                                style_image_key=cfg.get("style_image_key") or "ipadapter_main",
-                                num_image_tokens=cfg.get("num_image_tokens", 4),
-                                ipadapter_model_path=cfg["ipadapter_model_path"],
-                                image_encoder_path=cfg["image_encoder_path"],
-                                style_image=cfg.get("style_image"),
-                                scale=cfg.get("scale", 1.0),
-                                type=IPAdapterType(cfg.get("type", "regular")),
-                                insightface_model_name=cfg.get("insightface_model_name"),
-                            )
+                            ip_cfg = IPAdapterConfig.from_dict(cfg)
                             ip_module = IPAdapterModule(ip_cfg)
                             ip_module.install(stream)
                             # Expose for later updates
@@ -2852,24 +2842,12 @@ class StreamDiffusionWrapper:
             and hasattr(stream.unet, "attn_processors")
         ):
             try:
-                from streamdiffusion.modules.ipadapter_module import IPAdapterConfig, IPAdapterModule, IPAdapterType
+                from streamdiffusion.modules.ipadapter_module import IPAdapterConfig, IPAdapterModule
 
                 # Use first config if list provided
                 cfg = ipadapter_config[0] if isinstance(ipadapter_config, list) else ipadapter_config
 
-                # Get adapter type from config
-                ipadapter_type = IPAdapterType(cfg["type"])
-
-                ip_cfg = IPAdapterConfig(
-                    style_image_key=cfg.get("style_image_key") or "ipadapter_main",
-                    num_image_tokens=cfg.get("num_image_tokens", 4),
-                    ipadapter_model_path=cfg["ipadapter_model_path"],
-                    image_encoder_path=cfg["image_encoder_path"],
-                    style_image=cfg.get("style_image"),
-                    scale=cfg.get("scale", 1.0),
-                    type=ipadapter_type,
-                    insightface_model_name=cfg.get("insightface_model_name"),
-                )
+                ip_cfg = IPAdapterConfig.from_dict(cfg)
                 ip_module = IPAdapterModule(ip_cfg)
                 _saved_unet_processors_post = dict(stream.unet.attn_processors)
                 ip_module.install(stream)
