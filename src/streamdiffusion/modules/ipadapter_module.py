@@ -203,10 +203,16 @@ class IPAdapterModule(OrchestratorUser):
         self.ipadapter: Optional[Any] = None
 
     def build_embedding_hook(self, stream) -> EmbeddingHook:
-        style_key = self.config.style_image_key or "default"
+        # S4: must match install()'s default (below) — a mismatch here would silently
+        # miss the cache under the key install() actually populated, hitting the
+        # zero-fill path below on every frame. Latent today only because both wrapper
+        # call sites (wrapper.py:2263, :2864) pin style_image_key explicitly.
+        style_key = self.config.style_image_key or "ipadapter_main"
         num_tokens = int(self.config.num_image_tokens)
+        warned_zero_fill = False
 
         def _embedding_hook(ctx: EmbedsCtx) -> EmbedsCtx:
+            nonlocal warned_zero_fill
             # Fetch cached image token embeddings (prompt, negative)
             cached: Optional[Tuple[torch.Tensor, torch.Tensor]] = stream._param_updater.get_cached_embeddings(
                 style_key
@@ -220,6 +226,18 @@ class IPAdapterModule(OrchestratorUser):
             hidden_dim = ctx.prompt_embeds.shape[2]
             batch_size = ctx.prompt_embeds.shape[0]
             if image_prompt_tokens is None:
+                # S4: silent zero-fill is the same failure class as B1/B2 — it disables
+                # image conditioning without ever raising or failing a shape check.
+                # Warn once per hook instance so a real-time streaming loop doesn't
+                # spam this every frame.
+                if not warned_zero_fill:
+                    logger.warning(
+                        "IPAdapterModule: no cached image-token embeddings for "
+                        f"style_image_key='{style_key}' — falling back to zero-filled "
+                        "tokens (image conditioning is a no-op until a style image is "
+                        "processed for this key). Logged once per hook instance."
+                    )
+                    warned_zero_fill = True
                 image_prompt_tokens = torch.zeros(
                     (batch_size, num_tokens, hidden_dim),
                     dtype=ctx.prompt_embeds.dtype,
