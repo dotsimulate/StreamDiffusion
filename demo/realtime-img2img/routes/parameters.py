@@ -193,7 +193,7 @@ async def update_blending(request: Request, app_instance=Depends(get_app_instanc
         # Handle seed blending
         if "seed_list" in data:
             seed_list = data["seed_list"]
-            interpolation_method = data.get("seed_interpolation_method", "linear")
+            interpolation_method = data.get("seed_interpolation_method", "average")
 
             if not isinstance(seed_list, list):
                 raise HTTPException(status_code=400, detail="seed_list must be a list")

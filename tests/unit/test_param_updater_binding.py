@@ -113,7 +113,7 @@ class _FakeWrapper:
     def prepare(self, **kwargs):  # not exercised on the seed-only path, present for safety
         pass
 
-    def update_stream_params(self, *, seed_list=None, seed_interpolation_method="linear"):
+    def update_stream_params(self, *, seed_list=None, seed_interpolation_method="average"):
         self.update_calls.append({"seed_list": seed_list, "seed_interpolation_method": seed_interpolation_method})
 
 
@@ -121,7 +121,7 @@ def test_seed_only_blending_uses_seed_interpolation_method():
     from streamdiffusion import config as config_mod
 
     seed_list = [(1, 0.5), (2, 0.5)]
-    cfg = {"seed_blending": {"seed_list": seed_list, "interpolation_method": "linear"}}
+    cfg = {"seed_blending": {"seed_list": seed_list, "interpolation_method": "average"}}
 
     with patch("streamdiffusion.StreamDiffusionWrapper", _FakeWrapper):
         wrapper = config_mod.create_wrapper_from_config(cfg)
@@ -130,4 +130,4 @@ def test_seed_only_blending_uses_seed_interpolation_method():
     assert len(wrapper.update_calls) == 1
     call = wrapper.update_calls[0]
     assert call["seed_list"] == seed_list
-    assert call["seed_interpolation_method"] == "linear"
+    assert call["seed_interpolation_method"] == "average"

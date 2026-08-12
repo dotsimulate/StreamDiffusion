@@ -31,7 +31,7 @@ for current consumers.
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 # Interpolation-method aliases shared by the wrapper and updater signatures.
 PromptInterpolationMethod = Literal["linear", "slerp", "cosine_weighted"]
@@ -176,3 +176,68 @@ def rescale_t_index_list(old_t_list: List[int], old_num_steps: int, new_num_step
     """
     scale_factor = (new_num_steps - 1) / (old_num_steps - 1) if old_num_steps > 1 else 1.0
     return [min(round(t * scale_factor), new_num_steps - 1) for t in old_t_list]
+
+
+def compute_sub_timesteps(timesteps: Any, t_index_list: List[int]) -> List[Any]:
+    """Select the UNet-facing timestep value for each configured t_index.
+
+    Extracted 1:1 from pipeline.py's prepare() (``for t in self.t_list:
+    self.sub_timesteps.append(self.timesteps[t])``) and
+    stream_parameter_updater.py's ``_update_timestep_calculations``, which
+    duplicate the exact same indexing.
+
+    ``timesteps`` must already be the scheduler's *materialised* grid
+    (``scheduler.timesteps`` after ``set_timesteps`` — and, in prepare(),
+    after any sampler-specific spacing override has been applied). This
+    helper deliberately does not call ``set_timesteps`` itself: doing so
+    would silently discard prepare()'s spacing override for the
+    ``_SPACING_SAMPLERS`` samplers (see pipeline.py's ``prepare()``).
+    """
+    return [timesteps[t] for t in t_index_list]
+
+
+# Ghost-bleed inter-step beta_sqrt threshold. See bleed_risk_message.
+GHOST_BLEED_THRESHOLD: float = 0.75
+
+
+def bleed_risk_message(
+    inter_step_betas: Sequence[float],
+    t_list: Sequence[int],
+    use_denoising_batch: bool,
+    do_add_noise: bool,
+    threshold: float = GHOST_BLEED_THRESHOLD,
+) -> Optional[str]:
+    """Warning text if the current schedule risks ghost bleed from the
+    previous frame's content, or None if it doesn't apply.
+
+    Extracted 1:1 from stream_parameter_updater.py's
+    ``_update_timestep_calculations`` (~:1216-1236). Only meaningful on the
+    batched multi-step path: with ``do_add_noise=False`` the denoising-batch
+    pipelining trick hands each inter-step slot the *previous frame's*
+    partially-denoised latent with no noise re-injected, so a large
+    inter-step beta_sqrt (marginal noise std at that step) means the model
+    is being asked to resolve a residual it was never given the noise budget
+    to explain — audible as bleed from the prior frame.
+
+    ``inter_step_betas`` must be the per-step ``beta_prod_t_sqrt`` values for
+    the sub_timesteps *after* the first (index 0 has no "previous step" to
+    bleed from), pre-``repeat_interleave`` — i.e. ``beta_prod_t_sqrt[1:, 0,
+    0, 0]`` in pipeline.py's tensor layout.
+
+    Callers own their own logging call (this returns text, not a log side
+    effect), so the same message can be shared between
+    ``_update_timestep_calculations`` and a schedule-diagnostics dump without
+    either one depending on the other's logger.
+    """
+    if not (use_denoising_batch and not do_add_noise and len(t_list) > 1):
+        return None
+    if not inter_step_betas:
+        return None
+    max_beta = max(inter_step_betas)
+    if max_beta <= threshold:
+        return None
+    return (
+        f"do_add_noise=False + use_denoising_batch: inter-step beta_sqrt={max_beta:.3f} "
+        f"(t_index={list(t_list[1:])}) exceeds {threshold:.2f}. Previous-frame ghost bleed likely -- "
+        "consider enabling do_add_noise (reference fork default)."
+    )
