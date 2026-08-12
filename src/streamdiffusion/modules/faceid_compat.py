@@ -4,16 +4,17 @@
 ``livepeer/Diffusers_IPAdapter``), so it cannot be edited directly — edits are lost on
 reinstall. This module holds the fixes as monkeypatches / free functions, applied from
 ``IPAdapterModule.install()`` at runtime, and documents the silent-failure defects and
-wasted-work findings from ``docs/plans/FaceID_PLAN.md`` (B1, S1).
+wasted-work findings from ``docs/plans/FaceID_PLAN.md`` (B1, B2, S1).
 
-B1 produces **no errors or warnings** — FaceID runs end-to-end and looks healthy in the
-log while barely transferring any identity. S1 is not a correctness defect, just a
-redundant InsightFace pass on every SDXL update.
+B1 and B2 produce **no errors or warnings** — FaceID runs end-to-end and looks healthy
+in the log while barely transferring any identity. S1 is not a correctness defect, just
+a redundant InsightFace pass on every SDXL update.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Any, Dict
 
 import numpy as np
 import torch
@@ -157,3 +158,110 @@ def _apply_single_pass_face_conditioning_patch() -> None:
         "apply_faceid_patches: patched prepare_face_conditioning to detect faces once per "
         "update instead of twice (S1)."
     )
+
+
+# ---------------------------------------------------------------------------
+# B2 — the FaceID checkpoint's rank-128 LoRA (to_{q,k,v,out}_lora on all 140 attention
+# modules) is silently discarded. ip_adapter.py's strict load filters "lora"/"LoRA" keys
+# for FaceID models because no LoRA-aware processor exists in attention_processor.py,
+# and the TensorRT export path (unet_ipadapter_export.py) rebuilds every processor
+# before ONNX export regardless, so a processor-resident LoRA would be lost there too.
+# Fusing the LoRA into the base attention linears survives both paths.
+# ---------------------------------------------------------------------------
+_LORA_TARGET_ATTR: Dict[str, str] = {
+    "to_q_lora": "to_q",
+    "to_k_lora": "to_k",
+    "to_v_lora": "to_v",
+    "to_out_lora": "to_out.0",
+}
+
+
+def _load_faceid_state_dict(ckpt_path: str) -> Dict[str, Any]:
+    try:
+        return torch.load(ckpt_path, map_location="cpu", weights_only=True, mmap=True)
+    except TypeError:
+        # Older torch without the mmap kwarg.
+        return torch.load(ckpt_path, map_location="cpu", weights_only=True)
+
+
+def fuse_faceid_lora(unet: torch.nn.Module, ckpt_path: str, lora_scale: float = 1.0) -> int:
+    """Fuse the FaceID checkpoint's per-layer LoRA weights into the UNet's attention linears.
+
+    For each of the UNet's ``attn_processors`` (index ``i``, in ``unet.attn_processors``
+    iteration order — the same order ``diffusers_ipadapter`` uses to load
+    ``to_k_ip``/``to_v_ip``), adds ``(up @ down) * lora_scale`` into ``to_q``, ``to_k``,
+    ``to_v`` and ``to_out[0]`` of the corresponding attention module.
+
+    This is mathematically exact at ``lora_scale=1.0``: in h94's LoRA(IP)AttnProcessor,
+    each LoRA branch consumes the same input tensor as the base linear it parallels
+    (``to_q_lora`` <- ``hidden_states``; ``to_k_lora``/``to_v_lora`` <- the text slice of
+    ``encoder_hidden_states``, exactly what ``attn.to_k``/``attn.to_v`` receive;
+    ``to_out_lora`` <- the blended hidden states), and h94's ``LoRALinearLayer`` leaves
+    ``network_alpha=None`` — plain ``up @ down``, no rank/alpha division.
+
+    Once fused, the LoRA is permanent and is *not* modulated by ``ipadapter_scale`` at
+    runtime — this matches h94's reference behaviour (fixed ``lora_scale=1.0``). Callers
+    must bump the TensorRT engine cache-key marker (B3) so stale pre-fusion engines are
+    never reused.
+
+    Idempotent: a second call on an already-fused UNet is a no-op. Raises ``RuntimeError``
+    on any LoRA delta / target weight shape mismatch rather than silently skipping it —
+    this defect class (B1/B2) is exactly the silent-no-op failure this fix exists to end.
+
+    Returns the number of attention modules that received a fused update (0 if the
+    checkpoint carries no LoRA — e.g. a non-FaceID IP-Adapter — or the UNet was already
+    fused).
+    """
+    if getattr(unet, "_sdtd_faceid_lora_fused", False):
+        logger.info("fuse_faceid_lora: UNet already has fused FaceID LoRA — skipping.")
+        return 0
+
+    ckpt = _load_faceid_state_dict(ckpt_path)
+    ip_adapter_state_dict: Dict[str, torch.Tensor] = ckpt.get("ip_adapter", {})
+
+    if not any("_lora." in key for key in ip_adapter_state_dict):
+        logger.info("fuse_faceid_lora: checkpoint has no LoRA keys — nothing to fuse.")
+        del ckpt, ip_adapter_state_dict
+        return 0
+
+    processor_keys = list(unet.attn_processors.keys())
+    fused_layers = 0
+
+    with torch.no_grad():
+        for i, proc_key in enumerate(processor_keys):
+            if not proc_key.endswith(".processor"):
+                continue
+            module_path = proc_key[: -len(".processor")]
+
+            layer_fused = False
+            for lora_name, target_attr in _LORA_TARGET_ATTR.items():
+                down_key = f"{i}.{lora_name}.down.weight"
+                up_key = f"{i}.{lora_name}.up.weight"
+                if down_key not in ip_adapter_state_dict or up_key not in ip_adapter_state_dict:
+                    continue
+
+                down = ip_adapter_state_dict[down_key].float()
+                up = ip_adapter_state_dict[up_key].float()
+                delta = (up @ down) * lora_scale
+
+                target_linear = unet.get_submodule(f"{module_path}.{target_attr}")
+                if delta.shape != target_linear.weight.shape:
+                    raise RuntimeError(
+                        f"fuse_faceid_lora: shape mismatch at layer {i} "
+                        f"({module_path}.{target_attr}): delta {tuple(delta.shape)} "
+                        f"vs weight {tuple(target_linear.weight.shape)}"
+                    )
+                target_linear.weight.add_(
+                    delta.to(dtype=target_linear.weight.dtype, device=target_linear.weight.device)
+                )
+                layer_fused = True
+
+            if layer_fused:
+                fused_layers += 1
+
+    del ckpt, ip_adapter_state_dict
+    unet._sdtd_faceid_lora_fused = True
+    logger.info(
+        f"fuse_faceid_lora: fused FaceID LoRA into {fused_layers} attention modules (lora_scale={lora_scale})."
+    )
+    return fused_layers

@@ -321,6 +321,21 @@ class IPAdapterModule(OrchestratorUser):
         ipadapter = IPAdapter(**ip_kwargs)
         self.ipadapter = ipadapter
 
+        # B2: the FaceID checkpoint's rank-128 LoRA is silently discarded by the vendored
+        # strict load (it filters "lora"/"LoRA" keys — no LoRA-aware processor exists) and
+        # would be lost again by the TensorRT export path even if it did load. Fuse it
+        # directly into the UNet's attention linears instead, where no processor rebuild
+        # can touch it. B3 (engine cache-key marker) MUST accompany this — see
+        # engine_manager.py's EngineType.UNET branch.
+        if self.config.type == IPAdapterType.FACEID:
+            try:
+                from streamdiffusion.modules.faceid_compat import fuse_faceid_lora
+
+                fuse_faceid_lora(stream.pipe.unet, resolved_ip_path, lora_scale=1.0)
+            except Exception as e:
+                report_error(f"IPAdapterModule.install: fuse_faceid_lora (B2) failed: {e}")
+                raise
+
         # Fix kvo_cache incompatibility: diffusers_ipadapter sets old AttnProcessor on
         # self-attention blocks (attn1) that doesn't accept the kvo_cache kwarg passed by
         # newer diffusers Attention.forward(). Replace them with diffusers' native
