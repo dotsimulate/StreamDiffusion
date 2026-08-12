@@ -2,7 +2,10 @@ import gc
 import json
 import logging
 import os
+import re
 import shutil
+import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,19 +54,28 @@ def _onnx_cache_valid(path: str) -> bool:
         return False
 
 
-def _write_build_stats(engine_path: str, stats: dict):
-    """Append build stats to a JSON-lines file next to the engine directory."""
+def _write_build_stats(engine_path: str, stats: dict, append_global: bool = True):
+    """Write build stats to the per-engine JSON file, and (by default) append to
+    the JSON-lines build log at the engines root.
+
+    ``append_global=False`` is for a mid-build flush (fp8-round-13 provenance: the
+    per-engine file is written once the calibration-capture stage completes, so an
+    aborted run leaves a record instead of an orphan npz) -- the same ``stats``
+    dict is then written again, in full, when the build finishes, and every
+    successful build must only ever contribute ONE line to build_log.jsonl.
+    """
     try:
         engine_dir = Path(engine_path).parent
         # Write stats file inside the engine directory
         stats_file = engine_dir / "build_stats.json"
         with open(stats_file, "w") as f:
             json.dump(stats, f, indent=2)
-        # Also append to the global build log in the engines root
-        engines_root = engine_dir.parent
-        global_log = engines_root / "build_log.jsonl"
-        with open(global_log, "a") as f:
-            f.write(json.dumps(stats) + "\n")
+        if append_global:
+            # Also append to the global build log in the engines root
+            engines_root = engine_dir.parent
+            global_log = engines_root / "build_log.jsonl"
+            with open(global_log, "a") as f:
+                f.write(json.dumps(stats) + "\n")
     except Exception as e:
         _build_logger.warning(f"Failed to write build stats: {e}")
 
@@ -128,16 +140,109 @@ def _check_fp8_disk_space(onnx_opt_path: str, allow_fallback: bool) -> bool:
     )
 
 
+_VRAM_RELEASE_ATTRS = ("unet", "vae", "text_encoder", "text_encoder_2")
+
+
+def _release_torch_vram(builder: "EngineBuilder", pipe_ref, ipadapter_ref=None):
+    """Move resident PyTorch modules to CPU for the duration of FP8 ONNX quantize.
+
+    modelopt's ORT CUDA EP session lands in the same VRAM pool PyTorch is still
+    holding: TAESD VAE, both SDXL text encoders, and — on a cached-ONNX build,
+    where the fresh-export `.to("cpu")` above never ran — the full UNet too.
+    None of it is needed again until the first post-build inference, so free it
+    here and restore via the returned closure.
+
+    ``ipadapter_ref`` (the ``IPAdapterModule`` instance, i.e. ``stream._ipadapter_module``)
+    reaches a second holder outside the ``pipe_ref`` chain: its vendored
+    ``ipadapter.image_encoder`` is a plain CLIP ``nn.Module`` (3.4+ GiB for ViT-bigG/14)
+    that's dead weight for FaceID-non-plus configs but was previously invisible here
+    since it hangs off ``stream``, not ``stream.pipe``. InsightFace's ONNX-runtime-backed
+    face detector/recognizer sessions are a separate holder again and are not covered —
+    they're skipped by the isinstance check below like any other non-torch.nn.Module.
+
+    Best-effort by design: a module that's missing, not a torch.nn.Module (e.g.
+    an ONNX-runtime-backed IPAdapter/InsightFace encoder), or already has no
+    parameters is skipped rather than raising -- a build must not fail because
+    VRAM release did. Returns a no-arg restore closure; call it from a `finally`
+    so the pipeline is guaranteed usable again even if quantize itself raises.
+    """
+    moved: list = []  # (holder, attr_name, module, original_device)
+    seen_ids: set = set()
+
+    def _try_move(holder, attr_name, module):
+        if module is None or id(module) in seen_ids or not isinstance(module, torch.nn.Module):
+            return
+        first_param = next(module.parameters(), None)
+        if first_param is None:
+            return
+        original_device = first_param.device
+        if original_device.type == "cpu":
+            seen_ids.add(id(module))
+            return
+        try:
+            module.to("cpu")
+        except Exception as e:
+            _build_logger.debug(f"[BUILD] VRAM release: could not move '{attr_name}' to cpu: {e}")
+            return
+        seen_ids.add(id(module))
+        moved.append((holder, attr_name, module, original_device))
+
+    # self.network may already be gone -- del'd right after a fresh ONNX export
+    # (see the export branch above). getattr default handles that safely.
+    _try_move(builder, "network", getattr(builder, "network", None))
+    if pipe_ref is not None:
+        for _attr in _VRAM_RELEASE_ATTRS:
+            _try_move(pipe_ref, _attr, getattr(pipe_ref, _attr, None))
+    if ipadapter_ref is not None:
+        _ip = getattr(ipadapter_ref, "ipadapter", None)
+        if _ip is not None:
+            _try_move(_ip, "image_encoder", getattr(_ip, "image_encoder", None))
+
+    if moved:
+        _names = ", ".join(f"{h.__class__.__name__}.{a}" for h, a, _, _ in moved)
+        _build_logger.info(f"[BUILD] VRAM release: moved to CPU before FP8 quantize: {_names}")
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    def _restore():
+        if not moved:
+            return
+        for holder, attr_name, module, original_device in moved:
+            try:
+                module.to(original_device)
+                setattr(holder, attr_name, module)
+            except Exception as e:
+                _build_logger.warning(
+                    f"[BUILD] VRAM release: failed to restore '{attr_name}' to {original_device}: {e}"
+                )
+        _build_logger.info(f"[BUILD] VRAM release: restored {len(moved)} module(s) to GPU")
+
+    return _restore
+
+
+_KEEP_INTERMEDIATES_ENV = "STREAMDIFFUSION_FP8_KEEP_INTERMEDIATES"
+
+
 def _cleanup_intermediates(engine_dir: str, fp8_ok: bool):
     """Delete intermediate ONNX/build artifacts, preserving .engine, .cache, calib_data.npz,
-    build_stats.json, and (only when fp8_ok) the cached unet.fp8.onnx* artifact.
+    calib_data.meta.json, build_stats.json, and (only when fp8_ok) the cached
+    unet.fp8.onnx* artifact.
+
+    Set STREAMDIFFUSION_FP8_KEEP_INTERMEDIATES=1 to additionally preserve the pre-FP8
+    optimized ONNX (`*.opt.onnx`) and its external-data `weights.pb`. Without this, every
+    build wipes the one fixture fp8_quantize.py's `__main__` entry needs to run the FP8
+    quantize stage standalone -- opt-in rather than default so routine builds don't leave
+    an extra multi-GB ONNX behind in every engine dir.
 
     Two-pass deletion handles Windows file locks (gc.collect releases Python handles).
     Runs from a `finally` block so it also fires when a build stage raises, instead of
     orphaning tens of GB of external-data ONNX copies on failure.
     """
     _keep_suffixes = (".engine", ".cache")
-    _keep_exact = {"build_stats.json", "timing.cache", "calib_data.npz"}
+    _keep_exact = {"build_stats.json", "timing.cache", "calib_data.npz", "calib_data.meta.json"}
+    if os.environ.get(_KEEP_INTERMEDIATES_ENV) == "1":
+        _keep_suffixes = _keep_suffixes + (".opt.onnx",)
+        _keep_exact = _keep_exact | {"weights.pb"}
     _to_delete = []
     for file in os.listdir(engine_dir):
         # Keep the FP8 quantized ONNX artifact only if quantization actually succeeded
@@ -181,12 +286,111 @@ def _cleanup_intermediates(engine_dir: str, fp8_ok: bool):
         if _still_failed:
             _build_logger.warning(
                 f"[BUILD] {len(_still_failed)} intermediate files could not be cleaned. "
-                f"Manual cleanup: delete all files except *.engine, calib_data.npz, unet.fp8.onnx from {engine_dir}"
+                f"Manual cleanup: delete all files except *.engine, calib_data.npz, "
+                f"calib_data.meta.json, unet.fp8.onnx from {engine_dir}"
             )
         cleaned = len(_to_delete) - len(_still_failed)
     else:
         cleaned = len(_to_delete)
     _build_logger.info(f"[BUILD] Cleaned {cleaned}/{len(_to_delete)} intermediate files")
+
+
+# fp8-round-8's two-activation attention BMMs (Q@K^T, softmax@V) -- same anchor as
+# fp8_quantize.py's _ATTENTION_EXCLUDE_PATTERNS (r".*/attn[12]/MatMul(_\d+)?$"), kept
+# as a separate constant here rather than imported since this module must stay
+# importable without pulling in fp8_quantize.py's modelopt-adjacent dependencies.
+_ATTN_BMM_NAME_RE = re.compile(r"/attn[12]/MatMul(_\d+)?$")
+_MYL_PARTITION_RE = re.compile(r"_myl(\d+)_")
+
+
+def _count_attn_bmm_dq_fed(onnx_path: str) -> Optional[Tuple[int, int]]:
+    """Count attention BMMs (Q@K^T / softmax@V, never the QKV/output projections)
+    whose both direct inputs are DequantizeLinear-produced, vs the total attention-BMM
+    count, by parsing the ONNX graph structure only (FP8 Round 11 evidence record).
+
+    "Two-activation BMM" (neither input is a weight initializer) distinguishes these
+    from projection MatMuls, where one input is always a weight -- same distinction
+    fp8_quantize.py's _ATTENTION_EXCLUDE_PATTERNS regex targets. Graph-only load
+    (load_external_data=False): the graph itself is ~13 MB even though the model's
+    external weight data is multi-GB, so this is a cheap, read-only structural check,
+    not a real load of the model.
+
+    With fp8_mha_qdq (-mhaq) active, dq_fed should equal total (466/466 verified on a
+    real build); with it off, dq_fed should be 0 while total is unchanged -- this is
+    what settles whether mhaq's Q/DQ insertion is actually taking, independent of the
+    engine inspector's mha_fused_kernels (which measures TRT's fusion decision, not
+    modelopt's quantization).
+
+    Returns (dq_fed_count, total_count), or None if onnx_path doesn't exist or fails
+    to parse -- best-effort, matching the rest of the inspector block's posture.
+    """
+    if not onnx_path or not os.path.exists(onnx_path):
+        return None
+    try:
+        model = onnx.load(onnx_path, load_external_data=False)
+        initializer_names = {init.name for init in model.graph.initializer}
+        producer = {}
+        for node in model.graph.node:
+            for out in node.output:
+                producer[out] = node
+        total = 0
+        dq_fed = 0
+        for node in model.graph.node:
+            if node.op_type != "MatMul" or not _ATTN_BMM_NAME_RE.search(node.name):
+                continue
+            if any(inp in initializer_names for inp in node.input):
+                continue  # a projection MatMul (one operand is a weight), not a BMM
+            total += 1
+            producers = [producer.get(inp) for inp in node.input[:2]]
+            if all(p is not None and p.op_type == "DequantizeLinear" for p in producers):
+                dq_fed += 1
+        return dq_fed, total
+    except Exception:
+        return None
+
+
+def _find_best_sibling_mha_ratio(engine_dir: str, precision: str) -> Optional[float]:
+    """Best (highest) mha_kernels_per_attn_block seen among sibling engine dirs'
+    build_stats.json files at the same precision -- the same-precision regression
+    baseline for the inspector block's warning gate (FP8 Round 11).
+
+    Replaces the old ``_mha_count == 0`` guard, which never caught the FP8-vs-FP16
+    fusion regression this round found because the inspector block used to be
+    FP8-gated and so only ever compared FP8 against FP8. Same-precision only here by
+    design: FP8 quantization is *expected* to change kernel fusion vs FP16, so
+    flagging that difference as a warning on every FP8 build would be noise, not
+    signal -- the cross-precision delta is reported separately as INFO.
+
+    Skips sibling files with no ``precision`` key (e.g. VAE engine dirs, which never
+    run this inspector) or no ``mha_kernels_per_attn_block`` key (e.g. builds from
+    before this round, or ``use_cached_attn=False`` builds where the normalized
+    metric can't be computed). Returns None if no comparable sibling exists -- the
+    metric self-populates on this engine's first build; no seeded magic constant.
+    """
+    try:
+        root = Path(engine_dir).parent
+        best = None
+        for sibling in root.iterdir():
+            if not sibling.is_dir():
+                continue
+            stats_path = sibling / "build_stats.json"
+            if not stats_path.exists():
+                continue
+            try:
+                with open(stats_path) as f:
+                    sibling_stats = json.load(f)
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                continue
+            if sibling_stats.get("precision") != precision:
+                continue
+            ratio = sibling_stats.get("mha_kernels_per_attn_block")
+            if ratio is None:
+                continue
+            if best is None or ratio > best:
+                best = ratio
+        return best
+    except Exception:
+        return None
 
 
 def create_onnx_path(name, onnx_dir, opt=True):
@@ -224,15 +428,36 @@ class EngineBuilder:
         force_onnx_optimize: bool = False,
         fp8: bool = False,
         pipe_ref=None,
+        ipadapter_ref=None,
         calibration_prompts=None,
         calibration_steps: int = 20,
+        fp8_calibration_timesteps=None,
+        fp8_calibration_scheduler_ref=None,
         fp8_guidance_scale: float = 7.5,
         fp8_allow_fp16_fallback: bool = False,
         fp8_mha_qdq: bool = False,
+        # fp8-round-8: corrects modelopt's inverted INT8->FP8 scale-conversion factor
+        # (fp8_quantize.py::_rescale_fp8_qdq_scales). 1.0 = full E4M3 range.
+        fp8_scale_headroom: float = 1.0,
+        # fp8-round-8 fallback lever: excludes the two attention BMMs from FP8 Q/DQ.
+        fp8_exclude_attention: bool = False,
+        # fp8-round-9 fallback lever: excludes the three IPA cross-attention activation
+        # tensors from FP8 Q/DQ (see _IPADAPTER_ACTIVATION_EXCLUDE_PATTERNS).
+        fp8_exclude_ipadapter: bool = False,
         fp8_use_cached_attn: bool = False,
         fp8_use_feature_injection: bool = False,
         fp8_use_controlnet: bool = False,
         fp8_num_ip_layers: int = 0,
+        # fp8-round-5-handoff Step 3: deployment values for scalar/vector inputs that
+        # otherwise calibrate on zeros/ones (see capture_calibration_data's Args docstring).
+        # Read from config by the caller (wrapper.py) — never hardcoded here.
+        fp8_fi_strength: float = 0.0,
+        fp8_fi_threshold: float = 0.0,
+        fp8_ipadapter_scale: float = 1.0,
+        # fp8-round-9: real IP-Adapter projection tokens for calibration's
+        # encoder_hidden_states reconciliation (see capture_calibration_data's
+        # ipadapter_tokens docstring). None preserves the prior zero-pad behavior.
+        fp8_ipadapter_tokens=None,
         builder_optimization_level: Optional[int] = None,
         is_controlnet: bool = False,
         artifact_prefix: str = "unet",
@@ -325,12 +550,34 @@ class EngineBuilder:
             )
         _build_logger.info(f"Verified ONNX opt file: {onnx_opt_path} ({opt_file_size / (1024**2):.1f} MB)")
 
+        _restore_vram = None
         try:
             # --- FP8: Capture calibration tensors (once, cached in calib_data.npz) ---
             if fp8 and pipe_ref is not None:
+                from .fp8_quantize import load_calib_provenance
+
                 if os.path.exists(_calib_data_path):
-                    _build_logger.info(f"[BUILD] FP8 calibration data cached: {_calib_data_path}")
-                    stats["stages"]["fp8_calib_capture"] = {"status": StageStatus.CACHED}
+                    _provenance = load_calib_provenance(_calib_data_path)
+                    if _provenance is not None:
+                        _build_logger.info(
+                            f"[BUILD] FP8 calibration data cached: {_calib_data_path} "
+                            f"(captured res={_provenance.get('image_width')}x{_provenance.get('image_height')}, "
+                            f"selected_calls={_provenance.get('selected_calls')})"
+                        )
+                        stats["stages"]["fp8_calib_capture"] = {"status": StageStatus.CACHED, **_provenance}
+                    else:
+                        # fp8-round-13: this is the exact silence that hid fp8-round-10's
+                        # aborted ~07:14 capture -- a cache hit with no record of how the
+                        # npz was made. Every engine dir built before this round has no
+                        # sidecar; degrade gracefully rather than warn on every such build.
+                        _build_logger.info(
+                            f"[BUILD] FP8 calibration data cached: {_calib_data_path} "
+                            "(no provenance sidecar -- captured before fp8-round-13)"
+                        )
+                        stats["stages"]["fp8_calib_capture"] = {
+                            "status": StageStatus.CACHED,
+                            "provenance": "unavailable (captured before provenance records)",
+                        }
                 else:
 
                     def _calib_fn():
@@ -355,7 +602,8 @@ class EngineBuilder:
                             prompts = calibration_prompts or _load_calibration_prompts()
                             _build_logger.info(
                                 f"[BUILD] FP8 activation capture: {len(prompts)} prompts × "
-                                f"{calibration_steps} steps, guidance_scale={fp8_guidance_scale}"
+                                f"{calibration_steps} steps, guidance_scale={fp8_guidance_scale}, "
+                                f"res={opt_image_width}x{opt_image_height}"
                             )
                             capture_calibration_data(
                                 pipe_ref,
@@ -365,14 +613,42 @@ class EngineBuilder:
                                 guidance_scale=fp8_guidance_scale,
                                 onnx_path=onnx_opt_path,
                                 use_cached_attn=fp8_use_cached_attn,
+                                use_feature_injection=fp8_use_feature_injection,
                                 use_controlnet=fp8_use_controlnet,
                                 num_ip_layers=fp8_num_ip_layers,
+                                fi_strength=fp8_fi_strength,
+                                fi_threshold=fp8_fi_threshold,
+                                ipadapter_scale=fp8_ipadapter_scale,
+                                ipadapter_tokens=fp8_ipadapter_tokens,
+                                timesteps=fp8_calibration_timesteps,
+                                scheduler_ref=fp8_calibration_scheduler_ref,
+                                # fp8-round-10: without these, diffusers falls back to
+                                # pipe.unet.config.sample_size (512 for SDXL-Turbo) regardless
+                                # of the engine's actual build resolution — the CN branch above
+                                # already passes these; this restores the same symmetry here.
+                                image_height=opt_image_height,
+                                image_width=opt_image_width,
                             )
 
                     if not _run_fp8_stage(
                         "fp8_calib_capture", _calib_fn, stats, fp8_allow_fp16_fallback, engine_filename
                     ):
                         fp8 = False
+                    else:
+                        _provenance = load_calib_provenance(_calib_data_path)
+                        if _provenance is not None:
+                            stats["stages"]["fp8_calib_capture"].update(_provenance)
+
+                # fp8-round-13: flush here, right after the capture stage resolves
+                # (cached / built / failed-with-fallback), so an aborted run past this
+                # point still leaves a build_stats.json recording that capture at least
+                # started -- the exact failure mode that hid fp8-round-10's aborted
+                # ~07:14 capture (it never reached the end-of-build _write_build_stats
+                # call, so it left neither a stats file nor a build_log.jsonl line).
+                # append_global=False: this is a mid-build snapshot of the same `stats`
+                # dict the end-of-build call below writes in full -- appending here too
+                # would double every successful build's build_log.jsonl entry.
+                _write_build_stats(engine_path, stats, append_global=False)
             elif fp8 and pipe_ref is None:
                 _build_logger.warning(
                     "[BUILD] fp8=True but pipe_ref not provided — FP8 calibration skipped. "
@@ -390,37 +666,110 @@ class EngineBuilder:
                 else:
 
                     def _quant_fn():
-                        from .fp8_quantize import load_calibration_data, quantize_onnx_fp8
-
-                        calib_data = load_calibration_data(_calib_data_path)
-                        if calib_data is None:
+                        # Runs fp8_quantize.py's __main__ entry in a subprocess rather than
+                        # calling quantize_onnx_fp8() in-process. This process boundary is
+                        # the actual point of Step 4: modelopt/ORT's CUDA arena is scoped to
+                        # the child and is fully released on exit no matter how it fails,
+                        # instead of leaking into this long-lived build process. Calibration
+                        # data crosses via calib_data.npz on disk, not as a subprocess arg --
+                        # it's multi-GB. Note this does NOT free the parent's own resident
+                        # torch modules; _release_torch_vram (called just below) still is.
+                        if not os.path.exists(_calib_data_path):
                             raise RuntimeError(f"Calibration data missing after capture step: {_calib_data_path}")
-                        quantize_onnx_fp8(
-                            onnx_path=onnx_opt_path,
-                            output_path=_fp8_onnx_path,
-                            calibration_data=calib_data,
-                            disable_mha_qdq=not fp8_mha_qdq,
-                            use_cached_attn=fp8_use_cached_attn,
-                            use_feature_injection=fp8_use_feature_injection,
-                            use_controlnet=fp8_use_controlnet,
-                            num_ip_layers=fp8_num_ip_layers,
-                        )
 
+                        _quant_args = json.dumps(
+                            {
+                                "onnx_path": onnx_opt_path,
+                                "output_path": _fp8_onnx_path,
+                                "calib_data_path": _calib_data_path,
+                                "disable_mha_qdq": not fp8_mha_qdq,
+                                "use_cached_attn": fp8_use_cached_attn,
+                                "use_feature_injection": fp8_use_feature_injection,
+                                "use_controlnet": fp8_use_controlnet,
+                                "num_ip_layers": fp8_num_ip_layers,
+                                "fp8_scale_headroom": fp8_scale_headroom,
+                                "fp8_exclude_attention": fp8_exclude_attention,
+                                "fp8_exclude_ipadapter": fp8_exclude_ipadapter,
+                            }
+                        )
+                        _cmd = [
+                            sys.executable,
+                            "-m",
+                            "streamdiffusion.acceleration.tensorrt.fp8_quantize",
+                            _quant_args,
+                        ]
+                        _build_logger.info(f"[BUILD] fp8_onnx_quantize: launching subprocess: {_cmd[0]} -m ...")
+                        # env=os.environ.copy() (not the subprocess default of inheriting
+                        # implicitly) so PYTHONPATH / CUDA_VISIBLE_DEVICES / HF cache vars
+                        # are carried into the child explicitly rather than by accident of
+                        # not overriding env=.
+                        _proc = subprocess.Popen(
+                            _cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            bufsize=1,
+                            env=os.environ.copy(),
+                        )
+                        for _line in _proc.stdout:
+                            _build_logger.info(f"[FP8-subprocess] {_line.rstrip()}")
+                        _ret = _proc.wait()
+                        if _ret != 0:
+                            raise RuntimeError(f"fp8_onnx_quantize subprocess exited with code {_ret}")
+
+                    # Capture (above) needs pipe_ref/ipadapter_ref resident on GPU; quantize
+                    # doesn't -- release here, right before the stage that actually spikes
+                    # VRAM. Restored in the `finally` below regardless of outcome.
+                    _restore_vram = _release_torch_vram(self, pipe_ref, ipadapter_ref)
                     if not _run_fp8_stage(
                         "fp8_onnx_quantize", _quant_fn, stats, fp8_allow_fp16_fallback, engine_filename
                     ):
                         fp8 = False
 
+            # fp8-round-8: read back the rescale report from the .ok sentinel, written by
+            # _rescale_fp8_qdq_scales via quantize_onnx_fp8 (fp8_quantize.py). Covers both
+            # the fresh-build path (sentinel just written above) and the cache-hit path
+            # (sentinel from a prior run) — either way, by this point the file exists iff
+            # fp8 quantization succeeded. A bare "ok" string (older, pre-round-8 sentinel)
+            # or a missing/corrupt file just means this metric is unknown, not fatal.
+            if fp8 and os.path.exists(_fp8_onnx_path + ".ok"):
+                try:
+                    with open(_fp8_onnx_path + ".ok") as _f:
+                        _ok_payload = json.load(_f)
+                    _rescale = _ok_payload.get("rescale") or {}
+                    if "uncalibrated_count" in _rescale:
+                        stats["fp8_uncalibrated_scales"] = _rescale["uncalibrated_count"]
+                    if _rescale.get("realized_peak_after") is not None:
+                        stats["fp8_scale_realized_peak"] = _rescale["realized_peak_after"]
+                except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                    pass
+
             # Select the ONNX to feed into TRT: FP8-quantized when available, else plain opt.
             _trt_onnx_path = _fp8_onnx_path if (fp8 and os.path.exists(_fp8_onnx_path + ".ok")) else onnx_opt_path
 
+            if fp8:
+                # Captured unconditionally on this build's own parameters (not on
+                # fp8_onnx_quantize's cache status -- that stage's _quant_args closure
+                # only runs on a cache miss) so build_stats.json always reflects what
+                # this build *requested*, not just what the quantize subprocess happened
+                # to run this time (FP8 Round 11 -- closes the gap that left the
+                # 7104-vs-6899 qdq delta unattributable).
+                stats["fp8_quantize_args"] = {
+                    "disable_mha_qdq": not fp8_mha_qdq,
+                    "fp8_scale_headroom": fp8_scale_headroom,
+                    "fp8_exclude_attention": fp8_exclude_attention,
+                    "fp8_exclude_ipadapter": fp8_exclude_ipadapter,
+                }
+
             # --- TRT Engine Build ---
+            _engine = None
             if not force_engine_build and os.path.exists(engine_path):
                 print(f"Found cached engine: {engine_path}")
                 stats["stages"]["trt_build"] = {"status": "cached"}
             else:
                 t0 = time.perf_counter()
-                build_engine(
+                _l2tc_before = BUILD_TRT_LOGGER.l2tc_validate_fail_count
+                _engine = build_engine(
                     engine_path=engine_path,
                     onnx_opt_path=_trt_onnx_path,
                     model_data=self.model,
@@ -436,32 +785,74 @@ class EngineBuilder:
                 elapsed = time.perf_counter() - t0
                 stats["stages"]["trt_build"] = {"status": "built", "elapsed_s": round(elapsed, 2)}
                 _build_logger.info(f"[BUILD] TRT engine build ({engine_filename}): {elapsed:.1f}s")
+                # Tiling decision + TRT's own l2tc verdict (FP8 Round 11 evidence record --
+                # previously existed only as INFO log lines, never persisted).
+                stats["l2tc_validate_fail_count"] = BUILD_TRT_LOGGER.l2tc_validate_fail_count - _l2tc_before
+                _tiling_info = getattr(_engine, "last_tiling_info", {}) or {}
+                if _tiling_info:
+                    stats["dynamic_shapes"] = _tiling_info.get("dynamic_shapes")
+                    stats["tiling_optimization_level"] = _tiling_info.get("tiling_optimization_level")
+                    stats["l2_limit_for_tiling_mib"] = _tiling_info.get("l2_limit_for_tiling_mib")
 
-            # --- FP8 Q/DQ layer count (sanity gate: < 500 means quantization is inactive) ---
-            if fp8 and os.path.exists(engine_path):
+            # --- Engine inspector: Q/DQ + fused-MHA + attn-BMM evidence record (FP8 Round 11) ---
+            # Was `if fp8 and os.path.exists(engine_path)` -- FP16 builds never ran this, so
+            # mha_fused_kernels/total_engine_layers had no FP16 baseline to compare against
+            # (Round 10 parked Item 1: "mha_fused_kernels: 140 constant across every FP8
+            # build" was never capable of evidencing anything since it was FP8-vs-FP8 only).
+            # Now runs for every build that produced an engine, regardless of precision.
+            stats["precision"] = "fp8" if fp8 else "fp16"
+            if os.path.exists(engine_path):
                 try:
                     import json as _json
-                    import re as _re
 
                     import tensorrt as trt
+
+                    # VRAM safety: a genuine FP8 build already released torch VRAM before the
+                    # quantize stage (_restore_vram set above at the FP8-quantize call site)
+                    # and it stays released through here. This check exists for FP16 builds,
+                    # which never call _release_torch_vram at all -- their engine (5.58 GB
+                    # for a current UNet) previously deserialized here with torch modules
+                    # still resident, and the blanket `except Exception` below would have
+                    # swallowed an OOM and silently lost exactly the evidence this block
+                    # exists to capture. Do not overwrite an already-set _restore_vram --
+                    # that would orphan the earlier release's restore closure.
+                    if _restore_vram is None:
+                        _engine_size = os.path.getsize(engine_path)
+                        _free_vram, _ = torch.cuda.mem_get_info()
+                        _margin = 2 * (1024**3)
+                        if _free_vram < _engine_size + _margin:
+                            _build_logger.warning(
+                                f"[BUILD] Low VRAM before engine inspector ({_free_vram / 1024**3:.1f} GiB free, "
+                                f"need ~{(_engine_size + _margin) / 1024**3:.1f} GiB) -- releasing resident "
+                                "torch modules before deserializing for inspection."
+                            )
+                            _restore_vram = _release_torch_vram(self, pipe_ref, ipadapter_ref)
 
                     _rt = trt.Runtime(BUILD_TRT_LOGGER)
                     with open(engine_path, "rb") as _f:
                         _eng = _rt.deserialize_cuda_engine(_f.read())
                     _insp = _eng.create_engine_inspector()
                     _info = _insp.get_engine_information(trt.LayerInformationFormat.JSON)
-                    _qdq = _info.count("QuantizeLinear") + _info.count("DequantizeLinear")
-                    stats["fp8_qdq_layers"] = _qdq
-                    _build_logger.info(f"[BUILD] FP8 engine Q/DQ layer count: {_qdq}")
-                    if _qdq < 500:
-                        _build_logger.warning(
-                            f"[BUILD] Low Q/DQ count ({_qdq} < 500) — FP8 quantization likely inactive or incomplete"
-                        )
+                    # Free the deserialized engine as soon as its JSON info is extracted --
+                    # everything below is CPU-only string/JSON analysis. Previously `_eng`
+                    # lived until build() returned.
+                    del _eng, _insp
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    if fp8:
+                        _qdq = _info.count("QuantizeLinear") + _info.count("DequantizeLinear")
+                        stats["fp8_qdq_layers"] = _qdq
+                        _build_logger.info(f"[BUILD] FP8 engine Q/DQ layer count: {_qdq}")
+                        if _qdq < 500:
+                            _build_logger.warning(
+                                f"[BUILD] Low Q/DQ count ({_qdq} < 500) — FP8 quantization likely inactive or incomplete"
+                            )
 
                     # Fused-MHA check: count attention layers TRT fused into a single kernel.
                     # Pattern is empirical — FLUX uses "_gemm_mha_v2"; SDXL on Ada may differ.
                     # First build logs sample names so the regex can be confirmed or tightened.
-                    _MHA_RE = _re.compile(r"mha|fmha|MultiHead|FlashAttn", _re.IGNORECASE)
+                    _MHA_RE = re.compile(r"mha|fmha|MultiHead|FlashAttn", re.IGNORECASE)
                     try:
                         _layers = _json.loads(_info).get("Layers", [])
                     except Exception:
@@ -471,7 +862,9 @@ class EngineBuilder:
                     _mha_count = len(_mha_names)
                     stats["mha_fused_kernels"] = _mha_count
                     stats["total_engine_layers"] = _total
-                    _build_logger.info(f"[BUILD] FP8 engine fused MHA layers: {_mha_count} / {_total} total")
+                    _build_logger.info(
+                        f"[BUILD] {stats['precision']} engine fused MHA layers: {_mha_count} / {_total} total"
+                    )
                     if _mha_count == 0 and _total > 0:
                         _build_logger.warning(
                             "[BUILD] No fused MHA layers detected — attention may be running decomposed "
@@ -480,9 +873,57 @@ class EngineBuilder:
                         )
                     else:
                         _build_logger.info(f"[BUILD] Sample fused-MHA layer names: {_mha_names[:3]}")
+
+                    # Myelin partitions: distinct _myl<N>_ groups among the MHA-matching layer
+                    # names -- a stronger fusion signal than the raw count alone (FP8 Round 11:
+                    # 210 kernels in 11 partitions at FP16 vs 140 in a single myl0 at FP8 --
+                    # the raw count alone hid that split).
+                    _partitions = {m.group(1) for _n in _mha_names for m in [_MYL_PARTITION_RE.search(_n)] if m}
+                    stats["mha_myelin_partitions"] = len(_partitions)
+
+                    # Same-precision regression gate (replaces the old `_mha_count == 0`
+                    # guard, which -- back when this block was FP8-gated -- could only ever
+                    # compare FP8 against FP8 and so never caught the FP8-vs-FP16 fusion
+                    # delta this round found). Normalized per attn block so engines with
+                    # different kvo_cache_count remain comparable. kvo_cache_count only
+                    # exists on the model when use_cached_attn is set (models.py), hence
+                    # getattr with a 0 default -- 0 skips the normalized metric entirely.
+                    _kvo_count = getattr(self.model, "kvo_cache_count", 0)
+                    if _kvo_count > 0:
+                        _ratio = _mha_count / _kvo_count
+                        stats["mha_kernels_per_attn_block"] = _ratio
+                        _best_same = _find_best_sibling_mha_ratio(engine_dir_early, stats["precision"])
+                        if _best_same is not None and _ratio < _best_same:
+                            _build_logger.warning(
+                                f"[BUILD] MHA fusion regression vs best same-precision sibling: "
+                                f"{_ratio:.3f} kernels/block (this build) < {_best_same:.3f} (best sibling)."
+                            )
+                        _other_precision = "fp16" if fp8 else "fp8"
+                        _best_other = _find_best_sibling_mha_ratio(engine_dir_early, _other_precision)
+                        if _best_other is not None:
+                            _build_logger.info(
+                                f"[BUILD] MHA fusion, cross-precision: {_ratio:.3f} kernels/block "
+                                f"({stats['precision']}) vs {_best_other:.3f} ({_other_precision})."
+                            )
+
+                    # attn_bmm_dq_fed: only meaningful for FP8 -- checks that mhaq's Q/DQ
+                    # insertion actually reached the two attention BMMs, independent of
+                    # whether TRT went on to fuse them into a kernel. Reads the cached
+                    # {prefix}.fp8.onnx graph, not the engine.
+                    if fp8:
+                        _bmm_result = _count_attn_bmm_dq_fed(_fp8_onnx_path)
+                        if _bmm_result is not None:
+                            stats["attn_bmm_dq_fed"], stats["attn_bmm_total"] = _bmm_result
+                            _build_logger.info(
+                                f"[BUILD] Attention BMM Q/DQ coverage: {_bmm_result[0]}/{_bmm_result[1]} DQ-fed"
+                            )
                 except Exception as _e:
-                    _build_logger.warning(f"[BUILD] FP8 inspector check skipped: {_e}")
+                    _build_logger.warning(f"[BUILD] Engine inspector check skipped: {_e}")
         finally:
+            # Restore before cleanup so a restore failure (logged, not raised) still
+            # leaves temp-file sweep to run, and so this fires on the failure path too.
+            if _restore_vram is not None:
+                _restore_vram()
             _fp8_ok = fp8 and os.path.exists(_fp8_onnx_path + ".ok")
             _cleanup_intermediates(engine_dir_early, _fp8_ok)
 

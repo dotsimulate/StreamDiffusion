@@ -133,10 +133,19 @@ def compile_unet(
     build_options = dict(engine_build_options or {})
     fp8 = build_options.pop("fp8", False)
     pipe_ref = build_options.pop("pipe_ref", None)
+    ipadapter_ref = build_options.pop("ipadapter_ref", None)
     calibration_prompts = build_options.pop("calibration_prompts", None)
     calibration_steps = build_options.pop("calibration_steps", 20)
+    # Band-derived calibration schedule (fp8-round-5-handoff Step 2c/2c-bis): the raw
+    # UNet timesteps to calibrate against, and the deployment scheduler instance that
+    # produced them (needed so capture can drive pipe(timesteps=[...]) on the same
+    # scheduler inference actually uses, not the checkpoint's default one).
+    fp8_calibration_timesteps = build_options.pop("fp8_calibration_timesteps", None)
+    fp8_calibration_scheduler_ref = build_options.pop("fp8_calibration_scheduler_ref", None)
     fp8_allow_fp16_fallback = build_options.pop("fp8_allow_fp16_fallback", False)
     fp8_mha_qdq = build_options.pop("fp8_mha_qdq", False)
+    fp8_scale_headroom = build_options.pop("fp8_scale_headroom", 1.0)
+    fp8_exclude_attention = build_options.pop("fp8_exclude_attention", False)
     fp8_use_cached_attn = build_options.pop("fp8_use_cached_attn", False)
     fp8_use_feature_injection = build_options.pop("fp8_use_feature_injection", False)
     fp8_use_controlnet = build_options.pop("fp8_use_controlnet", False)
@@ -160,10 +169,15 @@ def compile_unet(
         opt_batch_size=opt_batch_size,
         fp8=fp8,
         pipe_ref=pipe_ref,
+        ipadapter_ref=ipadapter_ref,
         calibration_prompts=calibration_prompts,
         calibration_steps=calibration_steps,
+        fp8_calibration_timesteps=fp8_calibration_timesteps,
+        fp8_calibration_scheduler_ref=fp8_calibration_scheduler_ref,
         fp8_allow_fp16_fallback=fp8_allow_fp16_fallback,
         fp8_mha_qdq=fp8_mha_qdq,
+        fp8_scale_headroom=fp8_scale_headroom,
+        fp8_exclude_attention=fp8_exclude_attention,
         fp8_use_cached_attn=fp8_use_cached_attn,
         fp8_use_feature_injection=fp8_use_feature_injection,
         fp8_use_controlnet=fp8_use_controlnet,
