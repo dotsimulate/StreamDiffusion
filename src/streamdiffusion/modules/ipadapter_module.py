@@ -41,6 +41,47 @@ class IPAdapterConfig:
     type: IPAdapterType = IPAdapterType.REGULAR
     insightface_model_name: Optional[str] = None
 
+    @classmethod
+    def from_dict(cls, cfg: Dict[str, Any]) -> IPAdapterConfig:
+        """Build an IPAdapterConfig from a raw config dict (the ``ipadapter_config``
+        shape passed through ``wrapper.py``).
+
+        A4: both wrapper.py install sites (pre-TRT and post-TRT) previously built this
+        by hand with identical inline field lists — centralized here. Not used by
+        ``StreamParameterUpdater._get_current_ipadapter_config``: that dict is
+        deliberately lossy/demo-only (``demo/realtime-img2img``) and must not gain new
+        required-field validation.
+
+        Raises:
+            KeyError: if ``ipadapter_model_path`` or ``image_encoder_path`` is missing.
+            ValueError: if ``type == "faceid"`` and ``insightface_model_name`` is not
+                set. Without it, ``IPAdapter.insightface_model`` silently stays ``None``
+                and the failure only surfaces later, mid-stream, when the first style
+                image update raises inside ``_get_faceid_embeds`` — the same silent/late
+                failure class as B1/B2. Rejecting it here, at construction time, makes
+                the misconfiguration loud immediately.
+        """
+        adapter_type = IPAdapterType(cfg.get("type", "regular"))
+        insightface_model_name = cfg.get("insightface_model_name")
+
+        if adapter_type == IPAdapterType.FACEID and not insightface_model_name:
+            raise ValueError(
+                "IPAdapterConfig.from_dict: type='faceid' requires 'insightface_model_name' "
+                "to be set (e.g. 'buffalo_l') — without it, FaceID processing fails only "
+                "once a style image is actually submitted, mid-stream."
+            )
+
+        return cls(
+            style_image_key=cfg.get("style_image_key") or "ipadapter_main",
+            num_image_tokens=cfg.get("num_image_tokens", 4),
+            ipadapter_model_path=cfg["ipadapter_model_path"],
+            image_encoder_path=cfg["image_encoder_path"],
+            style_image=cfg.get("style_image"),
+            scale=cfg.get("scale", 1.0),
+            type=adapter_type,
+            insightface_model_name=insightface_model_name,
+        )
+
 
 # ---------------------------------------------------------------------------
 # IP-Adapter model path mapping by base model architecture and adapter type
@@ -203,10 +244,16 @@ class IPAdapterModule(OrchestratorUser):
         self.ipadapter: Optional[Any] = None
 
     def build_embedding_hook(self, stream) -> EmbeddingHook:
-        style_key = self.config.style_image_key or "default"
+        # S4: must match install()'s default (below) — a mismatch here would silently
+        # miss the cache under the key install() actually populated, hitting the
+        # zero-fill path below on every frame. Latent today only because both wrapper
+        # call sites (wrapper.py:2263, :2864) pin style_image_key explicitly.
+        style_key = self.config.style_image_key or "ipadapter_main"
         num_tokens = int(self.config.num_image_tokens)
+        warned_zero_fill = False
 
         def _embedding_hook(ctx: EmbedsCtx) -> EmbedsCtx:
+            nonlocal warned_zero_fill
             # Fetch cached image token embeddings (prompt, negative)
             cached: Optional[Tuple[torch.Tensor, torch.Tensor]] = stream._param_updater.get_cached_embeddings(
                 style_key
@@ -220,6 +267,18 @@ class IPAdapterModule(OrchestratorUser):
             hidden_dim = ctx.prompt_embeds.shape[2]
             batch_size = ctx.prompt_embeds.shape[0]
             if image_prompt_tokens is None:
+                # S4: silent zero-fill is the same failure class as B1/B2 — it disables
+                # image conditioning without ever raising or failing a shape check.
+                # Warn once per hook instance so a real-time streaming loop doesn't
+                # spam this every frame.
+                if not warned_zero_fill:
+                    logger.warning(
+                        "IPAdapterModule: no cached image-token embeddings for "
+                        f"style_image_key='{style_key}' — falling back to zero-filled "
+                        "tokens (image conditioning is a no-op until a style image is "
+                        "processed for this key). Logged once per hook instance."
+                    )
+                    warned_zero_fill = True
                 image_prompt_tokens = torch.zeros(
                     (batch_size, num_tokens, hidden_dim),
                     dtype=ctx.prompt_embeds.dtype,
@@ -302,13 +361,39 @@ class IPAdapterModule(OrchestratorUser):
             "device": stream.device,
             "dtype": stream.dtype,
         }
-        if self.config.type == IPAdapterType.FACEID and self.config.insightface_model_name:
-            ip_kwargs["insightface_model_name"] = self.config.insightface_model_name
-            print(
-                f"IPAdapterModule.install: Initializing FaceID IP-Adapter with InsightFace model: {self.config.insightface_model_name}"
-            )
+        if self.config.type == IPAdapterType.FACEID:
+            # B1: diffusers_ipadapter feeds InsightFace RGB, but every InsightFace ONNX
+            # model expects BGR (swapRB=True internally) — patch the single choke point
+            # (detect_faces_multires) before any detection can run.
+            try:
+                from streamdiffusion.modules.faceid_compat import apply_faceid_patches
+
+                apply_faceid_patches()
+            except Exception as e:
+                logger.warning(f"IPAdapterModule.install: apply_faceid_patches (B1) failed: {e}")
+
+            if self.config.insightface_model_name:
+                ip_kwargs["insightface_model_name"] = self.config.insightface_model_name
+                print(
+                    f"IPAdapterModule.install: Initializing FaceID IP-Adapter with InsightFace model: {self.config.insightface_model_name}"
+                )
         ipadapter = IPAdapter(**ip_kwargs)
         self.ipadapter = ipadapter
+
+        # B2: the FaceID checkpoint's rank-128 LoRA is silently discarded by the vendored
+        # strict load (it filters "lora"/"LoRA" keys — no LoRA-aware processor exists) and
+        # would be lost again by the TensorRT export path even if it did load. Fuse it
+        # directly into the UNet's attention linears instead, where no processor rebuild
+        # can touch it. B3 (engine cache-key marker) MUST accompany this — see
+        # engine_manager.py's EngineType.UNET branch.
+        if self.config.type == IPAdapterType.FACEID:
+            try:
+                from streamdiffusion.modules.faceid_compat import fuse_faceid_lora
+
+                fuse_faceid_lora(stream.pipe.unet, resolved_ip_path, lora_scale=1.0)
+            except Exception as e:
+                report_error(f"IPAdapterModule.install: fuse_faceid_lora (B2) failed: {e}")
+                raise
 
         # Fix kvo_cache incompatibility: diffusers_ipadapter sets old AttnProcessor on
         # self-attention blocks (attn1) that doesn't accept the kvo_cache kwarg passed by
@@ -340,6 +425,18 @@ class IPAdapterModule(OrchestratorUser):
             except Exception as e:
                 report_error(f"IPAdapterModule.install: Failed to initialize FaceIDEmbeddingPreprocessor: {e}")
                 raise
+
+            # Pay the InsightFace cold-start cost (skimage import + first ONNX Runtime
+            # session.run() for detection/recognition) here, while TD is already blocked
+            # building TensorRT engines, instead of on the user's first "update image"
+            # press — see faceid_compat.warmup_faceid's docstring for the two lazy costs
+            # this removes. Best-effort: a warmup failure only means a slower first press.
+            try:
+                from streamdiffusion.modules.faceid_compat import warmup_faceid
+
+                warmup_faceid(ipadapter)
+            except Exception as e:
+                logger.warning(f"IPAdapterModule.install: warmup_faceid failed (non-fatal): {e}")
         else:
             embedding_preprocessor = IPAdapterEmbeddingPreprocessor(
                 ipadapter=ipadapter,
@@ -415,8 +512,16 @@ class IPAdapterModule(OrchestratorUser):
             local_path = hf_hub_download(repo_id=repo_id, filename=subpath)
             return local_path
         else:
-            # Directory download
-            repo_root = snapshot_download(repo_id=repo_id, allow_patterns=[f"{subpath}/*"])
+            # Directory download.
+            # A6: HF image_encoder repos ship both model.safetensors and
+            # pytorch_model.bin (~3.69 GB each) for the same weights — transformers
+            # loads safetensors automatically when present, so the .bin (and other
+            # legacy formats) are pure dead weight on every fresh download.
+            repo_root = snapshot_download(
+                repo_id=repo_id,
+                allow_patterns=[f"{subpath}/*"],
+                ignore_patterns=["*.bin", "*.msgpack", "*.h5"],
+            )
             full_path = os.path.join(repo_root, subpath)
             if not os.path.exists(full_path):
                 raise FileNotFoundError(f"IPAdapterModule._resolve_model_path: Downloaded path not found: {full_path}")
