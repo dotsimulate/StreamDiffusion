@@ -18,6 +18,7 @@
 # limitations under the License.
 #
 
+import contextlib
 import gc
 import logging
 import os
@@ -60,6 +61,11 @@ class _BuildLogFilter(trt.ILogger):
     - Logger-mismatch notice ("logger passed into createInferBuilder differs") — a
       singleton bookkeeping warning with no effect on engine correctness. Counted so
       users see a single summary line instead of repeated [W] noise.
+
+    Also counts (does not suppress — TRT's actual verdict should stay visible)
+    "[l2tc] VALIDATE FAIL" messages, TRT's own signal that the L2-tiling pass found
+    a non-fully-concrete graph and skipped tiling for that layer. Read by builder.py
+    to persist the decision in build_stats.json (FP8 Round 11 evidence record).
     """
 
     # Myelin tactic-skip: ALL tokens must appear in the same message.
@@ -74,6 +80,7 @@ class _BuildLogFilter(trt.ILogger):
         self._inner = inner
         self.suppressed = 0
         self.suppressed_warn = 0
+        self.l2tc_validate_fail_count = 0
 
     def log(self, severity, msg):
         if all(s in msg for s in self._BENIGN):
@@ -82,6 +89,8 @@ class _BuildLogFilter(trt.ILogger):
         if any(s in msg for s in self._BENIGN_WARN):
             self.suppressed_warn += 1
             return
+        if "[l2tc]" in msg and "VALIDATE FAIL" in msg:
+            self.l2tc_validate_fail_count += 1
         self._inner.log(severity, msg)
 
 
@@ -277,7 +286,7 @@ def _apply_gpu_profile_to_config(
     gpu_profile: Optional[GPUBuildProfile],
     dynamic_shapes: bool = True,
     max_num_tactics: int = 64,
-) -> None:
+) -> dict:
     """
     Apply hardware-aware IBuilderConfig parameters that Polygraphy does not expose.
 
@@ -295,9 +304,27 @@ def _apply_gpu_profile_to_config(
             this from the TrtProfile: -1 for Performance/fp8 (deploy-once, search
             everything), 128 for Flexible/dynamic (kernels must generalize across the
             shape range), 64 (default) for Fast Build/Quality (static FP16).
+
+    Returns:
+        dict with the tiling decision actually applied (FP8 Round 11 evidence record —
+        callers persist this in build_stats.json rather than it existing only as an
+        INFO log line): {"dynamic_shapes": bool, "tiling_optimization_level": str or
+        None, "l2_limit_for_tiling_mib": int or None}. `tiling_optimization_level` is
+        the applied level name, or one of "skipped (no gpu_profile)", "skipped
+        (dynamic_shapes)", "disabled (NONE)", "unsupported" when nothing was applied.
     """
     if gpu_profile is None:
-        return
+        return {
+            "dynamic_shapes": dynamic_shapes,
+            "tiling_optimization_level": "skipped (no gpu_profile)",
+            "l2_limit_for_tiling_mib": None,
+        }
+
+    applied = {
+        "dynamic_shapes": dynamic_shapes,
+        "tiling_optimization_level": None,
+        "l2_limit_for_tiling_mib": None,
+    }
 
     # builder_optimization_level (0–5):
     #   4 = always compiles dynamic kernels (better than level-3 heuristics)
@@ -327,13 +354,16 @@ def _apply_gpu_profile_to_config(
             tiling_level = tiling_map.get(gpu_profile.tiling_optimization_level, trt.TilingOptimizationLevel.NONE)
             config.tiling_optimization_level = tiling_level
             logger.info(f"[TRT Config] tiling_optimization_level={gpu_profile.tiling_optimization_level}")
+            applied["tiling_optimization_level"] = gpu_profile.tiling_optimization_level
         except AttributeError:
             logger.debug("[TRT Config] tiling_optimization_level not supported — skipping")
+            applied["tiling_optimization_level"] = "unsupported"
 
         try:
             if gpu_profile.l2_limit_for_tiling > 0:
                 config.l2_limit_for_tiling = gpu_profile.l2_limit_for_tiling
                 logger.info(f"[TRT Config] l2_limit_for_tiling={gpu_profile.l2_limit_for_tiling // (1024 * 1024)} MiB")
+                applied["l2_limit_for_tiling_mib"] = gpu_profile.l2_limit_for_tiling // (1024 * 1024)
         except AttributeError:
             logger.debug("[TRT Config] l2_limit_for_tiling not supported — skipping")
     elif dynamic_shapes:
@@ -341,6 +371,13 @@ def _apply_gpu_profile_to_config(
             "[TRT Config] tiling_optimization_level/l2_limit skipped — dynamic shapes "
             "(would produce '[l2tc] VALIDATE FAIL' warnings with no effect)"
         )
+        applied["tiling_optimization_level"] = "skipped (dynamic_shapes)"
+    else:
+        # dynamic_shapes is False (all dims concrete) but the gpu_profile itself asked
+        # for no tiling (tiling_optimization_level == "NONE"). Previously silent: neither
+        # branch above fired, nothing was set, nothing was logged (FP8 Round 11 finding).
+        logger.debug("[TRT Config] tiling_optimization_level disabled by gpu_profile (NONE) — nothing applied")
+        applied["tiling_optimization_level"] = "disabled (NONE)"
 
     # max_aux_streams: NOT SET — let TRT use its own heuristic.
     # Setting an explicit value causes "[MS] Multi stream is disabled" warnings on
@@ -418,6 +455,8 @@ def _apply_gpu_profile_to_config(
     except AttributeError:
         logger.debug("[TRT Config] max_num_tactics not supported — skipping")
 
+    return applied
+
 
 # Map of numpy dtype -> torch dtype
 numpy_to_torch_dtype_dict = {
@@ -450,6 +489,48 @@ def CUASSERT(cuda_ret):
     if len(cuda_ret) > 1:
         return cuda_ret[1]
     return None
+
+
+# Number of consecutive CUDA graph capture failures (e.g. cudaErrorStreamCaptureInvalidated,
+# 901) tolerated per Engine before graphs are permanently disabled for that engine and every
+# frame falls back to plain execute_async_v3. Mirrors td_exporter/Exporter.py's
+# _graphs_disabled recovery — see Engine.infer's warmup/capture branch.
+_CUDA_GRAPH_MAX_CAPTURE_FAILURES = 3
+
+
+class NonBlockingStream:
+    """Minimal `polygraphy.cuda.Stream`-compatible wrapper around a stream created
+    with `cudaStreamNonBlocking`, via the `cuda.bindings.runtime` binding this module
+    already imports as `cudart` (see td_exporter/CUDAIPCWrapper.py's `create_stream`
+    for the raw-ctypes equivalent this mirrors, and CUDAGraphs.py:54-77 for why a
+    non-blocking stream is required alongside Relaxed capture mode).
+
+    `polygraphy.cuda.Stream()` creates a *blocking* stream (`cudaStreamCreate`), which
+    is what every engine stream in this module used to be. `Engine.infer` only ever
+    touches `.ptr` (an int) and `.synchronize()` on the stream object it's given —
+    verified across every `runtime_engines/*.py` wrapper and wrapper.py's call sites —
+    so that is the entire surface reproduced here. `.free()` / context-manager support
+    is added for parity with polygraphy's `Stream`, not because current callers rely on
+    it: the shared engine stream (wrapper.py's `cuda_stream = ...` call site) is never
+    explicitly freed today and lives for the process.
+    """
+
+    def __init__(self) -> None:
+        self.ptr: int = int(CUASSERT(cudart.cudaStreamCreateWithFlags(cudart.cudaStreamNonBlocking)))
+
+    def __enter__(self) -> "NonBlockingStream":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.free()
+
+    def synchronize(self) -> None:
+        CUASSERT(cudart.cudaStreamSynchronize(self.ptr))
+
+    def free(self) -> None:
+        if self.ptr:
+            CUASSERT(cudart.cudaStreamDestroy(self.ptr))
+            self.ptr = 0
 
 
 def _atomic_write_bytes(path: str, data: bytes) -> None:
@@ -606,6 +687,11 @@ class Engine:
         self.buffers = OrderedDict()
         self.tensors = OrderedDict()
         self.cuda_graph_instance = None  # cuda graph
+        # Tiling decision from the most recent build() call, stashed by
+        # _apply_gpu_profile_to_config's return value (FP8 Round 11 evidence record).
+        # Defaults to {} so getattr(engine, "last_tiling_info", {}) is never needed —
+        # present even if build() was never called or failed before reaching it.
+        self.last_tiling_info: dict = {}
 
         # Buffer reuse optimization tracking
         self._last_shape_dict = None
@@ -615,6 +701,21 @@ class Engine:
         # Cached ExternalStream wrapping the engine's polygraphy stream; allocated on
         # first infer() call so we avoid constructing a new Python wrapper every frame.
         self._engine_ext_stream = None
+        # Explicit cross-stream barriers around the engine stream. Today they are
+        # redundant: the engine stream is a blocking polygraphy stream, so PyTorch's
+        # implicit legacy-stream sync already orders things correctly (see
+        # wrapper.py's cuda_stream comment). They exist so that guarantee is provable
+        # rather than assumed, and so the engine stream can move to non-blocking in
+        # future without silently reintroducing a cross-stream race. Lazily created
+        # alongside _engine_ext_stream in infer().
+        self._pre_evt: Optional[torch.cuda.Event] = None  # caller stream -> engine stream
+        self._post_evt: Optional[torch.cuda.Event] = None  # engine stream -> caller stream
+        # CUDA graph capture is retried on invalidation (e.g. cudaErrorStreamCaptureInvalidated)
+        # up to _CUDA_GRAPH_MAX_CAPTURE_FAILURES times per engine, mirroring
+        # td_exporter/Exporter.py's _build_export_graphs recovery. After that this engine
+        # permanently falls back to plain execute_async_v3 rather than raising every frame.
+        self._cuda_graph_capture_failures = 0
+        self._cuda_graph_disabled = False
         # Sub-phase 5.6: last-bound caller tensor address per zero-copy input name,
         # so infer() can detect a pointer change and force a graph reset instead of
         # silently replaying stale addresses. Only populated for names actually
@@ -846,7 +947,7 @@ class Engine:
         config.set_timing_cache(trt_cache, ignore_mismatch=False)
 
         # Apply hardware-aware profile parameters
-        _apply_gpu_profile_to_config(
+        self.last_tiling_info = _apply_gpu_profile_to_config(
             config, gpu_profile, dynamic_shapes=dynamic_shapes, max_num_tactics=max_num_tactics
         )
 
@@ -978,7 +1079,7 @@ class Engine:
         config.set_timing_cache(trt_cache, ignore_mismatch=False)
 
         # Apply hardware-aware profile parameters
-        _apply_gpu_profile_to_config(
+        self.last_tiling_info = _apply_gpu_profile_to_config(
             config, gpu_profile, dynamic_shapes=dynamic_shapes, max_num_tactics=max_num_tactics
         )
 
@@ -1159,6 +1260,12 @@ class Engine:
         if self.profiler is not None:
             use_cuda_graph = False
 
+        # Permanently disabled after repeated capture failures (see the warmup/capture
+        # branch below and _CUDA_GRAPH_MAX_CAPTURE_FAILURES) — always take the plain
+        # execute_async_v3 path for this engine from here on.
+        if self._cuda_graph_disabled:
+            use_cuda_graph = False
+
         # Filter inputs to only those the engine actually exposes to avoid binding errors
         # _allowed_inputs is cached on first call — IO tensor names are immutable after engine build
         if self._allowed_inputs is None:
@@ -1191,6 +1298,8 @@ class Engine:
         # graph launch — copy_() on PyTorch's default stream would race the engine.
         if self._engine_ext_stream is None:
             self._engine_ext_stream = torch.cuda.ExternalStream(stream.ptr)
+            self._pre_evt = torch.cuda.Event()
+            self._post_evt = torch.cuda.Event()
             pt_stream = torch.cuda.current_stream().cuda_stream
             if pt_stream != stream.ptr:
                 logger.debug(
@@ -1207,6 +1316,11 @@ class Engine:
         bind_ptrs: dict[str, int] = {}
         needs_reset = False
         graph_exists = self.cuda_graph_instance is not None
+        # Barrier: every producer kernel for this frame's feed_dict tensors is already
+        # enqueued (in issue order) on the caller's current stream by this point. Make
+        # the engine stream wait for that point before it reads any of them.
+        self._pre_evt.record()
+        self._engine_ext_stream.wait_event(self._pre_evt)
         with torch.cuda.stream(self._engine_ext_stream):
             with _gpu_profiler.region("trt.input_staging"):
                 for name, buf in feed_dict.items():
@@ -1276,27 +1390,84 @@ class Engine:
                         if not noerror:
                             raise ValueError("ERROR: inference failed.")
                     stream.synchronize()
-                    # Drain the legacy/NULL stream before capture. The polygraphy Stream
-                    # is created via cudaStreamCreate (blocking), which implicitly syncs
-                    # with legacy. Any pending GPU work on legacy at capture time triggers
-                    # cudaErrorStreamCaptureInvalidated (901). One-time cost per engine.
+                    # Drain the legacy/NULL stream before capture. Belt-and-suspenders:
+                    # with the engine stream now non-blocking and capture mode Relaxed
+                    # (below), pending legacy work no longer invalidates the capture the
+                    # way it did on the old blocking-stream/ThreadLocal combination — but
+                    # draining first is still cheap (one-time cost per engine) and keeps
+                    # this capture's timing free of unrelated legacy-stream noise.
                     torch.cuda.current_stream().synchronize()
-                    # ThreadLocal mode: only captures ops on this thread's stream.
-                    # Global mode would also capture any GPU work submitted from other
-                    # threads (e.g. the TouchDesigner render thread), producing a
-                    # corrupted graph with unintended nodes.
-                    CUASSERT(
-                        cudart.cudaStreamBeginCapture(
-                            stream.ptr, cudart.cudaStreamCaptureMode.cudaStreamCaptureModeThreadLocal
+                    # Relaxed mode: no automatic cross-stream invalidation. Required
+                    # because TensorRT itself can enqueue work on the legacy stream
+                    # during execute_async_v3 for some engines (see the ControlNet
+                    # engine's genericReformat comment at wrapper.py's TRT ControlNet
+                    # load site) — under Global/ThreadLocal that legacy-stream touch
+                    # would invalidate the capture (cudaErrorStreamCaptureInvalidated,
+                    # 901) even though it did not originate from another thread. Matches
+                    # td_exporter/CUDAGraphs.py:54-77's rationale and the mode=2 passed by
+                    # Exporter._build_export_graphs's stream_begin_capture() call, the
+                    # sibling CUDA-graph implementation already live in this process
+                    # (symbol-relative citation — td_exporter/Exporter.py's line number
+                    # has already moved once across a cuda_link bump). The event barriers
+                    # around this stream (Fix 1a, above and
+                    # below) are what make it safe to no longer rely on ThreadLocal's
+                    # per-thread isolation for correctness.
+                    #
+                    # Capture failure is non-fatal, mirroring td_exporter/Exporter.py's
+                    # _build_export_graphs recovery. cudaStreamEndCapture ends the capture
+                    # itself even when it reports invalidation (e.g.
+                    # cudaErrorStreamCaptureInvalidated, 901) and sets pGraph=NULL in that
+                    # case, so self.graph is only ever non-None here if capture actually
+                    # finished and only cudaGraphInstantiate failed afterward — that is the
+                    # one case with a real graph object left to free.
+                    try:
+                        CUASSERT(
+                            cudart.cudaStreamBeginCapture(
+                                stream.ptr, cudart.cudaStreamCaptureMode.cudaStreamCaptureModeRelaxed
+                            )
                         )
-                    )
-                    self.context.execute_async_v3(stream.ptr)
-                    self.graph = CUASSERT(cudart.cudaStreamEndCapture(stream.ptr))
-                    self.cuda_graph_instance = CUASSERT(cudart.cudaGraphInstantiate(self.graph, 0))
+                        self.context.execute_async_v3(stream.ptr)
+                        self.graph = CUASSERT(cudart.cudaStreamEndCapture(stream.ptr))
+                        self.cuda_graph_instance = CUASSERT(cudart.cudaGraphInstantiate(self.graph, 0))
+                    except RuntimeError as exc:
+                        if getattr(self, "graph", None) is not None:
+                            with contextlib.suppress(RuntimeError):
+                                CUASSERT(cudart.cudaGraphDestroy(self.graph))
+                        self.graph = None
+                        self.cuda_graph_instance = None
+                        self._cuda_graph_capture_failures += 1
+                        if self._cuda_graph_capture_failures >= _CUDA_GRAPH_MAX_CAPTURE_FAILURES:
+                            self._cuda_graph_disabled = True
+                        logger.warning(
+                            "TensorRT Engine '%s': CUDA graph capture failed (%s) — falling back to "
+                            "non-graphed execution for this frame%s.",
+                            self.engine_path,
+                            exc,
+                            " (disabling CUDA graphs permanently for this engine after repeated failures)"
+                            if self._cuda_graph_disabled
+                            else "",
+                        )
+                        noerror = self.context.execute_async_v3(stream.ptr)
+                        if not noerror:
+                            raise ValueError("ERROR: inference failed.") from exc
             else:
                 noerror = self.context.execute_async_v3(stream.ptr)
                 if not noerror:
                     raise ValueError("ERROR: inference failed.")
+
+        # Barrier: make the caller's stream wait for engine-stream work (input staging
+        # plus execute/graph-launch) to complete before it touches the results, and
+        # tell the caching allocator these buffers are also live on the caller's
+        # stream so it won't reuse/free them early. Symmetric with the pre-barrier
+        # above. Covers feed_dict tensors (including zero-copy-bound inputs TensorRT
+        # read directly, which never touch self.tensors) and the persistent
+        # input/output buffers in self.tensors.
+        self._post_evt.record(self._engine_ext_stream)
+        torch.cuda.current_stream().wait_event(self._post_evt)
+        for tensor in feed_dict.values():
+            tensor.record_stream(torch.cuda.current_stream())
+        for tensor in self.tensors.values():
+            tensor.record_stream(torch.cuda.current_stream())
 
         if self.profiler is not None:
             # Synchronize to ensure all IProfiler.report_layer_time() callbacks have fired
@@ -1387,6 +1558,29 @@ def create_models(
         ),
     }
     return models
+
+
+def _compute_dynamic_shapes(build_dynamic_shape: bool, build_static_batch: bool, model_data: BaseModel) -> bool:
+    """Whether this engine has any symbolic dim (resolution, batch, or the KVO/FI
+    cache-frames axis) — the single source of truth `build_engine` passes to
+    `Engine.build`'s `dynamic_shapes=`, extracted (FP8 Round 11) so builder.py's
+    build_stats.json record and the actual kwarg passed to Engine.build cannot drift
+    apart, the way the tiling_optimization_level bug this round found and fixed did.
+
+    Any symbolic dim (resolution OR batch OR the KVO/FI cache-frames axis) disqualifies
+    l2tc tiling — see _apply_gpu_profile_to_config. build_dynamic_shape /
+    build_static_batch alone miss the StreamV2V cache-frames case:
+    get_kvo_cache_input_profile / get_fi_cache_input_profile always span
+    min_cache_maxframes..max_cache_maxframes unless pin_cache_frames has pinned them
+    equal (has_symbolic_cache_dims), so even a fully static-batch build still carries a
+    symbolic "C"/"FC" dim and previously reached the tiling branch, where TRT emitted
+    "[l2tc] VALIDATE FAIL - Graph contains symbolic shape" as a no-op.
+
+    `getattr(model_data, "has_symbolic_cache_dims", False)` (not direct attribute
+    access) so model_data stand-ins that don't define the property — e.g.
+    tests/unit/test_l2tc_dynamic_shapes.py's `_FakeModelData` — still work.
+    """
+    return build_dynamic_shape or not build_static_batch or getattr(model_data, "has_symbolic_cache_dims", False)
 
 
 def build_engine(
@@ -1488,18 +1682,7 @@ def build_engine(
         workspace_size=max_workspace_size,
         fp8=fp8,
         gpu_profile=gpu_profile,
-        # Any symbolic dim (resolution OR batch OR the KVO/FI cache-frames axis)
-        # disqualifies l2tc tiling — see _apply_gpu_profile_to_config.
-        # build_dynamic_shape / build_static_batch alone miss the StreamV2V
-        # cache-frames case: get_kvo_cache_input_profile / get_fi_cache_input_profile
-        # always span min_cache_maxframes..max_cache_maxframes unless pin_cache_frames
-        # has pinned them equal (has_symbolic_cache_dims), so even a fully static-batch
-        # build still carries a symbolic "C"/"FC" dim and previously reached the tiling
-        # branch, where TRT emitted "[l2tc] VALIDATE FAIL - Graph contains symbolic
-        # shape" as a no-op.
-        dynamic_shapes=(
-            build_dynamic_shape or not build_static_batch or getattr(model_data, "has_symbolic_cache_dims", False)
-        ),
+        dynamic_shapes=_compute_dynamic_shapes(build_dynamic_shape, build_static_batch, model_data),
     )
 
     return engine

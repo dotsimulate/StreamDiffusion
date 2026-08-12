@@ -17,6 +17,17 @@ whenever *any* dim (resolution or batch) is symbolic, matching
 concrete). Fully-static engines (e.g. ControlNet: `build_static_batch=True,
 build_dynamic_shape=False`) are unaffected.
 
+FP8 Round 11: the expression is actually three terms —
+`build_dynamic_shape or not build_static_batch or getattr(model_data,
+"has_symbolic_cache_dims", False)` — extracted into `_compute_dynamic_shapes`
+(utilities.py). The third term covers KVO/FI cache-frames axis models
+(`use_cached_attn`) whose exported ONNX still has symbolic dims even when
+`build_static_batch=True` and `build_dynamic_shape=False`, which every current
+UNet build actually is. That term previously had zero test coverage here even
+though it decides tiling for those builds; the two-term description above is
+kept for the original bug's history, not as the current full behavior — see
+the third-term tests below.
+
 These tests exercise only `build_engine`'s pure-Python wiring: GPU detection,
 the memory query, and the real `Engine.build()` TRT call are all monkeypatched
 out, so no CUDA device or TensorRT context is required.
@@ -40,13 +51,22 @@ pytestmark = pytest.mark.skipif(
 
 
 class _FakeModelData:
-    """Stand-in for a BaseModel subclass — build_engine only calls get_input_profile()."""
+    """Stand-in for a BaseModel subclass — build_engine only calls get_input_profile().
+    Deliberately does NOT define has_symbolic_cache_dims, so _compute_dynamic_shapes's
+    getattr(..., False) default is what most of these tests exercise for that term."""
 
     def get_input_profile(self, *args, **kwargs):
         return {}
 
 
-def _computed_dynamic_shapes(monkeypatch, *, build_static_batch, build_dynamic_shape):
+class _FakeModelDataWithSymbolicCache(_FakeModelData):
+    """Stand-in for a use_cached_attn model whose exported ONNX keeps a symbolic
+    cache-frames axis (has_symbolic_cache_dims=True) — the third term."""
+
+    has_symbolic_cache_dims = True
+
+
+def _computed_dynamic_shapes(monkeypatch, *, build_static_batch, build_dynamic_shape, model_data=None):
     """Call build_engine() with GPU detection / memory query / the real TRT build
     all monkeypatched out, and return the `dynamic_shapes` kwarg it actually
     passed to Engine.build()."""
@@ -60,7 +80,7 @@ def _computed_dynamic_shapes(monkeypatch, *, build_static_batch, build_dynamic_s
     trt_utilities.build_engine(
         engine_path="fake.engine",
         onnx_opt_path="fake.onnx",
-        model_data=_FakeModelData(),
+        model_data=model_data if model_data is not None else _FakeModelData(),
         opt_image_height=512,
         opt_image_width=512,
         opt_batch_size=1,
@@ -87,3 +107,29 @@ class TestL2tcDynamicShapesFix:
         """build_dynamic_shape=True alone was already sufficient before this fix."""
         result = _computed_dynamic_shapes(monkeypatch, build_static_batch=True, build_dynamic_shape=True)
         assert result is True
+
+    def test_symbolic_cache_dims_is_dynamic_even_when_fully_static(self, monkeypatch):
+        """FP8 Round 11: has_symbolic_cache_dims=True must force dynamic_shapes=True
+        on its own, even though build_static_batch=True and build_dynamic_shape=False
+        together compute False (see test_fully_static_engine_is_not_dynamic above).
+        This is the case every current pin_cache_frames UNet build actually hits."""
+        result = _computed_dynamic_shapes(
+            monkeypatch,
+            build_static_batch=True,
+            build_dynamic_shape=False,
+            model_data=_FakeModelDataWithSymbolicCache(),
+        )
+        assert result is True
+
+    def test_missing_has_symbolic_cache_dims_defaults_to_false_contribution(self, monkeypatch):
+        """_FakeModelData (no has_symbolic_cache_dims attribute at all) must not
+        crash and must not itself force dynamic_shapes=True — getattr(...,
+        False) is the required default, not attribute access, per
+        tests/unit/test_l2tc_dynamic_shapes.py's own _FakeModelData contract."""
+        result = _computed_dynamic_shapes(
+            monkeypatch,
+            build_static_batch=True,
+            build_dynamic_shape=False,
+            model_data=_FakeModelData(),
+        )
+        assert result is False
