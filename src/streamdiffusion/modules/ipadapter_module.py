@@ -425,6 +425,18 @@ class IPAdapterModule(OrchestratorUser):
             except Exception as e:
                 report_error(f"IPAdapterModule.install: Failed to initialize FaceIDEmbeddingPreprocessor: {e}")
                 raise
+
+            # Pay the InsightFace cold-start cost (skimage import + first ONNX Runtime
+            # session.run() for detection/recognition) here, while TD is already blocked
+            # building TensorRT engines, instead of on the user's first "update image"
+            # press — see faceid_compat.warmup_faceid's docstring for the two lazy costs
+            # this removes. Best-effort: a warmup failure only means a slower first press.
+            try:
+                from streamdiffusion.modules.faceid_compat import warmup_faceid
+
+                warmup_faceid(ipadapter)
+            except Exception as e:
+                logger.warning(f"IPAdapterModule.install: warmup_faceid failed (non-fatal): {e}")
         else:
             embedding_preprocessor = IPAdapterEmbeddingPreprocessor(
                 ipadapter=ipadapter,
