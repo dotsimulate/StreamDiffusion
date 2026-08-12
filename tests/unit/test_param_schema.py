@@ -22,7 +22,9 @@ from streamdiffusion.param_schema import (
     DEFAULTS,
     PARAM_NAMES,
     UPDATER_PARAM_NAMES,
+    build_calibration_t_indices,
     clamp_delta,
+    compute_sub_timesteps,
     delta_noise_cancellation_ceiling,
     floor_num_inference_steps,
     rescale_t_index_list,
@@ -101,7 +103,7 @@ class TestDefaultsGolden:
 
     def test_interpolation_method_defaults(self):
         assert DEFAULTS["prompt_interpolation_method"] == "slerp"
-        assert DEFAULTS["seed_interpolation_method"] == "linear"
+        assert DEFAULTS["seed_interpolation_method"] == "average"
 
     def test_config_only_params_default_none(self):
         for name in (
@@ -169,6 +171,148 @@ class TestDeltaCeiling:
         # At gamma <= 1 the uncond term never enters the combine — no ceiling.
         assert delta_noise_cancellation_ceiling(1.0) == float("inf")
         assert delta_noise_cancellation_ceiling(0.5) == float("inf")
+
+
+class TestComputeSubTimesteps:
+    def test_indexes_by_position(self):
+        assert compute_sub_timesteps([10, 20, 30, 40], [0, 2, 3]) == [10, 30, 40]
+
+    def test_reproduces_known_lcm_grid(self):
+        """timesteps[j] = 999 - 20j for num_inference_steps=50,
+        original_inference_steps=100 (confirmed by direct computation against
+        diffusers' LCMScheduler.set_timesteps -- see the fp8-round-5-handoff
+        plan). Deployment t_index_list [15, 21, 27] must map to raw UNet
+        timesteps 699 / 579 / 459, not the turbo-schedule 999/499/249 that
+        4-step calibration used to sample."""
+        timesteps = [999 - 20 * j for j in range(50)]
+        assert compute_sub_timesteps(timesteps, [15, 21, 27]) == [699, 579, 459]
+
+
+class TestBuildCalibrationTIndices:
+    """Band spec (user's decade rule): the k-th configured t_index_list entry
+    anchors band [k*10, (k+1)*10). Verified against the production config
+    (t_index_list=[15,21,27], num_inference_steps=50) throughout."""
+
+    def test_always_includes_configured_t_index_list(self):
+        result = build_calibration_t_indices([15, 21, 27], num_inference_steps=50, budget=8)
+        assert {15, 21, 27} <= set(result)
+
+    def test_result_is_sorted_and_deduplicated(self):
+        result = build_calibration_t_indices([15, 21, 27], num_inference_steps=50, budget=8)
+        assert result == sorted(set(result))
+
+    def test_covers_every_band(self):
+        """[15,21,27] sits in bands 1,2,2 (not 0,1,2) -- band 0 ([0,10]) has
+        no configured point in it at all, so band coverage only holds if the
+        remaining budget is genuinely spread across every band, not just
+        parked next to the configured values."""
+        result = build_calibration_t_indices([15, 21, 27], num_inference_steps=50, budget=8)
+        for lo, hi in [(0, 10), (10, 20), (20, 30)]:
+            assert any(lo <= t <= hi for t in result), f"band [{lo},{hi}] uncovered: {result}"
+
+    def test_generalises_to_five_step_schedule(self):
+        t_index_list = [5, 14, 23, 32, 41]
+        result = build_calibration_t_indices(t_index_list, num_inference_steps=50, budget=12)
+        assert set(t_index_list) <= set(result)
+        assert result == sorted(set(result))
+        assert len(result) <= 12
+
+    def test_generalises_to_three_step_schedule(self):
+        t_index_list = [15, 21, 27]
+        result = build_calibration_t_indices(t_index_list, num_inference_steps=50, budget=8)
+        assert set(t_index_list) <= set(result)
+        assert len(result) <= 8
+
+    def test_bands_clamp_at_max_index_no_out_of_range(self):
+        # num_inference_steps=25 -> max valid t_index is 24. Configured
+        # values sit near the top of the grid; bands must not run past it.
+        result = build_calibration_t_indices([20, 22, 24], num_inference_steps=25, budget=8)
+        assert all(0 <= t <= 24 for t in result)
+
+    def test_never_negative(self):
+        result = build_calibration_t_indices([0, 1, 2], num_inference_steps=10, budget=8)
+        assert all(t >= 0 for t in result)
+
+    def test_configured_values_win_when_budget_too_small(self):
+        """budget smaller than len(t_index_list): every deployment point must
+        still be present even though that means the result exceeds budget."""
+        t_index_list = [15, 21, 27, 33, 39]
+        result = build_calibration_t_indices(t_index_list, num_inference_steps=50, budget=3)
+        assert set(t_index_list) <= set(result)
+
+    def test_index_zero_absent_unless_configured(self):
+        """fp8-round-5-handoff round 6: band 0's floor was k*band_width == 0,
+        so t_index 0 (raw timestep ~999, pure noise) was silently included
+        even when nothing configured it. Band 0 must now floor at 1."""
+        result = build_calibration_t_indices([10, 20, 26], num_inference_steps=50, budget=8)
+        assert 0 not in result
+
+    def test_production_config_uses_full_budget(self):
+        """The exact config from the round-5 log (t_index_list=[10,20,26],
+        num_inference_steps=50, budget=8) must now consume all 8 slots as
+        distinct in-band indices, matching the fp8-round-7 hand trace under
+        neighbour-midpoint bands: [(1,15), (16,23), (24,49)]."""
+        result = build_calibration_t_indices([10, 20, 26], num_inference_steps=50, budget=8)
+        assert result == [4, 10, 12, 18, 20, 22, 26, 37]
+
+    def test_no_value_repeated_across_adjacent_bands(self):
+        """Regression for the old bug where _evenly_spaced_ints returned band
+        endpoints and adjacent bands shared a boundary, so most of the spare
+        budget re-picked an already-picked value instead of a new one."""
+        result = build_calibration_t_indices([10, 20, 26], num_inference_steps=50, budget=8)
+        assert len(result) == len(set(result)) == 8
+
+    def test_terminal_band_spill_is_not_dropped(self):
+        """fp8-round-6.1: the live t_index_list=[7,16,25] config left the last
+        band's own interior pick colliding with an already-picked value, and
+        forward-only spill has nowhere further to go from the last band --
+        budget silently dropped to 7/8. A round-robin top-up must recover it."""
+        result = build_calibration_t_indices([7, 16, 25], num_inference_steps=50, budget=8)
+        assert len(result) == 8
+
+    def test_full_budget_consumed_across_configs(self):
+        """Every config traced during the fp8-round-6.1 investigation must
+        consume its full budget now that the top-up sweep backstops spill."""
+        configs = [
+            [7, 16, 25],
+            [10, 20, 26],
+            [0, 16, 32, 45],
+            [5, 15],
+            [3, 13, 23, 33, 43],
+        ]
+        for t_index_list in configs:
+            result = build_calibration_t_indices(t_index_list, num_inference_steps=50, budget=8)
+            assert len(result) == 8, f"{t_index_list} -> {result}"
+
+    def test_single_t_index_spreads_across_full_range(self):
+        """fp8-round-7: under the old fixed-decade grid, a single configured
+        value only anchored band [1,9], collapsing 7 of 8 rows into the
+        noisiest indices (1..9) and leaving the deployment point isolated.
+        Neighbour-midpoint bands must give a lone value the *entire* range,
+        so the budget spreads across it instead of piling up near index 1."""
+        result = build_calibration_t_indices([25], num_inference_steps=50, budget=8)
+        assert len(result) == 8
+        assert max(result) > 9, f"budget collapsed near index 1: {result}"
+
+    def test_every_configured_value_lands_in_its_own_band(self):
+        """fp8-round-7: the old fixed-decade grid assigned band k to
+        t_index_list[k] positionally, with no guarantee the value actually
+        fell inside it -- e.g. [0,16,32,45] put 32 in band 3 (decade
+        [30,39], "belonging" to 45) and left 45 outside every band. Under
+        neighbour-midpoint bands each value must provably sit inside the
+        band derived for it -- except an explicit 0, whose own band 0 still
+        floors at 1 by design (see test_index_zero_absent_unless_configured);
+        0 stays in the result via direct picked-membership, just outside its
+        derived band's interior-sampling range."""
+        for t_index_list in ([7, 16, 25], [0, 16, 32, 45], [25], [5, 15]):
+            values = sorted(set(t_index_list))
+            n = len(values)
+            for k, t in enumerate(values):
+                if k == 0 and t == 0:
+                    continue
+                lo = 1 if k == 0 else (values[k - 1] + t) // 2 + 1
+                hi = 49 if k == n - 1 else (t + values[k + 1]) // 2
+                assert lo <= t <= hi, f"{t} not in its own band [{lo},{hi}] for {t_index_list}"
 
 
 class TestRescaleTIndexList:

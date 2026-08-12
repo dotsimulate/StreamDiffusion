@@ -10,7 +10,13 @@ from PIL import Image
 
 from .image_utils import postprocess_image
 from .model_detection import detect_model
-from .param_schema import PromptInterpolationMethod, SeedInterpolationMethod
+from .param_schema import (
+    PromptInterpolationMethod,
+    SeedInterpolationMethod,
+    build_calibration_t_indices,
+    compute_sub_timesteps,
+    materialise_timestep_grid,
+)
 from .pipeline import StreamDiffusion
 from .tools.gpu_profiler import configure as _configure_profiler
 from .tools.gpu_profiler import profiler
@@ -30,6 +36,240 @@ def _is_oom_error(exc: BaseException) -> bool:
     return (
         "out of memory" in error_msg or "outofmemory" in error_msg or "oom" in error_msg or "cuda error" in error_msg
     )
+
+
+def _encode_fp8_calibration_images(ipa: Any, images: List[Any]) -> Tuple[Optional[torch.Tensor], int, int]:
+    """Encode `images` through `ipa.get_image_embeds`, retrying per-image on
+    failure so one bad image can't cost the whole calibration set
+    (fp8-round-9.1 §10).
+
+    `get_image_embeds` is all-or-nothing: under `type: faceid` the encoder is
+    InsightFace/ArcFace, and `extract_face_embeddings` raises `ValueError` on
+    any image with no detectable face
+    (`diffusers_ipadapter/ip_adapter/face_utils.py`) *before any embedding is
+    returned* — so one non-face image in a calibration folder shared with a
+    CLIP-based adapter would previously delete every other image's
+    contribution too, degrading the whole set to zero-pad.
+
+    Batch-encodes first — identical to the pre-hardening call, and the
+    common case costs nothing extra. On failure with more than one image,
+    retries one image at a time, keeping survivors and warning once per
+    rejection. A single-image "batch" that fails is not retried (there is
+    nothing smaller to retry with) — the caller falls through to the next
+    calibration source instead.
+
+    Per-image encoding is not an approximation of the batch call: CLIP,
+    ArcFace, and the projection all run per row with no cross-image
+    interaction (`ip_adapter.py:163-251`), so the retry path's surviving
+    rows are identical to what the batch call would have produced for the
+    same images.
+
+    Returns `(embeds, kept, total)`. `embeds` is `None` only when `kept == 0`
+    (nothing survived); `total` is always `len(images)`, for the caller's
+    "n=<kept> of <total>" log line. Never raises — every exception from
+    `ipa.get_image_embeds` is caught and logged here.
+    """
+    total = len(images)
+    try:
+        embeds, _ = ipa.get_image_embeds(images=images)
+        return embeds, total, total
+    except Exception as e:
+        if total <= 1:
+            logger.warning(f"[TRT] FP8 calib image rejected by adapter ({type(e).__name__}: {e}); skipping.")
+            return None, 0, total
+        logger.warning(
+            f"[TRT] FP8 calib: batch encode of {total} image(s) failed "
+            f"({type(e).__name__}: {e}); retrying individually."
+        )
+    kept: List[torch.Tensor] = []
+    for i, image in enumerate(images):
+        try:
+            embed, _ = ipa.get_image_embeds(images=[image])
+            kept.append(embed)
+        except Exception as e:
+            logger.warning(
+                f"[TRT] FP8 calib image {i + 1}/{total} rejected by adapter ({type(e).__name__}: {e}); skipping."
+            )
+    if not kept:
+        return None, 0, total
+    return torch.cat(kept, dim=0), len(kept), total
+
+
+def _resolve_fp8_ipadapter_calibration_tokens(
+    ipa: Any,
+    cached_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    style_images: Optional[List[Any]] = None,
+) -> Tuple[Optional[np.ndarray], str]:
+    """Resolve real (or surrogate) IP-Adapter projection tokens for FP8
+    calibration's encoder_hidden_states reconciliation (fp8-round-9,
+    fp8-round-9.1), instead of the zero-pad fallback (None).
+
+    fp8-round-9 dispatched on adapter flavour (`is_faceid and not is_plus`),
+    which happened to match the FaceID config the round was measured against
+    but left every other adapter type — including plain `type: regular` —
+    silently zero-padded regardless of flavour. fp8-round-9.1 dispatches on
+    `image_proj_model.proj`'s actual structure instead, which is what
+    determines whether the zeros-surrogate call is even well-formed:
+
+    - `proj` is an `nn.Sequential` (FaceIDProjectionModel): `proj[0].in_features`
+      is `id_embeddings_dim` (512). Measured in the fp8-round-9 plan.
+    - `proj` is a bare `nn.Linear` (ImageProjModel, regular adapters):
+      `proj.in_features` is `clip_embeddings_dim`. `forward()` is
+      `Linear -> reshape(-1, 4, 2048) -> LayerNorm`, so a zeros input yields
+      the LayerNorm-normalised bias — non-degenerate and O(1), the same
+      structural argument fp8-round-9 measured for FaceID.
+    - Anything else (Plus / Resampler / FaceID-Plus-v2): call signature is
+      unmeasured here — skip, zero-pad fallback applies, unchanged from
+      fp8-round-9.
+
+    fp8-round-9.1 (this revision) also adds `style_images`, a fourth and
+    highest-priority source: a list of PIL images (or anything
+    `ipa.get_image_embeds` accepts), encoded through the adapter's own
+    runtime call — the same one `IPAdapterEmbeddingPreprocessor` uses at
+    inference. Unlike the zeros-surrogate, `get_image_embeds` dispatches
+    FaceID/Plus/regular internally, so it is not limited to the two `proj`
+    shapes this function otherwise recognizes. A configured image set beats
+    an incidentally-cached runtime embedding — an operator who deliberately
+    supplies calibration images expects them used, not silently superseded
+    by whatever the last live frame happened to cache.
+
+    `get_image_embeds` has a side effect (`ipa.set_tokens(len(images) *
+    ipa.num_tokens)`) that mutates `num_tokens` on every live
+    `IPAttnProcessor` in `ipa.pipe.unet.attn_processors` — correct for its
+    normal single-frame runtime call (batch=1), but a stale artifact here
+    whenever `style_images` has more than one entry (e.g. 2 images leaves
+    `num_tokens=8` sitting on live state meant for the next single-frame
+    call). Restored to the per-image invariant (`ipa.num_tokens`) in a
+    `finally` so a multi-image calibration set can't corrupt the live
+    adapter's runtime state for the next real frame.
+
+    fp8-round-9.1 §10: the `style_images` branch encodes via
+    `_encode_fp8_calibration_images`, which retries per-image on a batch
+    failure and keeps whatever survives — see its docstring for why. Unlike
+    the surrogate branch below, a `style_images` encode failure therefore
+    does NOT propagate; if nothing survives, this function falls through to
+    `cached_embeddings` or the zeros-surrogate instead. This matters most
+    under `type: faceid`: ArcFace raises on any image with no detectable
+    face, and a calibration folder shared with a CLIP-based adapter could
+    otherwise contain one. The surrogate/cached branches are unchanged —
+    they still run arbitrary third-party forward code with no internal
+    try/except, so callers must keep wrapping the whole call, since an FP8
+    calibration token failure must never hard-fail an engine build.
+
+    Returns ``(tokens_or_None, method)`` where ``method`` is one of
+    ``"image"`` (`_encode_fp8_calibration_images` kept at least one row),
+    ``"cached"`` (real cached embedding used verbatim), ``"surrogate"``
+    (`image_proj_model(zeros)`, `proj` shape recognized), or ``"skipped"``
+    (`ipa` is None or `proj` shape unrecognized — zero-pad fallback applies).
+    """
+    if ipa is None:
+        return None, "skipped"
+    if style_images:
+        try:
+            image_embeds, _kept, _total = _encode_fp8_calibration_images(ipa, style_images)
+        finally:
+            try:
+                ipa.set_tokens(ipa.num_tokens)
+            except Exception:
+                pass
+        if image_embeds is not None:
+            return image_embeds.detach().cpu().numpy(), "image"
+        # Every configured image was rejected by the adapter (e.g. no
+        # detectable face under FaceID) -- fall through rather than losing
+        # calibration entirely to a bad image.
+    if cached_embeddings is not None:
+        return cached_embeddings[0].detach().cpu().numpy(), "cached"
+    proj = getattr(getattr(ipa, "image_proj_model", None), "proj", None)
+    if isinstance(proj, torch.nn.Sequential):
+        in_features = proj[0].in_features
+    elif isinstance(proj, torch.nn.Linear):
+        in_features = proj.in_features
+    else:
+        return None, "skipped"
+    zeros = torch.zeros(1, in_features, device=ipa.device, dtype=ipa.dtype)
+    with torch.inference_mode():
+        tokens = ipa.image_proj_model(zeros)
+    return tokens.detach().cpu().numpy(), "surrogate"
+
+
+def _load_fp8_calibration_style_images(path: Optional[str]) -> Optional[List["Image.Image"]]:
+    """Load calibration images for FP8 IP-Adapter token resolution
+    (fp8-round-9.1) from `fp8_calibration_style_image`: a single image file,
+    or a directory of them, loaded in sorted filename order — deterministic,
+    and the same order `engine_manager.py`'s `_calibration_image_signature`
+    hashes in, so the `--ci<hash>` cache tag matches what was actually loaded.
+
+    Returns None (not an empty list) when nothing was configured, the path
+    doesn't exist, or nothing loadable was found, so callers can treat it the
+    same as "not configured" and fall through to the next calibration source.
+    """
+    if not path:
+        return None
+    from .acceleration.tensorrt.fp8_quantize import _list_calibration_images
+
+    p = Path(path)
+    if not p.exists():
+        logger.warning(f"[TRT] fp8_calibration_style_image path not found: {path}")
+        return None
+    files = _list_calibration_images(path)
+    images: List[Any] = []
+    for f in files:
+        try:
+            images.append(Image.open(f).convert("RGB"))
+        except Exception as e:
+            logger.warning(f"[TRT] Failed to load calibration image {f}: {type(e).__name__}: {e}")
+    return images or None
+
+
+# fp8-round-9.1 §10: `type: faceid` encodes through InsightFace/ArcFace, which
+# raises ValueError on any image with no detectable face (face_utils.py's
+# extract_face_embeddings) — so a calibration folder shared with a CLIP-based
+# adapter (regular/plus) risks feeding it non-face art and losing the whole
+# calibration set. Two folders, keyed on encoder *modality* rather than the
+# config `type` string, because regular and plus both encode through CLIP and
+# want identical inputs — a third modality just adds one more entry here.
+_FP8_CALIB_MODE_DIRS = {"faceid": "faces"}
+_FP8_CALIB_DEFAULT_MODE_DIR = "general"
+
+
+def _resolve_fp8_calibration_dir(path: Optional[str], adapter_type: Optional[str]) -> Optional[str]:
+    """Redirect `fp8_calibration_style_image` to its adapter-mode subfolder
+    (fp8-round-9.1 §10), e.g. `images/calibration` -> `images/calibration/faces`
+    for `type: faceid`, so a mode switch can't hand ArcFace an image with no
+    face in it.
+
+    Computed once here and threaded into *both* `EngineManager.get_engine_path`
+    (the `--ci<hash>` cache key) and `_load_fp8_calibration_style_images` (the
+    actual load) from the same call site in `configure_engines`/
+    `compile_and_load_engine` — never re-derived independently at each site —
+    so the two can't disagree about which folder is in play. Same reasoning
+    that put `_CALIBRATION_IMAGE_EXTENSIONS`/`_list_calibration_images` in one
+    module shared by both.
+
+    Returns `path` **unchanged** whenever it can't confidently improve on it:
+    `path` is `None`, names a single file (no mode folder applies to a single
+    explicit file), doesn't exist, or its mode subfolder is missing or empty
+    of recognized images. In every unchanged case the existing warnings in
+    the loader/hasher fire exactly as before — this function only adds a
+    redirect, it never removes a diagnostic.
+    """
+    if not path:
+        return path
+    from .acceleration.tensorrt.fp8_quantize import _list_calibration_images
+
+    p = Path(path)
+    if not p.is_dir():
+        return path
+    subdir_name = _FP8_CALIB_MODE_DIRS.get(adapter_type, _FP8_CALIB_DEFAULT_MODE_DIR)
+    candidate = p / subdir_name
+    if candidate.is_dir() and _list_calibration_images(str(candidate)):
+        return str(candidate)
+    logger.warning(
+        f"[TRT] FP8 calib: no usable '{subdir_name}/' subfolder under {path} for "
+        f"type={adapter_type!r}; using the flat folder — images unsuited to this "
+        f"adapter mode will be skipped at encode time rather than aborting the set."
+    )
+    return path
 
 
 # Text-encoder CPU offload frees ~1.6 GB VRAM but each prompt update pays a
@@ -149,11 +389,42 @@ class StreamDiffusionWrapper:
         fi_strength: float = 0.75,
         fi_threshold: float = 0.98,
         fp8: bool = False,
+        # Reference step count for FP8 build-time calibration schedule derivation
+        # (see _load_model's FP8 build seam) — NOT the live num_inference_steps
+        # used by prepare()/update_stream_params, which can still change at
+        # runtime. Defaults to 50 to match the internal warm-up prepare() call
+        # below; set it from config so a non-default deployment step count still
+        # calibrates the timestep region inference actually visits.
+        num_inference_steps: int = 50,
         static_shapes: bool = False,
         fp8_allow_fp16_fallback: bool = False,
         # Experimental: include attention BMM1/BMM2 in FP8 Q/DQ (modelopt disable_mha_qdq=False).
         # Forks the engine cache tag to --fp8v3-mhaq; default False keeps production identity.
         fp8_mha_qdq: bool = False,
+        # fp8-round-8: corrects modelopt's inverted INT8->FP8 scale-conversion factor
+        # (see fp8_quantize.py::_rescale_fp8_qdq_scales). 1.0 = full E4M3 range; >1.0
+        # trades resolution for outlier headroom. Forks the cache tag (--fp8v4-hr<N>).
+        fp8_scale_headroom: float = 1.0,
+        # fp8-round-8 fallback lever: excludes the two attention BMMs (QK^T, softmax@V)
+        # from FP8 Q/DQ entirely, running them FP16. Should not be needed once
+        # fp8_scale_headroom's correction is in place — see the fp8-round-8 plan.
+        # Forks the cache tag (--fp8v4-noattn).
+        fp8_exclude_attention: bool = False,
+        # fp8-round-9 fallback lever: excludes the three IP-Adapter cross-attention
+        # activation tensors (Mul_4/Mul_5/Transpose_4) from FP8 Q/DQ, running them
+        # FP16. Orthogonal to fp8_exclude_attention — see
+        # _IPADAPTER_ACTIVATION_EXCLUDE_PATTERNS's comment for the non-overlap.
+        # Forks the cache tag (--fp8v4-noip).
+        fp8_exclude_ipadapter: bool = False,
+        # fp8-round-9.1: real calibration source for the IP-Adapter cross-attention
+        # branch — a single image file, or a directory of them (loaded sorted via
+        # PIL), encoded through ipa.get_image_embeds — the same call the runtime
+        # IPAdapterEmbeddingPreprocessor uses. Highest-priority calibration token
+        # source: beats both a cached runtime embedding and the zeros-surrogate
+        # (see _resolve_fp8_ipadapter_calibration_tokens). None (default) preserves
+        # current behavior. Forks the cache tag (--ci<hash-of-file-contents>) since
+        # the calibration image set is part of the build recipe.
+        fp8_calibration_style_image: Optional[str] = None,
         builder_optimization_level: Optional[int] = None,
         # CUDA IPC output (SD→TD zero-copy GPU transport via cuda-link)
         use_cuda_ipc_output: bool = False,
@@ -401,6 +672,10 @@ class StreamDiffusionWrapper:
         self.static_shapes = static_shapes
         self.fp8_allow_fp16_fallback = fp8_allow_fp16_fallback
         self.fp8_mha_qdq = fp8_mha_qdq
+        self.fp8_scale_headroom = fp8_scale_headroom
+        self.fp8_exclude_attention = fp8_exclude_attention
+        self.fp8_exclude_ipadapter = fp8_exclude_ipadapter
+        self.fp8_calibration_style_image = fp8_calibration_style_image
         self.builder_optimization_level = builder_optimization_level
         # Per-engine VAE optlvl (None → inherit builder_optimization_level).
         # Tiny-VAE engines are small and gain little from optlvl 4 — defaulting to
@@ -448,6 +723,7 @@ class StreamDiffusionWrapper:
             fi_strength=fi_strength,
             fi_threshold=fi_threshold,
             fp8=fp8,
+            num_inference_steps=num_inference_steps,
         )
 
         # Store skip_diffusion on wrapper for execution flow control
@@ -497,9 +773,9 @@ class StreamDiffusionWrapper:
         guidance_scale: float = 1.2,
         delta: float = 1.0,
         # Blending-specific parameters (only used when prompt is a list)
-        prompt_interpolation_method: Literal["linear", "slerp", "cosine_weighted"] = "slerp",
+        prompt_interpolation_method: Literal["average", "slerp", "cosine_weighted"] = "slerp",
         seed_list: Optional[List[Tuple[int, float]]] = None,
-        seed_interpolation_method: Literal["linear", "slerp"] = "linear",
+        seed_interpolation_method: Literal["average", "slerp", "cosine_weighted"] = "average",
     ) -> None:
         """
         Prepares the model for inference.
@@ -524,13 +800,13 @@ class StreamDiffusionWrapper:
             Valid range [1.0, 5.0] (clamped); only used by cfg_type
             'self'/'initialize' at guidance_scale > 1. Values above
             guidance_scale/(guidance_scale-1) re-inject noise.
-        prompt_interpolation_method : Literal["linear", "slerp"], optional
+        prompt_interpolation_method : Literal["average", "slerp", "cosine_weighted"], optional
             Method for interpolating between prompt embeddings (only used for prompt blending),
             by default "slerp".
         seed_list : Optional[List[Tuple[int, float]]], optional
             List of seeds with weights for blending, by default None.
-        seed_interpolation_method : Literal["linear", "slerp"], optional
-            Method for interpolating between seed noise tensors, by default "linear".
+        seed_interpolation_method : Literal["average", "slerp", "cosine_weighted"], optional
+            Method for interpolating between seed noise tensors, by default "average".
         """
 
         # Handle both single prompt and prompt blending
@@ -634,7 +910,7 @@ class StreamDiffusionWrapper:
         self,
         prompt: Union[str, List[Tuple[str, float]]],
         negative_prompt: str = "",
-        prompt_interpolation_method: Literal["linear", "slerp", "cosine_weighted"] = "slerp",
+        prompt_interpolation_method: Optional[Literal["average", "slerp", "cosine_weighted"]] = None,
         clear_blending: bool = True,
         warn_about_conflicts: bool = True,
     ) -> None:
@@ -654,8 +930,9 @@ class StreamDiffusionWrapper:
             - Blending: [("cat", 0.7), ("dog", 0.3)]
         negative_prompt : str, optional
             The negative prompt (used with blending), by default "".
-        prompt_interpolation_method : Literal["linear", "slerp", "cosine_weighted"], optional
-            Method for interpolating between prompt embeddings (used with blending), by default "slerp".
+        prompt_interpolation_method : Optional[Literal["average", "slerp", "cosine_weighted"]], optional
+            Method for interpolating between prompt embeddings (used with blending), by default
+            None (keeps the last method set via update_stream_params / the UI, sticky).
         clear_blending : bool, optional
             Whether to clear existing blending when switching to single prompt, by default True.
         warn_about_conflicts : bool, optional
@@ -712,11 +989,11 @@ class StreamDiffusionWrapper:
         # Prompt blending parameters
         prompt_list: Optional[List[Tuple[str, float]]] = None,
         negative_prompt: Optional[str] = None,
-        prompt_interpolation_method: PromptInterpolationMethod = "slerp",
+        prompt_interpolation_method: Optional[PromptInterpolationMethod] = None,
         normalize_prompt_weights: Optional[bool] = None,
         # Seed blending parameters
         seed_list: Optional[List[Tuple[int, float]]] = None,
-        seed_interpolation_method: SeedInterpolationMethod = "linear",
+        seed_interpolation_method: Optional[SeedInterpolationMethod] = None,
         normalize_seed_weights: Optional[bool] = None,
         # ControlNet configuration
         controlnet_config: Optional[List[Dict[str, Any]]] = None,
@@ -761,16 +1038,18 @@ class StreamDiffusionWrapper:
             Example: [("cat", 0.7), ("dog", 0.3)]
         negative_prompt : Optional[str]
             The negative prompt to apply to all blended prompts.
-        prompt_interpolation_method : Literal["linear", "slerp", "cosine_weighted"]
-            Method for interpolating between prompt embeddings, by default "slerp".
+        prompt_interpolation_method : Optional[Literal["average", "slerp", "cosine_weighted"]]
+            Method for interpolating between prompt embeddings, by default None (sticky —
+            keeps the last method set; falls back to "slerp" if none has been set yet).
         normalize_prompt_weights : Optional[bool]
             Whether to normalize prompt weights in blending to sum to 1, by default None (no change).
             When False, weights > 1 will amplify embeddings.
         seed_list : Optional[List[Tuple[int, float]]]
             List of seeds with weights for blending. Each tuple contains (seed_value, weight).
             Example: [(123, 0.6), (456, 0.4)]
-        seed_interpolation_method : Literal["linear", "slerp"]
-            Method for interpolating between seed noise tensors, by default "linear".
+        seed_interpolation_method : Optional[Literal["average", "slerp", "cosine_weighted"]]
+            Method for interpolating between seed noise tensors, by default None (sticky —
+            keeps the last method set; falls back to "average" if none has been set yet).
         normalize_seed_weights : Optional[bool]
             Whether to normalize seed weights in blending to sum to 1, by default None (no change).
             When False, weights > 1 will amplify noise.
@@ -1554,6 +1833,7 @@ class StreamDiffusionWrapper:
         fi_strength: float = 0.75,
         fi_threshold: float = 0.98,
         fp8: bool = False,
+        num_inference_steps: int = 50,
     ) -> StreamDiffusion:
         """
         Loads the model.
@@ -1637,6 +1917,15 @@ class StreamDiffusionWrapper:
             Model ID for the safety checker, by default "Freepik/nsfw_image_detector".
         compile_engines_only : bool, optional
             Whether to only compile engines and not load the model, by default False.
+        fp8 : bool, optional
+            Whether to build the UNet TensorRT engine with FP8 quantization, by default False.
+        num_inference_steps : int, optional
+            Reference step count for the diffusion schedule, by default 50. Used at FP8
+            build time (see acceleration/tensorrt/fp8_quantize.py's capture_calibration_data)
+            to derive the band-based calibration timestep schedule from t_index_list via
+            param_schema.build_calibration_t_indices/compute_sub_timesteps — this must match
+            the num_inference_steps the deployment prepare() call will actually use, or the
+            calibration grid and the inference grid diverge.
 
         Returns
         -------
@@ -1918,6 +2207,10 @@ class StreamDiffusionWrapper:
             stream._fi_threshold_tensor = torch.tensor(
                 [float(fi_threshold)], dtype=torch.float32, device=stream.device
             )
+            # StreamDiffusion.__init__ ran with fio_cache=[] (use_feature_injection forced
+            # False, so _fi_strength_base defaulted to 0.75) — resync it now so unet_step's
+            # per-frame base * warp-attenuation write uses the actually-configured strength.
+            stream._fi_strength_base = float(fi_strength)
 
         # Load and properly merge LoRA weights using the standard diffusers approach
         lora_adapters_to_merge = []
@@ -2005,8 +2298,6 @@ class StreamDiffusionWrapper:
             if acceleration == "xformers":
                 stream.pipe.enable_xformers_memory_efficient_attention()
             if acceleration == "tensorrt":
-                from polygraphy import cuda
-
                 from streamdiffusion.acceleration.tensorrt import TorchVAEEncoder
                 from streamdiffusion.acceleration.tensorrt.engine_manager import EngineManager, EngineType
                 from streamdiffusion.acceleration.tensorrt.models.models import (
@@ -2019,6 +2310,7 @@ class StreamDiffusionWrapper:
                     AutoencoderKLEngine,
                     NSFWDetectorEngine,
                 )
+                from streamdiffusion.acceleration.tensorrt.utilities import NonBlockingStream
 
                 # Add ControlNet detection and support
                 from streamdiffusion.model_detection import extract_unet_architecture, validate_architecture
@@ -2115,12 +2407,42 @@ class StreamDiffusionWrapper:
                 # Strength is now a runtime input, so we do NOT bake scale into engine identity
                 ipadapter_scale = None
                 ipadapter_tokens = None
+                # Deployment scale for FP8 calibration (fp8-round-5-handoff Step 3) — the actual
+                # runtime weight (IPAdapterConfig.scale, ipadapter_module.py:37) applied via
+                # set_scale()/UnetKwargsDelta, not the `ipadapter_scale` local above (which stays
+                # None — only used for engine-naming, real strength is a runtime input by design).
+                # fp8-round-9: calibrate at the runtime *bound*, not the deployment value — scale
+                # is live-adjustable via OSC (/ipadapter_update), so no single build-time value
+                # bounds the range calibration must cover. max(config, 1.0) covers the normal
+                # 0-1 range; a runtime scale pushed above 1.0 re-exposes the merge point to
+                # clipping (see fp8-round-9 plan's residual-risk note). Default 1.0 also matches
+                # IPAdapterConfig's own default when scale is unset in config.
+                fp8_deploy_ipadapter_scale = 1.0
+                # fp8-round-9: style key for resolving real calibration tokens below (None
+                # when unset in config / IP-Adapter not installed — kept as a plain local,
+                # never touching cfg0 outside this block, since cfg0 itself is only bound
+                # when this if fires).
+                _fp8_ipa_style_key = None
+                # fp8-round-9.1 §10: adapter-mode-resolved calibration directory (None until
+                # computed below). Resolved exactly once here and threaded into both
+                # get_engine_path (the --ci<hash> cache key, right below) and the loader
+                # call site further down — never re-derived at each site — so the two can't
+                # disagree about which folder is in play. See
+                # _resolve_fp8_calibration_dir's docstring.
+                _fp8_calib_dir = None
                 if use_ipadapter_trt and has_ipadapter and ipadapter_config:
                     cfg0 = ipadapter_config[0] if isinstance(ipadapter_config, list) else ipadapter_config
                     # scale omitted from engine naming; runtime will pass ipadapter_scale vector
                     ipadapter_tokens = cfg0.get("num_image_tokens", 4)
                     # Determine FaceID type from config for engine naming
                     is_faceid = cfg0["type"] == "faceid"
+                    fp8_deploy_ipadapter_scale = max(float(cfg0.get("scale", 1.0)), 1.0)
+                    _fp8_ipa_style_key = cfg0.get("style_image_key")
+                    _fp8_calib_dir = (
+                        _resolve_fp8_calibration_dir(self.fp8_calibration_style_image, cfg0.get("type"))
+                        if fp8
+                        else None
+                    )
                 # Generate engine paths using EngineManager
                 unet_path = engine_manager.get_engine_path(
                     EngineType.UNET,
@@ -2138,6 +2460,23 @@ class StreamDiffusionWrapper:
                     use_controlnet=use_controlnet_trt,
                     fp8=fp8,
                     fp8_mha_qdq=self.fp8_mha_qdq,
+                    fp8_scale_headroom=self.fp8_scale_headroom,
+                    fp8_exclude_attention=self.fp8_exclude_attention,
+                    fp8_exclude_ipadapter=self.fp8_exclude_ipadapter,
+                    # fp8-round-9.1: the calibration image set is part of the build
+                    # recipe — fork on its content hash (see
+                    # EngineManager._calibration_image_signature), same reasoning as
+                    # every other fp8_* recipe flag above. fp8-round-9.1 §10: pass the
+                    # already-resolved mode subfolder (_fp8_calib_dir), not the raw
+                    # config value — this is the same directory the loader call site
+                    # below will read, so the cache key can't disagree with the load.
+                    fp8_calibration_style_image=_fp8_calib_dir,
+                    # Fork the cache key on the calibration band layout (fp8-round-5-handoff
+                    # Step 2f) — not on t_index_list's literal values, only its length, so a
+                    # live /t_list change within the calibrated band doesn't need a rebuild.
+                    fp8_calib_t_index_len=len(t_index_list) if fp8 else None,
+                    fp8_calib_num_steps=num_inference_steps if fp8 else None,
+                    fp8_calib_scheduler_type=scheduler if fp8 else None,
                     resolution=(self.height, self.width),
                     builder_optimization_level=self.builder_optimization_level,
                     # Must match the build_static_batch value in _unet_build_opts below so
@@ -2508,12 +2847,22 @@ class StreamDiffusionWrapper:
                     },
                 )
 
-                # Use polygraphy's default Blocking stream. A NonBlocking engine stream
-                # would skip the legacy/per-thread NULL-stream auto-sync that the rest of
-                # the pipeline relies on (PyTorch ops run on stream 0x0), creating a data
-                # race where the engine reads stale inputs and writes outputs that
-                # downstream PyTorch never observes — symptom is black/zero output frames.
-                cuda_stream = cuda.Stream()
+                # A NonBlocking engine stream used to produce black/zero output frames
+                # here, because it skips the legacy/per-thread NULL-stream auto-sync
+                # that the rest of the pipeline (PyTorch ops on stream 0x0) implicitly
+                # relied on for ordering. That implicit-sync rationale has been replaced
+                # by explicit torch.cuda.Event barriers around every engine-stream use
+                # in Engine.infer (utilities.py, Fix 1a) — pre/post events plus
+                # record_stream() on every tensor crossing the stream boundary — so the
+                # ordering guarantee no longer depends on the stream being blocking.
+                # NonBlockingStream is a minimal cudaStreamNonBlocking wrapper (see
+                # utilities.py) required for Relaxed CUDA-graph capture mode alongside
+                # it (Fix 1c) — see Engine.infer's capture branch for the rationale.
+                # If output regresses to black/zero frames again, that means an
+                # engine-stream use site was missed by the event barriers; the
+                # independently-safe fallback is reverting just this one line to
+                # `from polygraphy import cuda; cuda_stream = cuda.Stream()`.
+                cuda_stream = NonBlockingStream()
 
                 vae_config = stream.vae.config
                 vae_dtype = stream.vae.dtype
@@ -2540,23 +2889,149 @@ class StreamDiffusionWrapper:
                     if fp8:
                         _is_turbo = getattr(self, "_is_turbo", False)
                         _unet_build_opts["fp8"] = True
-                        _unet_build_opts["onnx_opset"] = 19  # FP8 Q/DQ scales require opset ≥19
+                        _unet_build_opts["onnx_opset"] = (
+                            21  # FP8 Q/DQ scales with FP16 scale factors require opset ≥21
+                        )
                         _unet_build_opts["pipe_ref"] = stream.pipe
-                        # SDXL-Turbo: 4 steps, guidance_scale=0.0 (matches inference);
-                        # SDXL base: 20 steps, guidance_scale=7.5.
-                        # Calibration activations must match inference-time ranges.
-                        _unet_build_opts["calibration_steps"] = 4 if _is_turbo else 20
+                        # The CLIP image encoder (ip-adapter/faceid) hangs off
+                        # stream._ipadapter_module.ipadapter, not stream.pipe, so it's
+                        # invisible to the pipe_ref-only VRAM release below unless passed
+                        # separately. None when IP-Adapter isn't installed.
+                        _unet_build_opts["ipadapter_ref"] = getattr(stream, "_ipadapter_module", None)
+                        # guidance_scale still follows the turbo/non-turbo split (matches
+                        # inference CFG); this axis is independent of *which* timesteps are
+                        # calibrated, so it rides alongside the schedule derivation below.
                         _unet_build_opts["fp8_guidance_scale"] = 0.0 if _is_turbo else 7.5
+
+                        # --- band-based, config-derived calibration schedule ---
+                        # (fp8-round-5-handoff plan, Step 2c). Calibration must sample the raw
+                        # UNet timesteps deployment actually visits (t_index_list on the
+                        # num_inference_steps-step grid), not a mismatched turbo schedule — see
+                        # the plan for the full diagnosis. prepare() has not run yet at this
+                        # point in _load_model, so stream.scheduler.timesteps is still the
+                        # constructor default; materialise the real grid explicitly via the
+                        # shared helper (param_schema.materialise_timestep_grid) rather than
+                        # calling prepare() itself, which would also run embedding/noise setup
+                        # this build stage doesn't want yet. This is the same set_timesteps +
+                        # _SPACING_SAMPLERS override prepare() applies (pipeline.py's
+                        # prepare(), ~:612-620) — sharing the helper means the two can never
+                        # silently drift apart on what "spacing override" means.
+                        from .acceleration.tensorrt.fp8_quantize import _MAX_CALIB_ROWS
+
+                        materialise_timestep_grid(
+                            stream.scheduler,
+                            num_inference_steps,
+                            stream.sampler_type,
+                            stream.device,
+                            stream._get_spaced_timesteps,
+                        )
+                        _calib_t_indices = build_calibration_t_indices(
+                            t_index_list, num_inference_steps, budget=_MAX_CALIB_ROWS
+                        )
+                        _calib_timesteps = compute_sub_timesteps(stream.scheduler.timesteps, _calib_t_indices)
+                        # LCM's custom-timestep path requires strictly descending values
+                        # (venv scheduling_lcm.py ~:440-443); the grid is monotonically
+                        # decreasing in t_index, so sorting t_index ascending (as
+                        # build_calibration_t_indices returns) already yields this order.
+                        _unet_build_opts["fp8_calibration_timesteps"] = [int(t) for t in _calib_timesteps]
+                        _unet_build_opts["fp8_calibration_scheduler_ref"] = stream.scheduler
+                        # calibration_steps no longer selects the schedule (the explicit
+                        # timestep list above does, via capture_calibration_data's
+                        # timesteps=/scheduler_ref= params — Step 2d) — kept as the row count
+                        # for logging and as capture_calibration_data's num_inference_steps
+                        # fallback for the (should-be-unreachable-when-fp8) case where only
+                        # one of fp8_calibration_timesteps/fp8_calibration_scheduler_ref
+                        # makes it through.
+                        _unet_build_opts["calibration_steps"] = len(_calib_timesteps)
+                        logger.warning(
+                            f"[TRT] FP8 calibration schedule: t_index={_calib_t_indices}, "
+                            f"timesteps={_unet_build_opts['fp8_calibration_timesteps']}"
+                        )
                         _unet_build_opts["fp8_allow_fp16_fallback"] = self.fp8_allow_fp16_fallback
                         _unet_build_opts["fp8_mha_qdq"] = self.fp8_mha_qdq
+                        _unet_build_opts["fp8_scale_headroom"] = self.fp8_scale_headroom
+                        _unet_build_opts["fp8_exclude_attention"] = self.fp8_exclude_attention
+                        _unet_build_opts["fp8_exclude_ipadapter"] = self.fp8_exclude_ipadapter
                         _unet_build_opts["fp8_use_cached_attn"] = use_cached_attn
                         _unet_build_opts["fp8_use_feature_injection"] = use_feature_injection
                         _unet_build_opts["fp8_use_controlnet"] = use_controlnet_trt
                         _unet_build_opts["fp8_num_ip_layers"] = num_ip_layers if use_ipadapter_trt else 0
+                        # fp8-round-5-handoff Step 3: calibrate kvo/fio-adjacent scalar inputs
+                        # (fi_strength, fi_threshold, ipadapter_scale) on the deployment config's
+                        # actual values instead of the zeros/ones capture_calibration_data
+                        # previously synthesized — read from config, never hardcoded.
+                        _unet_build_opts["fp8_fi_strength"] = float(fi_strength) if use_feature_injection else 0.0
+                        _unet_build_opts["fp8_fi_threshold"] = float(fi_threshold) if use_feature_injection else 0.0
+                        _unet_build_opts["fp8_ipadapter_scale"] = (
+                            fp8_deploy_ipadapter_scale if use_ipadapter_trt else 1.0
+                        )
+                        # fp8-round-9 / fp8-round-9.1: feed real IP-Adapter projection tokens into
+                        # calibration's encoder_hidden_states reconciliation instead of
+                        # zero-padding — see capture_calibration_data's ipadapter_tokens docstring,
+                        # the fp8-round-9 plan's diagnosis, and _resolve_fp8_ipadapter_calibration_
+                        # tokens' docstring for why fp8-round-9.1 dispatches on proj shape rather
+                        # than adapter flavour (fp8-round-9's `is_faceid and not is_plus` gate left
+                        # `type: regular` — the shipped config — silently zero-padded). Never
+                        # allowed to hard-fail an engine build — any failure falls back to None.
+                        _fp8_deploy_ipadapter_tokens = None
+                        if use_ipadapter_trt:
+                            try:
+                                _ipa_module = getattr(stream, "_ipadapter_module", None)
+                                _ipa = getattr(_ipa_module, "ipadapter", None)
+                                _cached = None
+                                if _ipa is not None and _fp8_ipa_style_key and hasattr(stream, "_param_updater"):
+                                    _cached = stream._param_updater.get_cached_embeddings(_fp8_ipa_style_key)
+                                # fp8-round-9.1 §10: read the same resolved directory that
+                                # get_engine_path was given above (_fp8_calib_dir), not the raw
+                                # config value — the cache key and the load must agree on which
+                                # folder is in play.
+                                _fp8_style_images = _load_fp8_calibration_style_images(_fp8_calib_dir)
+                                _fp8_deploy_ipadapter_tokens, _fp8_tokens_method = (
+                                    _resolve_fp8_ipadapter_calibration_tokens(_ipa, _cached, _fp8_style_images)
+                                )
+                                if _fp8_tokens_method == "image":
+                                    # fp8-round-9.1 §10: some configured images may have been
+                                    # rejected by the adapter (e.g. a non-face image under
+                                    # type: faceid) and skipped rather than aborting the whole
+                                    # set — report kept-vs-configured explicitly.
+                                    _fp8_n_kept = (
+                                        _fp8_deploy_ipadapter_tokens.shape[0]
+                                        if _fp8_deploy_ipadapter_tokens is not None
+                                        else 0
+                                    )
+                                    logger.info(
+                                        f"[TRT] FP8 IPA calibration tokens: real style image(s) from "
+                                        f"{_fp8_calib_dir} (n={_fp8_n_kept} of {len(_fp8_style_images)})"
+                                    )
+                                elif _fp8_tokens_method == "cached":
+                                    logger.info("[TRT] FP8 IPA calibration tokens: real cached style embedding")
+                                elif _fp8_tokens_method == "surrogate":
+                                    logger.info(
+                                        "[TRT] FP8 IPA calibration tokens: image_proj_model(zeros) surrogate "
+                                        "(no cached style embedding — conservative-safe; see "
+                                        "_reconcile_calib_to_onnx_dims log for the appended region's |x|max)"
+                                    )
+                                else:
+                                    logger.info(
+                                        "[TRT] FP8 IPA calibration tokens: skipped (unrecognized "
+                                        "image_proj_model.proj shape) — falling back to zero-pad reconciliation"
+                                    )
+                            except Exception as e:
+                                logger.warning(
+                                    f"[TRT] FP8 IPA calibration token resolution failed "
+                                    f"({type(e).__name__}: {e}); falling back to zero-pad reconciliation."
+                                )
+                                _fp8_deploy_ipadapter_tokens = None
+                        _unet_build_opts["fp8_ipadapter_tokens"] = _fp8_deploy_ipadapter_tokens
                         logger.warning(
                             f"[TRT] FP8 build opts: turbo={_is_turbo}, "
-                            f"steps={_unet_build_opts['calibration_steps']}, "
-                            f"guidance={_unet_build_opts['fp8_guidance_scale']}"
+                            f"deploy_steps={len(t_index_list)}, "
+                            f"calib_rows={_unet_build_opts['calibration_steps']}, "
+                            f"guidance={_unet_build_opts['fp8_guidance_scale']}, "
+                            f"scale_headroom={self.fp8_scale_headroom}, "
+                            f"exclude_attention={self.fp8_exclude_attention}, "
+                            f"exclude_ipadapter={self.fp8_exclude_ipadapter}, "
+                            f"ipa_tokens={'real' if _fp8_deploy_ipadapter_tokens is not None else 'zero-pad'}"
                         )
 
                     # Compile and load UNet engine using EngineManager

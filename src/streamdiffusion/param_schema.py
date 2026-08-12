@@ -16,10 +16,14 @@ with ``PARAM_NAMES`` / ``UPDATER_PARAM_NAMES``, so drift is *caught*, not
 
 Note on ``default`` vs. the runtime signatures: every parameter in
 ``update_stream_params`` defaults to ``None`` at the call-site (meaning
-"leave the current value unchanged"), except the two interpolation-method
-Literals. ``ParamSpec.default`` here is a *different* concept — the
-concrete construction-time value — and intentionally does not mirror the
-``None`` sentinels.
+"leave the current value unchanged") — including the two interpolation-method
+Literals, which are additionally *sticky*: the last explicitly-supplied value
+is persisted on the updater (``_last_prompt_interpolation_method`` /
+``_last_seed_interpolation_method``) and re-applied whenever a caller omits
+it, so a method-only update takes effect immediately and a later list-only
+update doesn't silently revert it. ``ParamSpec.default`` here is a *different*
+concept — the concrete construction-time value — and intentionally does not
+mirror the ``None`` sentinels.
 
 This module has no torch import and no dependency on the rest of the
 ``streamdiffusion`` package, so it stays cheap to import in isolation
@@ -34,8 +38,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple
 
 # Interpolation-method aliases shared by the wrapper and updater signatures.
-PromptInterpolationMethod = Literal["linear", "slerp", "cosine_weighted"]
-SeedInterpolationMethod = Literal["linear", "slerp"]
+PromptInterpolationMethod = Literal["average", "slerp", "cosine_weighted"]
+SeedInterpolationMethod = Literal["average", "slerp", "cosine_weighted"]
 
 # The four cfg_type values StreamDiffusion.__init__ accepts (pipeline.py's single
 # assignment choke point, :85). cfg_type is construction-time only — it is not in
@@ -56,7 +60,7 @@ class ParamSpec:
     default:
         Construction-time default (see module docstring) — NOT the
         ``update_stream_params`` runtime default, which is ``None`` for
-        all but the two interpolation-method params.
+        every param.
     updater:
         Whether this param is forwarded to
         ``StreamParameterUpdater.update_stream_params``. False only for
@@ -85,7 +89,7 @@ PARAMS: Tuple[ParamSpec, ...] = (
     ParamSpec("prompt_interpolation_method", "slerp"),
     ParamSpec("normalize_prompt_weights", True),
     ParamSpec("seed_list", None),
-    ParamSpec("seed_interpolation_method", "linear"),
+    ParamSpec("seed_interpolation_method", "average"),
     ParamSpec("normalize_seed_weights", True),
     ParamSpec("controlnet_config", None),
     ParamSpec("ipadapter_config", None),
@@ -290,3 +294,139 @@ def bleed_risk_message(
         f"(t_index={list(t_list[1:])}) exceeds {threshold:.2f}. Previous-frame ghost bleed likely -- "
         "consider enabling do_add_noise (reference fork default)."
     )
+
+
+def _band_interior_ints(span_len: int, count: int) -> List[int]:
+    """Pick up to ``count`` offsets into ``range(span_len)``, at sub-interval
+    *centers* rather than endpoints: ``floor((i + 0.5) * span_len / count)``
+    for ``i in range(count)``.
+
+    Unlike an endpoint-inclusive linspace, these offsets never land on 0 or
+    ``span_len - 1`` unless the band is so narrow relative to ``count`` that
+    centers collapse onto the edges. This matters because adjacent bands are
+    half-open and touch at their boundary, and a caller's configured values
+    often sit exactly on a decade boundary — an endpoint sampler wastes
+    budget re-picking those already-``picked`` boundary values (see
+    ``build_calibration_t_indices``). May return fewer than ``count``
+    distinct values if the span is narrower than the request — callers dedup
+    via a set.
+    """
+    if count <= 0 or span_len <= 0:
+        return []
+    return [int(min((i + 0.5) * span_len // count, span_len - 1)) for i in range(count)]
+
+
+def _widest_gap_index(lo: int, hi: int, picked: Set[int]) -> Optional[int]:
+    """The unpicked index in ``[lo, hi]`` sitting in the band's widest
+    remaining gap — furthest from any already-picked value. Ties resolve
+    toward the band midpoint (then the lowest index), keeping the pick
+    interior for the same reason ``_band_interior_ints`` avoids endpoints.
+    None when the band holds no unpicked index.
+    """
+    candidates = [i for i in range(lo, hi + 1) if i not in picked]
+    if not candidates:
+        return None
+    mid = (lo + hi) / 2
+
+    def _distance(i: int) -> int:
+        return min(abs(i - p) for p in picked) if picked else 0
+
+    return min(candidates, key=lambda i: (-_distance(i), abs(i - mid), i))
+
+
+def build_calibration_t_indices(
+    t_index_list: List[int],
+    num_inference_steps: int,
+    budget: int,
+) -> List[int]:
+    """Derive a calibration t_index schedule covering the timestep region
+    deployment actually visits, per a neighbour-midpoint band rule: each
+    distinct, clamped value in ``t_index_list`` owns the index range up to
+    the midpoint with its neighbours, so bands are derived from the values
+    themselves rather than from a fixed decade grid. The first band floors
+    at 1 and the last extends to ``num_inference_steps - 1``, so the bands
+    partition ``[1, num_inference_steps - 1]`` with no gaps and no overlaps,
+    and every configured value is provably inside its own band — including
+    the single-entry case, where one band spans the full range. Band 0's
+    floor is 1, not 0 — index 0 is the highest-noise raw timestep (~999) and
+    must never be calibrated implicitly; it only enters the result if
+    ``t_index_list`` configures it explicitly. Bands scale automatically with
+    the number of distinct values in ``t_index_list``, so this stays correct
+    for whatever step count a static TRT engine has locked in for its
+    lifetime.
+
+    Every value in ``t_index_list`` is always included in the result — the
+    exact deployment points must never be missed, even though only the
+    *union* of bands matters for FP8 scale correctness (a per-tensor amax at
+    a given raw timestep doesn't care which step index produced it). The
+    remaining budget (``budget - len(set(t_index_list))``) is spread as
+    evenly as possible across the bands, sampling each band's *interior*
+    (see ``_band_interior_ints``) so spare slots don't collide with the
+    band-boundary values ``t_index_list`` typically already occupies. Any
+    per-band budget a narrow band can't absorb spills forward into the
+    remaining bands; a later band whose own interior picks collide with
+    already-picked values can still fall short even after that spill, so a
+    final round-robin top-up (widest remaining gap per band) mops up
+    whatever is left, guaranteeing the full budget is consumed whenever the
+    bands have room for it. A live ``/t_list`` change that stays within its
+    calibrated band doesn't need an engine rebuild.
+
+    Returns a sorted-ascending, deduplicated list of t_index values. Normally
+    ``len(result) <= budget``; if ``budget < len(set(t_index_list))`` the
+    configured values still all win and the result exceeds budget — never
+    drop a deployment point to fit a smaller budget.
+    """
+    max_idx = max(num_inference_steps - 1, 0)
+
+    picked = {min(max(t, 0), max_idx) for t in t_index_list}
+
+    # Bands derive from the configured values themselves (sorted ascending),
+    # not a fixed decade grid -- band k owns the range up to the midpoint
+    # with its neighbours, so every value is guaranteed to land inside the
+    # band derived for it, regardless of len(t_index_list) or spacing.
+    values = sorted(picked)
+    n_bands = max(len(values), 1)
+    bands = []
+    if not values:
+        bands.append((min(1, max_idx), max_idx))
+    else:
+        for k, t in enumerate(values):
+            lo = 1 if k == 0 else (values[k - 1] + t) // 2 + 1
+            hi = max_idx if k == n_bands - 1 else (t + values[k + 1]) // 2
+            bands.append((min(max(lo, 0), max_idx), min(hi, max_idx)))
+
+    remaining = max(budget - len(picked), 0)
+    base, extra = divmod(remaining, n_bands)
+    band_budgets = [base + (1 if i < extra else 0) for i in range(n_bands)]
+
+    # Two passes so unused budget (band narrower than its share) spills
+    # forward into later bands instead of being silently dropped.
+    spill = 0
+    for i, (lo, hi) in enumerate(bands):
+        span_len = hi - lo + 1
+        want = band_budgets[i] + spill
+        span = list(range(lo, hi + 1))
+        before = len(picked)
+        for j in _band_interior_ints(span_len, want):
+            picked.add(span[j])
+        used = len(picked) - before
+        spill = max(want - used, 0) if used < want else 0
+
+    # Forward-only spill can still leave budget on the table -- the last band
+    # has nowhere further to spill into if its own interior picks collide
+    # with already-picked values (see module-level defect notes). Top up by
+    # sweeping every band's widest remaining gap, round-robin, until the
+    # budget is met or every band is saturated.
+    while len(picked) < budget:
+        progress = False
+        for lo, hi in bands:
+            if len(picked) >= budget:
+                break
+            idx = _widest_gap_index(lo, hi, picked)
+            if idx is not None:
+                picked.add(idx)
+                progress = True
+        if not progress:
+            break
+
+    return sorted(picked)

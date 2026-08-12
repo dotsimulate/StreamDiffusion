@@ -79,7 +79,7 @@ def create_wrapper_from_config(config: Dict[str, Any], **overrides) -> Any:
             seed_blend_config = final_config["seed_blending"]
             prepare_params_with_blending["seed_list"] = seed_blend_config.get("seed_list", [])
             prepare_params_with_blending["seed_interpolation_method"] = seed_blend_config.get(
-                "interpolation_method", "linear"
+                "interpolation_method", "average"
             )
 
         wrapper.prepare(**prepare_params_with_blending)
@@ -95,7 +95,7 @@ def create_wrapper_from_config(config: Dict[str, Any], **overrides) -> Any:
         seed_blend_config = final_config["seed_blending"]
         wrapper.update_stream_params(
             seed_list=seed_blend_config.get("seed_list", []),
-            seed_interpolation_method=seed_blend_config.get("interpolation_method", "linear"),
+            seed_interpolation_method=seed_blend_config.get("interpolation_method", "average"),
         )
 
     return wrapper
@@ -106,6 +106,11 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
     param_map = {
         "model_id_or_path": config.get("model_id", "stabilityai/sd-turbo"),
         "t_index_list": config.get("t_index_list", list(DEFAULTS["t_index_list"])),
+        # Reference step count for FP8 build-time calibration schedule derivation
+        # (see StreamDiffusionWrapper.__init__'s num_inference_steps docstring).
+        # Mirrors _extract_prepare_params's identical lookup below so a build-time
+        # config and the first prepare() call agree on the deployment grid.
+        "num_inference_steps": config.get("num_inference_steps", DEFAULTS["num_inference_steps"]),
         "lora_dict": config.get("lora_dict"),
         "mode": config.get("mode", "img2img"),
         "output_type": config.get("output_type", "pil"),
@@ -143,6 +148,10 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
         "build_engines_if_missing": config.get("build_engines_if_missing", True),
         "fp8_allow_fp16_fallback": config.get("fp8_allow_fp16_fallback", False),
         "fp8_mha_qdq": config.get("fp8_mha_qdq", False),
+        "fp8_scale_headroom": config.get("fp8_scale_headroom", 1.0),
+        "fp8_exclude_attention": config.get("fp8_exclude_attention", False),
+        "fp8_exclude_ipadapter": config.get("fp8_exclude_ipadapter", False),
+        "fp8_calibration_style_image": config.get("fp8_calibration_style_image"),
     }
     if config.get("controlnets"):
         param_map["use_controlnet"] = True
@@ -241,7 +250,7 @@ def _extract_prepare_params(config: Dict[str, Any]) -> Dict[str, Any]:
         seed_blend_config = config["seed_blending"]
         prepare_params["seed_blending"] = {
             "seed_list": seed_blend_config.get("seed_list", []),
-            "interpolation_method": seed_blend_config.get("interpolation_method", "linear"),
+            "interpolation_method": seed_blend_config.get("interpolation_method", "average"),
             "enable_caching": seed_blend_config.get("enable_caching", True),
         }
 
@@ -419,7 +428,7 @@ def create_prompt_blending_config(
 def create_seed_blending_config(
     base_config: Dict[str, Any],
     seed_list: List[Tuple[int, float]],
-    interpolation_method: str = "linear",
+    interpolation_method: str = "average",
     enable_caching: bool = True,
 ) -> Dict[str, Any]:
     """Create a configuration with seed blending settings"""
@@ -527,8 +536,8 @@ def _validate_config(config: Dict[str, Any]) -> None:
                     raise ValueError(f"_validate_config: Prompt weight {i} must be a non-negative number")
 
         interpolation_method = blend_config.get("interpolation_method", "slerp")
-        if interpolation_method not in ["linear", "slerp", "cosine_weighted"]:
-            raise ValueError("_validate_config: interpolation_method must be 'linear', 'slerp', or 'cosine_weighted'")
+        if interpolation_method not in ["average", "slerp", "cosine_weighted"]:
+            raise ValueError("_validate_config: interpolation_method must be 'average', 'slerp', or 'cosine_weighted'")
 
     # Validate seed blending configuration if present
     if "seed_blending" in config:
