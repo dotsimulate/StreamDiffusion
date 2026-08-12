@@ -91,18 +91,24 @@ class PostprocessingOrchestrator(BaseOrchestrator[torch.Tensor, torch.Tensor]):
         if not postprocessors:
             return input_tensor
 
-        # Use same stream context as background processing for consistency
-        original_stream = self._set_background_stream_context()
+        # Event-based handoff, all on this thread: arm the pre-exec barrier, run the
+        # postprocessors on the background stream, record the post-exec barrier, then
+        # make this thread's (the consumer's) stream wait on it and record_stream()
+        # the result before returning. Same producer+consumer protocol as
+        # _process_frame_background / _wait_for_previous_processing, collapsed onto a
+        # single thread since process_sync has no executor hop.
+        self._arm_background_handoff()
         try:
-            # Sequential application of postprocessors
-            current_tensor = input_tensor
-            for postprocessor in postprocessors:
-                if postprocessor is not None:
-                    current_tensor = self._apply_single_postprocessor(current_tensor, postprocessor)
-
-            return current_tensor
+            with self._background_stream_scope():
+                # Sequential application of postprocessors
+                current_tensor = input_tensor
+                for postprocessor in postprocessors:
+                    if postprocessor is not None:
+                        current_tensor = self._apply_single_postprocessor(current_tensor, postprocessor)
         finally:
-            self._restore_stream_context(original_stream)
+            self._finish_background_handoff()
+
+        return self._consume_background_handoff(current_tensor)
 
     def _process_frame_background(
         self, input_tensor: torch.Tensor, postprocessors: List[Any], *args, **kwargs
@@ -116,43 +122,45 @@ class PostprocessingOrchestrator(BaseOrchestrator[torch.Tensor, torch.Tensor]):
             Dictionary containing processing results and status
         """
         try:
-            # Set CUDA stream for background processing
-            original_stream = self._set_background_stream_context()
+            # Scope this frame's GPU work to the background stream. The pre-exec
+            # barrier (background stream waiting on the caller's queued work) was
+            # already armed by _start_next_frame_processing on the caller thread --
+            # see BaseOrchestrator._arm_background_handoff.
+            with self._background_stream_scope():
+                if not postprocessors:
+                    return {"result": input_tensor, "status": "success"}
 
-            if not postprocessors:
-                return {"result": input_tensor, "status": "success"}
+                # Check for cache hit using data_ptr + shape — O(1) vs torch.equal's O(N).
+                # TRT engines reuse the same output buffer each frame, so data_ptr identity
+                # reliably detects whether the input is the same buffer as last frame.
+                cache_hit = (
+                    self._last_input_ptr is not None
+                    and self._last_processed_result is not None
+                    and input_tensor.data_ptr() == self._last_input_ptr
+                    and input_tensor.shape == self._last_input_shape
+                )
 
-            # Check for cache hit using data_ptr + shape — O(1) vs torch.equal's O(N).
-            # TRT engines reuse the same output buffer each frame, so data_ptr identity
-            # reliably detects whether the input is the same buffer as last frame.
-            cache_hit = (
-                self._last_input_ptr is not None
-                and self._last_processed_result is not None
-                and input_tensor.data_ptr() == self._last_input_ptr
-                and input_tensor.shape == self._last_input_shape
-            )
+                if cache_hit:
+                    return {
+                        "result": self._last_processed_result,
+                        "status": "success",
+                        "cache_hit": True,
+                    }
 
-            if cache_hit:
-                return {
-                    "result": self._last_processed_result,
-                    "status": "success",
-                    "cache_hit": True,
-                }
+                # Update cache — store ptr + shape, no tensor clone needed
+                self._last_input_ptr = input_tensor.data_ptr()
+                self._last_input_shape = input_tensor.shape
 
-            # Update cache — store ptr + shape, no tensor clone needed
-            self._last_input_ptr = input_tensor.data_ptr()
-            self._last_input_shape = input_tensor.shape
+                # Process postprocessors in parallel if multiple, sequential if single
+                if len(postprocessors) > 1:
+                    result = self._process_postprocessors_parallel(input_tensor, postprocessors)
+                else:
+                    result = self._apply_single_postprocessor(input_tensor, postprocessors[0])
 
-            # Process postprocessors in parallel if multiple, sequential if single
-            if len(postprocessors) > 1:
-                result = self._process_postprocessors_parallel(input_tensor, postprocessors)
-            else:
-                result = self._apply_single_postprocessor(input_tensor, postprocessors[0])
+                # Cache the processed result for future cache hits
+                self._last_processed_result = result
 
-            # Cache the processed result for future cache hits
-            self._last_processed_result = result
-
-            return {"result": result, "status": "success"}
+                return {"result": result, "status": "success"}
 
         except Exception as e:
             logger.error(f"PostprocessingOrchestrator: Background processing failed: {e}")
@@ -162,8 +170,9 @@ class PostprocessingOrchestrator(BaseOrchestrator[torch.Tensor, torch.Tensor]):
                 "status": "error",
             }
         finally:
-            # Restore original CUDA stream
-            self._restore_stream_context(original_stream)
+            # Post-exec barrier, producer side: record the background stream's
+            # completion event for the consumer (_consume_background_handoff) to wait on.
+            self._finish_background_handoff()
 
     def _process_postprocessors_parallel(self, input_tensor: torch.Tensor, postprocessors: List[Any]) -> torch.Tensor:
         """

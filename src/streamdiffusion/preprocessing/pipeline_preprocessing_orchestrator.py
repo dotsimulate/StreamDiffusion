@@ -110,27 +110,30 @@ class PipelinePreprocessingOrchestrator(BaseOrchestrator[torch.Tensor, torch.Ten
             Dictionary containing processing results and status
         """
         try:
-            # Set CUDA stream for background processing
-            original_stream = self._set_background_stream_context()
+            # Scope this frame's GPU work to the background stream. The pre-exec
+            # barrier (background stream waiting on the caller's queued work) was
+            # already armed by _start_next_frame_processing on the caller thread --
+            # see BaseOrchestrator._arm_background_handoff.
+            with self._background_stream_scope():
+                if not processors:
+                    return {"result": input_tensor, "status": "success"}
 
-            if not processors:
-                return {"result": input_tensor, "status": "success"}
+                # Process processors sequentially (most pipeline preprocessing is dependent)
+                current_tensor = input_tensor
+                for processor in processors:
+                    if processor is not None:
+                        current_tensor = self._apply_single_processor(current_tensor, processor)
 
-            # Process processors sequentially (most pipeline preprocessing is dependent)
-            current_tensor = input_tensor
-            for processor in processors:
-                if processor is not None:
-                    current_tensor = self._apply_single_processor(current_tensor, processor)
-
-            return {"result": current_tensor, "status": "success"}
+                return {"result": current_tensor, "status": "success"}
 
         except Exception as e:
             logger.error(f"PipelinePreprocessingOrchestrator: Background processing failed: {e}")
             # Return original input tensor on error
             return {"result": input_tensor, "error": str(e), "status": "error"}
         finally:
-            # Restore original CUDA stream
-            self._restore_stream_context(original_stream)
+            # Post-exec barrier, producer side: record the background stream's
+            # completion event for the consumer (_consume_background_handoff) to wait on.
+            self._finish_background_handoff()
 
     def _apply_single_processor(self, input_tensor: torch.Tensor, processor: Any) -> torch.Tensor:
         """

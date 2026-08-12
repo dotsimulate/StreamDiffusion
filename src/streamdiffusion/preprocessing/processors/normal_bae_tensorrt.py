@@ -81,6 +81,7 @@ def _probe_normal_bae_onnx_export(device: str = "cuda") -> bool:
                 opset_version=17,
                 input_names=["input"],
                 output_names=["output"],
+                dynamo=False,
             )
         _TRT_STRATEGY_AVAILABLE = os.path.exists(tmp) and os.path.getsize(tmp) > 0
         if os.path.exists(tmp):
@@ -291,6 +292,7 @@ class NormalBaeTensorrtPreprocessor(SelfBuildingTRTPreprocessor):
                     "input": {0: "batch", 2: "height", 3: "width"},
                     "output": {0: "batch", 2: "height", 3: "width"},
                 },
+                dynamo=False,
             )
 
         logger.info(f"NormalBaeTensorrtPreprocessor: ONNX exported → {onnx_path}")

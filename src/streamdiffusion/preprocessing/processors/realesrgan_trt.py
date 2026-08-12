@@ -294,6 +294,7 @@ class RealESRGANProcessor(BasePreprocessor):
                 opset_version=17,
                 export_params=True,
                 dynamic_axes=dynamic_axes,
+                dynamo=False,
             )
 
     def _setup_tensorrt(self):
@@ -327,10 +328,24 @@ class RealESRGANProcessor(BasePreprocessor):
             return
 
         try:
+            # Reuse the shared BUILD_TRT_LOGGER (see acceleration/tensorrt/utilities.py)
+            # instead of throwaway trt.Logger() instances. TRT registers exactly ONE
+            # ILogger globally (first trt.Builder/Runtime/Refitter wins), so a fresh
+            # logger here either loses that race silently or wins it and leaves the main
+            # engine builds without BUILD_TRT_LOGGER's benign myelin/l2tc noise filter.
+            # Falls back to a plain logger if the acceleration package isn't importable
+            # (e.g. a standalone preprocessor-only environment).
+            try:
+                from streamdiffusion.acceleration.tensorrt.utilities import BUILD_TRT_LOGGER
+
+                trt_logger = BUILD_TRT_LOGGER
+            except ImportError:
+                trt_logger = trt.Logger(trt.Logger.WARNING)
+
             # Create builder and network
-            builder = trt.Builder(trt.Logger(trt.Logger.WARNING))
+            builder = trt.Builder(trt_logger)
             network = builder.create_network()  # EXPLICIT_BATCH deprecated/ignored in TRT 10.x
-            parser = trt.OnnxParser(network, trt.Logger(trt.Logger.WARNING))
+            parser = trt.OnnxParser(network, trt_logger)
 
             # Parse ONNX model
             with open(self.onnx_path, "rb") as model:

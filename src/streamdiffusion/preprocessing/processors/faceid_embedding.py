@@ -1,3 +1,4 @@
+import time
 from typing import Any, Tuple
 
 import torch
@@ -61,13 +62,22 @@ class FaceIDEmbeddingPreprocessor(IPAdapterEmbeddingPreprocessor):
             Tuple of (positive_embeds, negative_embeds) for FaceID conditioning
         """
         try:
+            # Wall-clock, not profiler.region(): profiler's CUDA-event timing only measures
+            # GPU kernel time, but the "update image" freeze is the render thread blocking on
+            # InsightFace's synchronous session.run() calls — CPU-thread stall, not GPU time.
+            # Also zero-config (no GPU_PROFILER=1 needed) so it's always visible in this log.
+            # Baseline measurement for the FaceID render-thread-freeze fix — see FaceID_PLAN.md
+            # cost-reduction patches (faceid_compat.py) and the plan's staged Stage 1/Stage 2 split.
+            _t0 = time.perf_counter()
             # Use the IP-Adapter's FaceID-specific embedding extraction
             image_embeds, negative_embeds = self.ipadapter.get_image_embeds(
                 images=[image], faceid_v2_weight=self.faceid_v2_weight
             )
+            _elapsed_ms = (time.perf_counter() - _t0) * 1000.0
 
             print(
-                f"FaceIDEmbeddingPreprocessor._process_core: Generated FaceID embeddings - positive: {image_embeds.shape}, negative: {negative_embeds.shape}"
+                f"FaceIDEmbeddingPreprocessor._process_core: Generated FaceID embeddings in "
+                f"{_elapsed_ms:.1f}ms - positive: {image_embeds.shape}, negative: {negative_embeds.shape}"
             )
 
             return image_embeds, negative_embeds
