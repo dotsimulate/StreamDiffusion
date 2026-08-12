@@ -133,6 +133,7 @@ def compile_unet(
     build_options = dict(engine_build_options or {})
     fp8 = build_options.pop("fp8", False)
     pipe_ref = build_options.pop("pipe_ref", None)
+    ipadapter_ref = build_options.pop("ipadapter_ref", None)
     calibration_prompts = build_options.pop("calibration_prompts", None)
     calibration_steps = build_options.pop("calibration_steps", 20)
     # Band-derived calibration schedule (fp8-round-5-handoff Step 2c/2c-bis): the raw
@@ -168,6 +169,7 @@ def compile_unet(
         opt_batch_size=opt_batch_size,
         fp8=fp8,
         pipe_ref=pipe_ref,
+        ipadapter_ref=ipadapter_ref,
         calibration_prompts=calibration_prompts,
         calibration_steps=calibration_steps,
         fp8_calibration_timesteps=fp8_calibration_timesteps,
