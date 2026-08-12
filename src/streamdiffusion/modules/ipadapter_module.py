@@ -302,11 +302,22 @@ class IPAdapterModule(OrchestratorUser):
             "device": stream.device,
             "dtype": stream.dtype,
         }
-        if self.config.type == IPAdapterType.FACEID and self.config.insightface_model_name:
-            ip_kwargs["insightface_model_name"] = self.config.insightface_model_name
-            print(
-                f"IPAdapterModule.install: Initializing FaceID IP-Adapter with InsightFace model: {self.config.insightface_model_name}"
-            )
+        if self.config.type == IPAdapterType.FACEID:
+            # B1: diffusers_ipadapter feeds InsightFace RGB, but every InsightFace ONNX
+            # model expects BGR (swapRB=True internally) — patch the single choke point
+            # (detect_faces_multires) before any detection can run.
+            try:
+                from streamdiffusion.modules.faceid_compat import apply_faceid_patches
+
+                apply_faceid_patches()
+            except Exception as e:
+                logger.warning(f"IPAdapterModule.install: apply_faceid_patches (B1) failed: {e}")
+
+            if self.config.insightface_model_name:
+                ip_kwargs["insightface_model_name"] = self.config.insightface_model_name
+                print(
+                    f"IPAdapterModule.install: Initializing FaceID IP-Adapter with InsightFace model: {self.config.insightface_model_name}"
+                )
         ipadapter = IPAdapter(**ip_kwargs)
         self.ipadapter = ipadapter
 
