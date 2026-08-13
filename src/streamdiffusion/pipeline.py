@@ -240,6 +240,12 @@ class StreamDiffusion:
         # mutates it in place (CUDA-graph-safe: same device address across frames).
         self._lora_scale_tensor: Optional[torch.Tensor] = None
 
+        # Ordered (path, adapter_name) list wrapper.py._load_model populates once LoRA
+        # adapters are discovered from lora_dict — the index<->path mapping consumed by
+        # unet_unified_export.py and stream_parameter_updater.py. Declared here (not just
+        # assigned dynamically in wrapper.py) so static type checking can resolve it.
+        self._lora_order: List[Tuple[str, str]] = []
+
         # Pre-allocated CUDA timing events — reused every frame via .record()
         self._timing_start = torch.cuda.Event(enable_timing=True)
         self._timing_end = torch.cuda.Event(enable_timing=True)
