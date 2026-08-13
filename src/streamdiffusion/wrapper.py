@@ -1015,6 +1015,8 @@ class StreamDiffusionWrapper:
         # Feature Injection live-tunable params (in-place tensor update, no engine rebuild)
         fi_strength: Optional[float] = None,
         fi_threshold: Optional[float] = None,
+        # LoRA weight — live tensor update, no engine rebuild (see _lora_scale_tensor)
+        lora_weights: Optional[Dict[str, float]] = None,
     ) -> None:
         """
         Update streaming parameters efficiently in a single call.
@@ -1083,6 +1085,12 @@ class StreamDiffusionWrapper:
             Feature Injection blend weight alpha (0.0-1.0).
         fi_threshold : Optional[float]
             Feature Injection cosine-similarity gate (0.0-1.0).
+        lora_weights : Optional[Dict[str, float]]
+            {lora_path: weight} for one or more currently-loaded LoRA adapters.
+            Applied as a live runtime dial (in-place tensor write for TensorRT,
+            direct PEFT set_adapters() re-application otherwise) — no engine
+            rebuild. A path not among the LoRAs loaded at stream construction is
+            logged and skipped; loading a *new* LoRA still requires a restart.
         """
         # Skip re-encoding if the incoming prompt_list is identical to the cached one.
         # OSC delivers list-of-lists from JSON; normalise to (str, float) tuples before
@@ -1131,6 +1139,7 @@ class StreamDiffusionWrapper:
                 cn_cache_decay=cn_cache_decay,
                 fi_strength=fi_strength,
                 fi_threshold=fi_threshold,
+                lora_weights=lora_weights,
             )
         finally:
             if needs_encoding:
@@ -2212,7 +2221,12 @@ class StreamDiffusionWrapper:
             # per-frame base * warp-attenuation write uses the actually-configured strength.
             stream._fi_strength_base = float(fi_strength)
 
-        # Load and properly merge LoRA weights using the standard diffusers approach
+        # Load LoRA weights as live PEFT adapters — never fused/merged into UNet weights.
+        # Fusing (fuse_lora + unload_lora_weights, the pre-A1 approach) baked the scale
+        # into fp16 weights permanently, which is exactly what made `Weight` a
+        # restart-required parameter that forced a full engine rebuild on every change.
+        # Keeping the adapters live and routing the scale through a runtime tensor (see
+        # _set_lora_scale in unet_unified_export.py) is what makes it a live dial instead.
         lora_adapters_to_merge = []
         lora_scales_to_merge = []
         # adapter_name → (lora_name, lora_scale) for only successfully loaded adapters (G1 fix)
@@ -2224,20 +2238,12 @@ class StreamDiffusionWrapper:
                 adapter_name = f"custom_lora_{i}"
                 logger.info(f"_load_model: Loading LoRA '{lora_name}' with scale {lora_scale}")
 
-                # G8 fix: scale-0 fuse is a mathematical no-op (W + 0·ΔW = W), so skip
-                # loading and fusing entirely.  The entry is also excluded from
-                # _loaded_adapter_names so the G1 block at the end of the loop naturally
-                # drops it from the engine cache signature — a lora_dict with only
-                # zero-scale entries collapses to None and reuses the baseline UNet engine.
-                # Note: negative scales are valid (subtract the LoRA delta), so skip == 0
-                # exactly, not <= 0.
-                if lora_scale == 0:
-                    logger.info(
-                        f"_load_model: Skipping zero-scale LoRA '{lora_name}' — "
-                        "no effect on weights; engine will match baseline cache"
-                    )
-                    continue
-
+                # A1: a zero-scale LoRA must still be loaded and baked into the graph as
+                # an adapter — the scale is now a live tensor that can be raised later
+                # without a rebuild. The old G8 skip-on-zero short-circuit (and its
+                # "reuses the baseline engine" behavior) is retired: under dynamic weight,
+                # skipping zero would make 0 a trap door that still needs a rebuild to
+                # leave. Note: negative scales are valid (subtract the LoRA delta).
                 try:
                     # Load LoRA weights with unique adapter name
                     stream.load_lora(lora_name, adapter_name=adapter_name)
@@ -2250,31 +2256,57 @@ class StreamDiffusionWrapper:
                     # Drop this entry — do NOT carry it into the engine cache key (G1 fix)
                     continue
 
-        # Merge all LoRA adapters using the proper diffusers method
+        # Activate every loaded adapter. For TensorRT, this only establishes each
+        # adapter's base_scaling = lora_alpha/r baseline via PEFT's set_scale() — the
+        # *live* per-adapter scale is applied per forward call as a runtime tensor
+        # (_set_lora_scale multiplies this baseline by the traced lora_scale input), so
+        # unit weight is passed here deliberately, not lora_scale.
+        #
+        # Non-TensorRT builds (acceleration="none"/"xformers") never construct an
+        # export wrapper, so nothing would ever apply that multiply — PEFT's own
+        # forward() reads self.scaling[adapter] fresh every call, so applying the
+        # actual configured weight directly here is both correct and sufficient (a
+        # free live-adjustable LoRA for that path, no runtime tensor needed). Applying
+        # unit weight there instead would silently strand every non-TRT LoRA at
+        # baseline strength — a regression versus the old fuse_lora(lora_scale=w).
+        # Re-applied again after a TensorRT OOM fallback below, since that swaps
+        # stream.unet back to the raw PyTorch module after this ran the TRT branch.
         if lora_adapters_to_merge:
+            _lora_adapter_weights = (
+                [1.0] * len(lora_adapters_to_merge) if acceleration == "tensorrt" else lora_scales_to_merge
+            )
             try:
-                for adapter_name, scale in zip(lora_adapters_to_merge, lora_scales_to_merge):
-                    logger.info(f"Merging individual LoRA: {adapter_name} with scale {scale}")
-                    stream.pipe.fuse_lora(lora_scale=scale, adapter_names=[adapter_name])
-
-                # Clean up after individual merging
-                stream.pipe.unload_lora_weights()
-                logger.info("Successfully merged LoRAs individually")
-
-            except Exception as fuse_error:
-                # Partial fusion leaves UNet weights in an ambiguous state; baking a TRT engine
-                # from this state creates a permanently mislabeled or corrupted engine (G1 fix).
-                try:
-                    stream.pipe.unload_lora_weights()
-                except Exception:
-                    logger.debug("LoRA cleanup: unload_lora_weights() failed after merge failure", exc_info=True)
+                stream.pipe.set_adapters(lora_adapters_to_merge, adapter_weights=_lora_adapter_weights)
+                logger.info(f"Activated {len(lora_adapters_to_merge)} LoRA adapter(s) (live, unfused)")
+            except Exception as activate_error:
                 raise RuntimeError(
-                    f"LoRA fusion failed — cannot build TRT engine with partial UNet state. Error: {fuse_error}"
-                ) from fuse_error
+                    f"LoRA activation failed — cannot build engine with partial adapter state. "
+                    f"Error: {activate_error}"
+                ) from activate_error
 
-        # G1 fix: Correct lora_dict to only contain successfully fused LoRAs so that
+        # Ordered adapter list — the index<->path mapping the export wrapper
+        # (unet_unified_export.py) and the runtime updater (stream_parameter_updater.py)
+        # both need to translate a lora_scale tensor slot back to a LoRA path. Path
+        # normalized to forward slashes to match the YAML config builder's convention.
+        stream._lora_order = [
+            (_loaded_adapter_names[a][0].replace("\\", "/"), a) for a in lora_adapters_to_merge
+        ]
+
+        # Persistent fp32 [num_loras] tensor — the runtime lora_scale engine input.
+        # Initialized to the configured per-LoRA weights (not 1.0) so the very first
+        # frame reproduces the old fuse_lora(lora_scale=w) result exactly; later
+        # updates come from stream_parameter_updater, which mutates this in place
+        # (same device address across frames, CUDA-graph-safe — mirrors
+        # _fi_strength_tensor/_fi_threshold_tensor above).
+        stream._lora_scale_tensor = (
+            torch.tensor(lora_scales_to_merge, dtype=torch.float32, device=stream.device)
+            if lora_adapters_to_merge
+            else None
+        )
+
+        # G1 fix: Correct lora_dict to only contain successfully loaded LoRAs so that
         # get_engine_path() computes the correct engine cache signature.  Any LoRA that
-        # failed to load was never merged into UNet weights; the engine must NOT carry
+        # failed to load was never activated as an adapter; the engine must NOT carry
         # its signature in the cache path.
         if lora_dict is not None:
             fused_lora_dict = {
@@ -2571,7 +2603,12 @@ class StreamDiffusionWrapper:
                 )
                 logger.debug(f"compile_and_load_engine: use_ipadapter_trt={use_ipadapter_trt}, tokens={num_tokens}")
 
-                # Note: LoRA weights have already been merged permanently during model loading
+                # LoRA adapters stay live/unfused (see the load-time block above) — their
+                # scale is a runtime engine input (lora_scale) rather than a baked-in
+                # weight, so num_loras/lora_order below flow into both the wrapper and
+                # the UNet model_config that declares the graph input.
+                use_lora_trt = bool(getattr(stream, "_lora_order", None))
+                num_loras = len(stream._lora_order) if use_lora_trt else 0
 
                 # CRITICAL: Install IPAdapter module BEFORE TensorRT compilation to ensure processors are baked into engines
                 if use_ipadapter and ipadapter_config and not hasattr(stream, "_ipadapter_module"):
@@ -2676,6 +2713,7 @@ class StreamDiffusionWrapper:
                     use_ipadapter=use_ipadapter_trt,
                     control_input_names=None,
                     num_tokens=num_tokens,
+                    lora_order=stream._lora_order if use_lora_trt else None,
                 )
 
                 num_ip_layers = None
@@ -2700,6 +2738,8 @@ class StreamDiffusionWrapper:
                     use_ipadapter=use_ipadapter_trt,
                     num_image_tokens=num_tokens,
                     num_ip_layers=num_ip_layers if use_ipadapter_trt else None,
+                    use_lora=use_lora_trt,
+                    num_loras=num_loras,
                     image_height=self.height,
                     image_width=self.width,
                     use_cached_attn=use_cached_attn,
@@ -2725,6 +2765,7 @@ class StreamDiffusionWrapper:
                     num_tokens=num_tokens,
                     kvo_cache_structure=kvo_cache_structure,
                     fi_layer_count=getattr(unet_model, "fi_cache_count", 0),
+                    lora_order=stream._lora_order if use_lora_trt else None,
                 )
 
                 if use_cached_attn:
@@ -3047,6 +3088,8 @@ class StreamDiffusionWrapper:
                         use_ipadapter_trt=use_ipadapter_trt,
                         unet_arch=unet_arch,
                         num_ip_layers=num_ip_layers if use_ipadapter_trt else None,
+                        use_lora_trt=use_lora_trt,
+                        num_loras=num_loras,
                         engine_build_options=_unet_build_opts,
                     )
                     if load_engine:
@@ -3092,6 +3135,25 @@ class StreamDiffusionWrapper:
                             if hasattr(stream, "pipe") and hasattr(stream.pipe, "unet"):
                                 stream.unet = stream.pipe.unet
                                 logger.info("PyTorch UNet fallback successful")
+                                # The set_adapters() call above this TRT attempt used
+                                # unit weight (base_scaling only), expecting the export
+                                # wrapper to multiply the runtime tensor in. There is no
+                                # export wrapper on this PyTorch fallback path, so
+                                # re-apply the actual configured weights directly —
+                                # otherwise every loaded LoRA silently runs at baseline
+                                # strength instead of its configured Weight.
+                                if lora_adapters_to_merge:
+                                    try:
+                                        stream.pipe.set_adapters(
+                                            lora_adapters_to_merge, adapter_weights=lora_scales_to_merge
+                                        )
+                                        logger.info(
+                                            "Re-applied configured LoRA weight(s) directly for PyTorch OOM fallback"
+                                        )
+                                    except Exception as lora_reapply_error:
+                                        logger.warning(
+                                            f"Failed to re-apply LoRA weights after OOM fallback: {lora_reapply_error}"
+                                        )
                             else:
                                 raise RuntimeError("No PyTorch UNet available for fallback")
                         except Exception as fallback_error:
@@ -3356,7 +3418,8 @@ class StreamDiffusionWrapper:
                 logger.error("Failed to install IPAdapterModule")
                 raise
 
-        # Note: LoRA weights have already been merged permanently during model loading
+        # Note: LoRA weights stay live/unfused (see the load-time adapter-activation
+        # block) — weight is a runtime tensor (lora_scale), not baked into UNet weights.
 
         # Install pipeline hook modules (Phase 4: Configuration Integration)
         if image_preprocessing_config and image_preprocessing_config.get("enabled", True):

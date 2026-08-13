@@ -191,3 +191,108 @@ class TestFp8RecipeTagOrthogonalToIpAdapterSuffixes:
         )
 
         assert len({neither, noattn, noip, both}) == 4
+
+
+class TestUnetPathLoraSuffix:
+    """Workstream A / A5: get_engine_path's LoRA cache-key suffix (_lora_signature)
+    deliberately EXCLUDES weight -- dragging the runtime `Weight` slider must reuse the
+    cached engine, not rebuild it, which is the entire point of making LoRA weight a
+    live tensor instead of something fused into the exported UNet graph. It must still
+    fork on the file's actual identity though: several coexisting LoRA files can share a
+    basename (e.g. multiple training-run checkpoints all saved as
+    sepiagraph_woolsey.safetensors in different folders), so basename alone would
+    silently load the wrong weights into a matching cache dir. size+mtime is the guard
+    against that collision.
+    """
+
+    def test_unet_path_same_when_lora_weight_changes(self, tmp_path):
+        lora_file = tmp_path / "style_a.safetensors"
+        lora_file.write_bytes(b"fake-lora-weights")
+        em = _make_engine_manager()
+        path_low = em.get_engine_path(
+            engine_type=EngineType.UNET, is_faceid=False, lora_dict={str(lora_file): 0.3}, **_BASE_KWARGS
+        )
+        path_high = em.get_engine_path(
+            engine_type=EngineType.UNET, is_faceid=False, lora_dict={str(lora_file): 0.9}, **_BASE_KWARGS
+        )
+
+        assert path_low == path_high
+
+    def test_unet_path_differs_when_lora_file_changes(self, tmp_path):
+        file_a = tmp_path / "style_a.safetensors"
+        file_b = tmp_path / "style_b.safetensors"
+        file_a.write_bytes(b"fake-lora-weights-a")
+        file_b.write_bytes(b"fake-lora-weights-b")
+        em = _make_engine_manager()
+        path_a = em.get_engine_path(
+            engine_type=EngineType.UNET, is_faceid=False, lora_dict={str(file_a): 0.5}, **_BASE_KWARGS
+        )
+        path_b = em.get_engine_path(
+            engine_type=EngineType.UNET, is_faceid=False, lora_dict={str(file_b): 0.5}, **_BASE_KWARGS
+        )
+
+        assert path_a != path_b
+
+    def test_unet_path_differs_when_basename_collides_but_content_differs(self, tmp_path):
+        """Same basename, different folders/content (the sepiagraph_* scenario) must
+        still fork -- basename-only signing would silently alias them."""
+        dir_a = tmp_path / "run_a"
+        dir_b = tmp_path / "run_b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        file_a = dir_a / "style.safetensors"
+        file_b = dir_b / "style.safetensors"
+        file_a.write_bytes(b"a" * 100)
+        file_b.write_bytes(b"b" * 250)
+        em = _make_engine_manager()
+        path_a = em.get_engine_path(
+            engine_type=EngineType.UNET, is_faceid=False, lora_dict={str(file_a): 0.5}, **_BASE_KWARGS
+        )
+        path_b = em.get_engine_path(
+            engine_type=EngineType.UNET, is_faceid=False, lora_dict={str(file_b): 0.5}, **_BASE_KWARGS
+        )
+
+        assert path_a != path_b
+
+    def test_unet_path_no_lora_and_empty_lora_dict_are_equivalent(self):
+        em = _make_engine_manager()
+        path_none = em.get_engine_path(engine_type=EngineType.UNET, is_faceid=False, lora_dict=None, **_BASE_KWARGS)
+        path_empty = em.get_engine_path(engine_type=EngineType.UNET, is_faceid=False, lora_dict={}, **_BASE_KWARGS)
+
+        assert path_none == path_empty
+
+    def test_unet_path_forks_on_lora_presence(self, tmp_path):
+        lora_file = tmp_path / "style_a.safetensors"
+        lora_file.write_bytes(b"fake-lora-weights")
+        em = _make_engine_manager()
+        path_none = em.get_engine_path(engine_type=EngineType.UNET, is_faceid=False, lora_dict=None, **_BASE_KWARGS)
+        path_lora = em.get_engine_path(
+            engine_type=EngineType.UNET, is_faceid=False, lora_dict={str(lora_file): 1.0}, **_BASE_KWARGS
+        )
+
+        assert path_none != path_lora
+
+    def test_unet_path_is_deterministic_with_lora(self, tmp_path):
+        """Same LoRA config -> same path, so a previously-built engine is reused."""
+        lora_file = tmp_path / "style_a.safetensors"
+        lora_file.write_bytes(b"fake-lora-weights")
+        em = _make_engine_manager()
+        kwargs = dict(_BASE_KWARGS, engine_type=EngineType.UNET, is_faceid=False, lora_dict={str(lora_file): 0.5})
+
+        path_a = em.get_engine_path(**kwargs)
+        path_b = em.get_engine_path(**kwargs)
+
+        assert path_a == path_b
+
+    def test_vae_paths_unaffected_by_lora_dict(self, tmp_path):
+        lora_file = tmp_path / "style_a.safetensors"
+        lora_file.write_bytes(b"fake-lora-weights")
+        em = _make_engine_manager()
+        path_none = em.get_engine_path(
+            engine_type=EngineType.VAE_DECODER, is_faceid=False, lora_dict=None, **_BASE_KWARGS
+        )
+        path_lora = em.get_engine_path(
+            engine_type=EngineType.VAE_DECODER, is_faceid=False, lora_dict={str(lora_file): 0.7}, **_BASE_KWARGS
+        )
+
+        assert path_none == path_lora

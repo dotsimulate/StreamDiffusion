@@ -1,7 +1,8 @@
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from diffusers import UNet2DConditionModel
+from peft.tuners.tuners_utils import BaseTunerLayer
 
 from streamdiffusion._patches.diffusers_kvo_patch import apply as _apply_kvo_patch
 
@@ -52,6 +53,60 @@ def _collect_fi_processors(unet: UNet2DConditionModel) -> List:
     return procs
 
 
+def _collect_lora_layers(
+    unet: torch.nn.Module, lora_order: List[Tuple[str, str]]
+) -> Dict[str, List[Tuple[BaseTunerLayer, float]]]:
+    """Walk ``unet.named_modules()`` and, for every adapter name in ``lora_order``,
+    capture every ``BaseTunerLayer`` carrying that adapter along with its base PEFT
+    scaling (``lora_alpha / r``, established once by ``pipe.set_adapters(..., 1.0)``
+    at load time — see wrapper.py's live-adapter-activation block). ``_set_lora_scale``
+    multiplies this base value by the live ``lora_scale`` tensor every forward pass.
+
+    Fails loudly (``RuntimeError``) rather than shipping an inert slider: every touched
+    layer must be vanilla LoRA (no DoRA/other ``lora_variant``), unmerged, and not
+    adapter-disabled — the three states under which PEFT's ``scaling`` dict multiply is
+    bypassed entirely (``peft/tuners/lora/layer.py``'s forward()/merge()/unmerge()).
+    """
+    adapter_names = {adapter_name for _path, adapter_name in lora_order}
+    layers: Dict[str, List[Tuple[BaseTunerLayer, float]]] = {name: [] for name in adapter_names}
+
+    for module_path, module in unet.named_modules():
+        if not isinstance(module, BaseTunerLayer):
+            continue
+        for adapter_name in adapter_names:
+            if adapter_name not in module.scaling:
+                continue
+            if adapter_name in module.lora_variant:
+                raise RuntimeError(
+                    f"LoRA adapter '{adapter_name}' uses a non-vanilla PEFT variant "
+                    f"(e.g. DoRA) on module '{module_path}'. The runtime lora_scale "
+                    f"tensor only patches the vanilla scaling path "
+                    f"('result + lora_B(lora_A(x)) * scaling' in peft's layer.py) — a "
+                    f"variant adapter would silently ignore it and ship an inert slider. "
+                    f"Refusing to export rather than do that."
+                )
+            if module.merged:
+                raise RuntimeError(
+                    f"LoRA adapter '{adapter_name}' is merged into module '{module_path}'. "
+                    f"Dynamic lora_scale requires every adapter to stay live/unfused."
+                )
+            if module.disable_adapters:
+                raise RuntimeError(
+                    f"LoRA adapter '{adapter_name}' is disabled on module '{module_path}'. "
+                    f"Dynamic lora_scale requires every adapter to stay active."
+                )
+            layers[adapter_name].append((module, module.scaling[adapter_name]))
+
+    for adapter_name in adapter_names:
+        if not layers[adapter_name]:
+            raise RuntimeError(
+                f"LoRA adapter '{adapter_name}' was requested via lora_order but no PEFT "
+                f"BaseTunerLayer in the UNet carries it — nothing to scale."
+            )
+
+    return layers
+
+
 class UnifiedExportWrapper(torch.nn.Module):
     """
     Unified wrapper that composes wrappers for conditioning modules.
@@ -59,6 +114,7 @@ class UnifiedExportWrapper(torch.nn.Module):
     Positional args in ``forward`` (after the three base inputs) follow this order:
 
         ipadapter_scale  (optional, only when use_ipadapter=True; stripped before routing)
+        lora_scale       (optional, [N] fp32, only when num_loras>0; stripped before routing)
         kvo_cache_in_0 … kvo_cache_in_N     (kvo_cache_count tensors)
         fio_cache_in_<idx0> … fio_cache_in_<idxM>   (fi_layer_count tensors, FI only)
         fi_strength                          (scalar [1] fp32, FI only)
@@ -79,6 +135,7 @@ class UnifiedExportWrapper(torch.nn.Module):
         num_tokens: int = 4,
         kvo_cache_structure: Optional[List[int]] = None,
         fi_layer_count: int = 0,
+        lora_order: Optional[List[Tuple[str, str]]] = None,
         **kwargs,
     ):
         super().__init__()
@@ -90,6 +147,7 @@ class UnifiedExportWrapper(torch.nn.Module):
         self.unet = unet
         self.kvo_cache_structure = kvo_cache_structure
         self.fi_layer_count = fi_layer_count
+        self._lora_order: List[Tuple[str, str]] = lora_order or []
 
         # Precompute kvo cache count for arg-splitting in _basic_unet_forward
         self._kvo_cache_count: int = sum(sum(block) for block in kvo_cache_structure)
@@ -110,6 +168,14 @@ class UnifiedExportWrapper(torch.nn.Module):
             self.controlnet_wrapper = create_controlnet_wrapper(
                 self.unet, control_input_names, kvo_cache_structure, **controlnet_kwargs
             )
+
+        # Collect every PEFT BaseTunerLayer touched by a loaded LoRA adapter, capturing
+        # its base scaling (lora_alpha/r) and asserting the vanilla/unmerged/enabled
+        # invariants dynamic scaling depends on. Raises RuntimeError immediately on any
+        # violation — see _collect_lora_layers' docstring.
+        self._lora_layers: Dict[str, List[Tuple[BaseTunerLayer, float]]] = (
+            _collect_lora_layers(self.unet, self._lora_order) if self._lora_order else {}
+        )
 
         # Best-effort collection at construction time — may return [] if processors are
         # not yet installed (e.g. when wrapper.py constructs UnifiedExportWrapper before
@@ -154,6 +220,29 @@ class UnifiedExportWrapper(torch.nn.Module):
             proc._fi_cache = fi_slice
             proc._fi_strength = fi_strength
             proc._fi_threshold = fi_threshold
+
+    def _set_lora_scale(self, lora_scale: torch.Tensor) -> None:
+        """Write the live per-adapter weight into every PEFT layer's ``scaling`` dict
+        before the UNet forward.
+
+        Mirrors ``set_ipadapter_scale`` (unet_ipadapter_export.py) and ``_set_fi_cache``
+        above: the traced tensor is stashed directly on the consuming object (here,
+        PEFT's ``BaseTunerLayer.scaling`` dict, normally a plain float) so the ONNX
+        tracer follows the data edge without threading the argument through every
+        transformer block. ``base_scale`` is ``lora_alpha/r``, captured once at adapter-
+        activation time in wrapper.py — multiplying it back in here reproduces
+        ``fuse_lora(lora_scale=w)``'s exact math, just live instead of baked in.
+
+        NOTE: this assigns a tensor into a dict PEFT's own code treats as floats
+        (``LoraLayer.scaling``). Safe for the vanilla forward() multiply this class
+        guards for (see ``_collect_lora_layers``), but PEFT helpers such as
+        ``scale_layer``/``unscale_layer``/``scale_lora_layers`` are not called anywhere
+        in this codebase and would misbehave against a tensor value if that changes.
+        """
+        for i, (_path, adapter_name) in enumerate(self._lora_order):
+            weight = lora_scale[i]
+            for module, base_scale in self._lora_layers[adapter_name]:
+                module.scaling[adapter_name] = base_scale * weight
 
     def _basic_unet_forward(self, sample, timestep, encoder_hidden_states, *args, **kwargs):
         """Basic UNet forward that passes through all parameters to handle any model type.
@@ -257,6 +346,16 @@ class UnifiedExportWrapper(torch.nn.Module):
             # assign per-layer scale tensors into processors
             self.ipadapter_wrapper.set_ipadapter_scale(ipadapter_scale)
             # remove it from control args before passing to controlnet wrapper
+            args = args[1:]
+
+        if self._lora_order:
+            # lora_scale is appended right after ipadapter_scale (see class docstring)
+            if len(args) == 0:
+                raise RuntimeError("UnifiedExportWrapper: lora_scale tensor is required when LoRA adapters are loaded")
+            lora_scale = args[0]
+            if not isinstance(lora_scale, torch.Tensor):
+                raise TypeError(f"lora_scale must be a torch.Tensor, got {type(lora_scale)}")
+            self._set_lora_scale(lora_scale)
             args = args[1:]
 
         if self.controlnet_wrapper:

@@ -83,14 +83,25 @@ class EngineManager:
     def _lora_signature(self, lora_dict: Dict[str, float]) -> str:
         """Create a short, stable signature for a set of LoRAs.
 
-        Uses sorted basenames and weights, hashed to a short hex to avoid
-        long/invalid paths while keeping cache keys stable across runs.
+        Post-Workstream-A: LoRA weight is a live runtime tensor (lora_scale),
+        never baked into the engine, so it is deliberately EXCLUDED from this
+        signature -- changing a weight must reuse the cached engine, not
+        rebuild it (that's the entire point of the change). Basename alone is
+        NOT enough, though: two different files can share a name (e.g. several
+        "style.safetensors" trained on different runs), which would silently
+        load the wrong weights into a matching cache dir. File size + mtime
+        are cheap insurance against that collision.
         """
-        # Build canonical string of basename:weight pairs
         parts = []
-        for path, weight in sorted(lora_dict.items(), key=lambda x: str(x[0])):
-            base = Path(str(path)).name  # basename only
-            parts.append(f"{base}:{weight}")
+        for path, _weight in sorted(lora_dict.items(), key=lambda x: str(x[0])):
+            p = Path(str(path))
+            base = p.name  # basename only
+            try:
+                stat = p.stat()
+                size, mtime = stat.st_size, int(stat.st_mtime)
+            except OSError:
+                size, mtime = -1, -1
+            parts.append(f"{base}:{size}:{mtime}")
         canon = "|".join(parts)
         h = hashlib.sha1(canon.encode("utf-8")).hexdigest()[:10]
         return f"{len(lora_dict)}-{h}"
@@ -266,12 +277,22 @@ class EngineManager:
                 if ipadapter_tokens is not None:
                     prefix += f"--tokens{ipadapter_tokens}"
 
-                # Fused Loras - use concise hashed signature to avoid long/invalid paths.
-                # Only UNet engines bake LoRA weights; VAE and other standard engines are
-                # LoRA-agnostic, so scoping the suffix to UNET prevents redundant VAE rebuilds
-                # every time the LoRA dict changes.
+                # Live (unfused) LoRAs — concise hashed signature to avoid long/invalid
+                # paths. Only UNet engines carry LoRA adapters; VAE and other standard
+                # engines are LoRA-agnostic, so scoping the suffix to UNET prevents
+                # redundant VAE rebuilds every time the LoRA set changes.
+                #
+                # "--loradyn" is MANDATORY whenever a LoRA is loaded, not a defensive
+                # extra: Engine.infer silently drops any feed_dict key the loaded engine
+                # doesn't declare as a binding (utilities.py filtered_feed_dict), so
+                # feeding the new lora_scale tensor to a pre-Workstream-A engine (built
+                # with LoRA weights fused into the UNet, no lora_scale input at all)
+                # would not error -- it would just discard the tensor and reproduce the
+                # exact dead-slider bug this feature exists to fix. The tag's job is
+                # purely to fork every such stale engine into a fresh cache directory;
+                # its value never needs to change again after that one-time fork.
                 if lora_dict is not None and len(lora_dict) > 0:
-                    prefix += f"--lora-{self._lora_signature(lora_dict)}"
+                    prefix += f"--lora-{self._lora_signature(lora_dict)}--loradyn"
 
                 prefix += f"--use_cached_attn-{use_cached_attn}"
                 # FI suffix MUST come right after cached_attn so stale engines
@@ -646,6 +667,12 @@ class EngineManager:
             # number of IP-attention layers for runtime vector sizing
             if "num_ip_layers" in kwargs and kwargs["num_ip_layers"] is not None:
                 loaded_engine.num_ip_layers = kwargs["num_ip_layers"]
+
+        # Live (unfused) LoRA — see unet_engine.py._check_use_lora(). num_loras sizes
+        # the lora_scale vector the runtime updater indexes into via stream._lora_order.
+        loaded_engine.use_lora = kwargs.get("use_lora_trt", False)
+        if kwargs.get("use_lora_trt", False):
+            loaded_engine.num_loras = kwargs.get("num_loras", 0)
 
     def get_or_load_controlnet_engine(
         self,

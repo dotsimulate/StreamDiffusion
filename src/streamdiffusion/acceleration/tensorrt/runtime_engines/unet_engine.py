@@ -33,6 +33,7 @@ class UNet2DConditionModelEngine:
 
         # Cache expensive attribute lookups to avoid repeated getattr calls
         self._use_ipadapter_cached = None
+        self._use_lora_cached = None
 
         # Pre-compute ControlNet input names to avoid string formatting in hot paths
         # Support up to 20 ControlNet inputs (more than enough for typical use cases)
@@ -97,6 +98,12 @@ class UNet2DConditionModelEngine:
         if self._use_ipadapter_cached is None:
             self._use_ipadapter_cached = getattr(self, "use_ipadapter", False)
         return self._use_ipadapter_cached
+
+    def _check_use_lora(self) -> bool:
+        """Cache live-LoRA detection to avoid repeated getattr calls"""
+        if self._use_lora_cached is None:
+            self._use_lora_cached = getattr(self, "use_lora", False)
+        return self._use_lora_cached
 
     def __call__(
         self,
@@ -181,6 +188,21 @@ class UNet2DConditionModelEngine:
                 raise TypeError("ipadapter_scale must be a torch.Tensor")
             shape_dict["ipadapter_scale"] = ip_scale.shape
             input_dict["ipadapter_scale"] = ip_scale
+
+        # Handle LoRA runtime scale vector if engine was built with live (unfused)
+        # LoRA adapters. lora_scale is required whenever use_lora is set — a stale
+        # engine built before this metadata existed would never have use_lora=True,
+        # so this branch only fires for engines that actually declare the binding.
+        if self._check_use_lora():
+            if "lora_scale" not in kwargs:
+                logger.error("UNet2DConditionModelEngine: lora_scale missing but required (use_lora=True)")
+                raise RuntimeError("UNet2DConditionModelEngine: lora_scale is required for live-LoRA engines")
+            lora_scale = kwargs["lora_scale"]
+            if not isinstance(lora_scale, torch.Tensor):
+                logger.error(f"UNet2DConditionModelEngine: lora_scale has wrong type: {type(lora_scale)}")
+                raise TypeError("lora_scale must be a torch.Tensor")
+            shape_dict["lora_scale"] = lora_scale.shape
+            input_dict["lora_scale"] = lora_scale
 
         # Handle ControlNet inputs if provided
         if controlnet_conditioning is not None:
