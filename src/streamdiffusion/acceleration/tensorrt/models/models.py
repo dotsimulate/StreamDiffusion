@@ -453,6 +453,8 @@ class UNet(BaseModel):
         use_ipadapter=False,
         num_image_tokens=4,
         num_ip_layers: int = None,
+        use_lora: bool = False,
+        num_loras: int = 0,
         use_cached_attn: bool = False,
         cache_maxframes: int = 1,
         min_cache_maxframes: int = 1,
@@ -489,6 +491,14 @@ class UNet(BaseModel):
             self.text_maxlen = text_maxlen + self.num_image_tokens
             if self.num_ip_layers is None:
                 raise ValueError("UNet model requires num_ip_layers when use_ipadapter=True")
+
+        # Dynamic LoRA scale — a live [num_loras] fp32 vector, one entry per loaded
+        # adapter, index-aligned with stream._lora_order. See UnifiedExportWrapper /
+        # _collect_lora_layers for how the tensor value reaches PEFT's scaling dict.
+        self.use_lora = use_lora
+        self.num_loras = num_loras
+        if self.use_lora and self.num_loras <= 0:
+            raise ValueError("UNet model requires num_loras > 0 when use_lora=True")
 
         if self.use_control and self.unet_arch:
             self.control_inputs = self.get_control(image_height, image_width)
@@ -673,6 +683,8 @@ class UNet(BaseModel):
                 logging.getLogger(__name__).debug(f"TRT Models: get_input_names with ipadapter -> {base_names}")
             except Exception:
                 pass
+        if self.use_lora:
+            base_names.append("lora_scale")
         if self.use_control and self.control_inputs:
             control_names = sorted(self.control_inputs.keys())
             base_names = base_names + control_names
@@ -722,6 +734,9 @@ class UNet(BaseModel):
                 )
             except Exception:
                 pass
+
+        if self.use_lora:
+            base_axes["lora_scale"] = {0: "L_lora"}
 
         if self.use_control and self.control_inputs:
             for name, shape_spec in self.control_inputs.items():
@@ -831,6 +846,14 @@ class UNet(BaseModel):
             except Exception:
                 pass
 
+        if self.use_lora:
+            # scalar per-adapter vector, length fixed to num_loras
+            profile["lora_scale"] = [
+                (1,),
+                (self.num_loras,),
+                (self.num_loras,),
+            ]
+
         if self.use_control and self.control_inputs:
             # Use the actual calculated spatial dimensions for each ControlNet input
             # Each control input has its own specific spatial resolution based on UNet architecture
@@ -899,6 +922,9 @@ class UNet(BaseModel):
             except Exception:
                 pass
 
+        if self.use_lora:
+            shape_dict["lora_scale"] = (self.num_loras,)
+
         if self.use_control and self.control_inputs:
             # Use the actual calculated spatial dimensions for each ControlNet input
             for name, shape_spec in self.control_inputs.items():
@@ -963,6 +989,9 @@ class UNet(BaseModel):
 
         if self.use_ipadapter:
             base_inputs.append(torch.ones(self.num_ip_layers, dtype=torch.float32, device=self.device))
+
+        if self.use_lora:
+            base_inputs.append(torch.ones(self.num_loras, dtype=torch.float32, device=self.device))
 
         if self.use_control and self.control_inputs:
             control_inputs = []

@@ -5,14 +5,16 @@ feature-injection kwargs to a non-TRT (eager PyTorch) UNet.
 ``import streamdiffusion`` monkeypatches diffusers' ``UNet2DConditionModel.forward``
 (see ``_patches/diffusers_kvo_patch.py``) to add exactly one new kwarg, ``kvo_cache``,
 for StreamV2V cached-attention. It does *not* add ``fio_cache`` / ``fi_strength`` /
-``fi_threshold`` — feature-injection is TensorRT-engine-only
+``fi_threshold`` / ``lora_scale`` — feature-injection and the live LoRA-weight dial
+are both TensorRT-engine-only
 (``acceleration/tensorrt/runtime_engines/unet_engine.py``,
 ``UNet2DConditionModelEngine.__call__``).
 
 ``StreamDiffusion.unet_step()`` (pipeline.py) has two model-family branches. The SDXL
-branch gates the FI kwargs behind ``self._check_unet_tensorrt()``; the SD1.5/2.1
-branch did not, and unconditionally passed all four cache kwargs to ``self.unet(...)``.
-On any non-TRT backend (``acceleration: none``/``xformers``/``sfast``) this raised:
+branch gates the FI/LoRA kwargs behind ``self._check_unet_tensorrt()``; the SD1.5/2.1
+branch did not, and unconditionally passed all four cache kwargs to ``self.unet(...)``
+(``lora_scale`` was added later, already correctly gated the same way). On any non-TRT
+backend (``acceleration: none``/``xformers``/``sfast``) the original bug raised:
 
     UNet2DConditionModel.forward() got an unexpected keyword argument 'fio_cache'
 
@@ -119,6 +121,7 @@ def _make_pipeline(unet, *, prompt_tokens: int = 4) -> StreamDiffusion:
     sd.fio_cache: List[torch.Tensor] = []
     sd._fi_strength_tensor: Optional[torch.Tensor] = None
     sd._fi_threshold_tensor: Optional[torch.Tensor] = None
+    sd._lora_scale_tensor: Optional[torch.Tensor] = None  # live LoRA-weight dial; None == no LoRA loaded
     sd.use_feature_injection = False  # read by unet_step's FI-attenuation hot path
     sd._fi_strength_base = 0.0
     sd.fx_frame_transform = None
@@ -156,30 +159,32 @@ class TestSd15Sd21UnetCallBackendGate:
 
     def test_non_tensorrt_unet_receives_no_feature_injection_kwargs(self):
         """The patched PyTorch UNet only understands kvo_cache; fio_cache/fi_strength/
-        fi_threshold must never reach it, TRT-only or not."""
+        fi_threshold/lora_scale must never reach it, TRT-only or not."""
         recording_unet = _RecordingUnet(_make_tiny_unet())
         sd = _make_pipeline(recording_unet)
 
         _call_unet_step(sd)
 
         assert "kvo_cache" in recording_unet.last_kwargs
-        for key in ("fio_cache", "fi_strength", "fi_threshold"):
+        for key in ("fio_cache", "fi_strength", "fi_threshold", "lora_scale"):
             assert key not in recording_unet.last_kwargs, (
                 f"non-TRT UNet call must not receive {key!r}; got kwargs={sorted(recording_unet.last_kwargs)}"
             )
 
     def test_tensorrt_engine_still_receives_feature_injection_kwargs(self):
-        """Regression guard: the fix must not remove FI support from the real TRT path."""
+        """Regression guard: the fix must not remove FI/LoRA-scale support from the
+        real TRT path."""
         fake_engine = _FakeTrtEngine()
         sd = _make_pipeline(fake_engine)
         sd._fi_strength_tensor = torch.tensor(0.5)
         sd._fi_threshold_tensor = torch.tensor(0.1)
+        sd._lora_scale_tensor = torch.tensor([1.0])
         sd.use_feature_injection = True
         sd._fi_strength_base = 0.5
 
         _call_unet_step(sd)
 
-        for key in ("kvo_cache", "fio_cache", "fi_strength", "fi_threshold"):
+        for key in ("kvo_cache", "fio_cache", "fi_strength", "fi_threshold", "lora_scale"):
             assert key in fake_engine.last_kwargs, (
                 f"TRT engine call must still receive {key!r}; got kwargs={sorted(fake_engine.last_kwargs)}"
             )

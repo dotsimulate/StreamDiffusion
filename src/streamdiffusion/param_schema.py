@@ -1,7 +1,7 @@
 """Single source of truth for the runtime-tunable StreamDiffusion parameter set.
 
-This module owns parameter *identity* — the 26 names accepted by
-:meth:`StreamDiffusionWrapper.update_stream_params`, which of those 24 are
+This module owns parameter *identity* — the 27 names accepted by
+:meth:`StreamDiffusionWrapper.update_stream_params`, which of those 25 are
 forwarded to :meth:`StreamParameterUpdater.update_stream_params`, and each
 param's *construction-time* default (the value a fresh wrapper gets when the
 key is absent from config — see ``config._extract_wrapper_params`` and
@@ -105,12 +105,16 @@ PARAMS: Tuple[ParamSpec, ...] = (
     ParamSpec("cn_cache_decay", 0.0),
     ParamSpec("fi_strength", 0.75),
     ParamSpec("fi_threshold", 0.98),
+    # {lora_path: weight} — live per-adapter LoRA weight dial. See
+    # StreamParameterUpdater._update_lora_weights; resolved against
+    # stream._lora_order (index<->path mapping set once at load time).
+    ParamSpec("lora_weights", None),
 )
 
-# All 26 params the wrapper accepts, in wrapper signature order.
+# All 27 params the wrapper accepts, in wrapper signature order.
 PARAM_NAMES: Tuple[str, ...] = tuple(p.name for p in PARAMS)
 
-# The 24 params forwarded to the updater, in updater signature order
+# The 25 params forwarded to the updater, in updater signature order
 # (a contiguous subsequence of PARAM_NAMES once use_safety_checker /
 # safety_checker_threshold are removed).
 UPDATER_PARAM_NAMES: Tuple[str, ...] = tuple(p.name for p in PARAMS if p.updater)

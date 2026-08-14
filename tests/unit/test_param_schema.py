@@ -37,10 +37,10 @@ WRAPPER_ONLY_PARAMS = {"use_safety_checker", "safety_checker_threshold"}
 
 class TestParamNames:
     def test_param_names_count(self):
-        assert len(PARAM_NAMES) == 26
+        assert len(PARAM_NAMES) == 27
 
     def test_updater_param_names_count(self):
-        assert len(UPDATER_PARAM_NAMES) == 24
+        assert len(UPDATER_PARAM_NAMES) == 25
 
     def test_updater_param_names_is_ordered_subsequence_of_param_names(self):
         """Dropping the two wrapper-only names from PARAM_NAMES, in place,
@@ -115,6 +115,7 @@ class TestDefaultsGolden:
             "image_postprocessing_config",
             "latent_preprocessing_config",
             "latent_postprocessing_config",
+            "lora_weights",
         ):
             assert DEFAULTS[name] is None
 

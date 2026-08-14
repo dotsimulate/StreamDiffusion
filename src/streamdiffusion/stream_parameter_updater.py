@@ -51,7 +51,12 @@ class StreamParameterUpdater(OrchestratorUser):
         # Atomic update lock for deterministic, thread-safe runtime updates
         self._update_lock = threading.RLock()
         # Prompt blending caches
-        self._prompt_cache: Dict[int, Dict] = {}
+        # Keyed by prompt text (not list position): dedupes repeated prompt
+        # text across positions, survives Promptblock() skipping an empty
+        # concept (which shifts every later index), and needs no reindexing
+        # on insert/remove/reorder. See _cache_prompt_embeddings /
+        # _apply_prompt_blending.
+        self._prompt_cache: Dict[str, Dict] = {}
         self._current_prompt_list: List[Tuple[str, float]] = []
         self._current_negative_prompt: str = ""
         self._prompt_cache_stats = CacheStats()
@@ -320,6 +325,7 @@ class StreamParameterUpdater(OrchestratorUser):
         cn_cache_decay: Optional[float] = None,
         fi_strength: Optional[float] = None,
         fi_threshold: Optional[float] = None,
+        lora_weights: Optional[Dict[str, float]] = None,
     ) -> None:
         """Update streaming parameters efficiently in a single call."""
 
@@ -564,6 +570,77 @@ class StreamParameterUpdater(OrchestratorUser):
                     self.stream._fi_threshold_tensor.fill_(float(fi_threshold))
                     logger.info(f"update_stream_params: fi_threshold -> {fi_threshold:.6f}")
 
+            # LoRA weight — live dial, see _update_lora_weights for the TRT/PyTorch split.
+            if lora_weights is not None:
+                self._update_lora_weights(lora_weights)
+
+    def _update_lora_weights(self, lora_weights: Dict[str, float]) -> None:
+        """
+        Update the live runtime weight for one or more loaded LoRA adapters.
+
+        Args:
+            lora_weights: {lora_path: weight} — paths are matched against
+                          stream._lora_order (set once at load time in
+                          wrapper.py._load_model) after normalizing to forward
+                          slashes, mirroring that module's own convention. A path
+                          that isn't currently loaded is logged and skipped rather
+                          than raising — an OSC client a frame ahead of a LoRA
+                          reload/removal should not kill the stream.
+        """
+        lora_order = getattr(self.stream, "_lora_order", None)
+        if not lora_order:
+            logger.warning("update_stream_params: lora_weights given but no LoRA adapters are loaded")
+            return
+
+        tensor = getattr(self.stream, "_lora_scale_tensor", None)
+        if tensor is None:
+            # Should be impossible whenever _lora_order is non-empty (wrapper.py
+            # allocates both together), but guard rather than crash the stream.
+            logger.warning("update_stream_params: lora_weights given but _lora_scale_tensor is not allocated")
+            return
+
+        # Resolve path -> index once so both update targets below (the TRT tensor
+        # and, for PyTorch, PEFT's own scaling dict) apply the identical value.
+        resolved: Dict[int, float] = {}
+        for raw_path, weight in lora_weights.items():
+            norm_path = str(raw_path).replace("\\", "/")
+            for idx, (lora_name, _adapter_name) in enumerate(lora_order):
+                if lora_name == norm_path:
+                    resolved[idx] = float(weight)
+                    break
+            else:
+                logger.warning(f"update_stream_params: lora_weights path not found in loaded adapters: {raw_path!r}")
+
+        if not resolved:
+            return
+
+        # TensorRT path: write straight into the persistent [num_loras] tensor in
+        # place (same device address every frame -- CUDA-graph-safe). The export
+        # wrapper's _set_lora_scale (unet_unified_export.py) multiplies this
+        # against each adapter's base_scaling = lora_alpha/r on every forward
+        # call, so an in-place write here is enough for TRT.
+        for idx, weight in resolved.items():
+            tensor[idx] = weight
+
+        # Non-TensorRT path: there is no export wrapper to apply that multiply --
+        # stream.unet is the live PyTorch UNet, and its PEFT LoraLayers read
+        # self.scaling[adapter] fresh every forward(). Re-issue set_adapters()
+        # with the full current vector (tensor is now the source of truth for
+        # every adapter, not just the ones just written) so PyTorch gets the
+        # same live-dial behavior as TRT (see wrapper.py's matching comment at
+        # the original set_adapters() activation call).
+        is_tensorrt_engine = hasattr(self.stream.unet, "engine") and hasattr(self.stream.unet, "stream")
+        if not is_tensorrt_engine:
+            adapter_names = [adapter_name for _lora_name, adapter_name in lora_order]
+            current_weights = [float(tensor[i].item()) for i in range(len(lora_order))]
+            try:
+                self.stream.pipe.set_adapters(adapter_names, adapter_weights=current_weights)
+            except Exception as e:
+                logger.warning(f"update_stream_params: failed to re-apply LoRA weights on PyTorch UNet: {e}")
+
+        for idx, weight in resolved.items():
+            logger.info(f"update_stream_params: LoRA '{lora_order[idx][0]}' weight -> {weight:.4f}")
+
     @torch.inference_mode()
     def _update_blended_prompts(
         self,
@@ -583,26 +660,36 @@ class StreamParameterUpdater(OrchestratorUser):
         self._apply_prompt_blending(prompt_interpolation_method)
 
     def _cache_prompt_embeddings(self, prompt_list: List[Tuple[str, float]], negative_prompt: str) -> None:
-        """Cache prompt embeddings for efficient reuse."""
-        for idx, (prompt_text, weight) in enumerate(prompt_list):
-            if idx not in self._prompt_cache or self._prompt_cache[idx]["text"] != prompt_text:
-                # Cache miss - encode the prompt
-                self._prompt_cache_stats.record_miss()
-                encoder_output = self.stream.pipe.encode_prompt(
-                    prompt=prompt_text,
-                    device=self.stream.device,
-                    num_images_per_prompt=1,
-                    do_classifier_free_guidance=False,
-                    negative_prompt=negative_prompt,
-                )
-                # Evict oldest entry if cache is full
-                if len(self._prompt_cache) >= 32:
-                    oldest_key = next(iter(self._prompt_cache))
-                    del self._prompt_cache[oldest_key]
-                self._prompt_cache[idx] = {"embed": encoder_output[0], "text": prompt_text}
-            else:
+        """Cache prompt embeddings for efficient reuse.
+
+        Keyed by prompt text rather than list position, so a weight-only
+        change or a reorder never triggers a re-encode, and duplicate prompt
+        text at different positions shares one cached embedding. The eviction
+        cap floors at 32 (the original limit) but grows to this call's own
+        list length, so a single legitimate prompt_list can never be made to
+        self-evict entries it still needs mid-call -- eviction still only
+        removes the oldest-inserted (FIFO) entries not referenced by this call.
+        """
+        cache_cap = max(32, len(prompt_list))
+        for prompt_text, _weight in prompt_list:
+            if prompt_text in self._prompt_cache:
                 # Cache hit
                 self._prompt_cache_stats.record_hit()
+                continue
+            # Cache miss - encode the prompt
+            self._prompt_cache_stats.record_miss()
+            encoder_output = self.stream.pipe.encode_prompt(
+                prompt=prompt_text,
+                device=self.stream.device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=False,
+                negative_prompt=negative_prompt,
+            )
+            # Evict oldest entry if cache is full
+            if len(self._prompt_cache) >= cache_cap:
+                oldest_key = next(iter(self._prompt_cache))
+                del self._prompt_cache[oldest_key]
+            self._prompt_cache[prompt_text] = {"embed": encoder_output[0]}
 
     def _apply_prompt_blending(
         self, prompt_interpolation_method: Literal["average", "slerp", "cosine_weighted"]
@@ -613,11 +700,23 @@ class StreamParameterUpdater(OrchestratorUser):
 
         embeddings = []
         weights = []
+        missing = []
 
-        for idx, (prompt_text, weight) in enumerate(self._current_prompt_list):
-            if idx in self._prompt_cache:
-                embeddings.append(self._prompt_cache[idx]["embed"])
+        for prompt_text, weight in self._current_prompt_list:
+            cached = self._prompt_cache.get(prompt_text)
+            if cached is not None:
+                embeddings.append(cached["embed"])
                 weights.append(weight)
+            else:
+                missing.append(prompt_text)
+
+        if missing:
+            logger.warning(
+                "_apply_prompt_blending: %d prompt(s) have no cached embedding and were "
+                "dropped from the blend: %r",
+                len(missing),
+                missing,
+            )
 
         if not embeddings:
             logger.warning("_apply_prompt_blending: Warning: No cached embeddings found")
@@ -1413,33 +1512,10 @@ class StreamParameterUpdater(OrchestratorUser):
         old_prompt, weight = self._current_prompt_list[index]
         self._current_prompt_list[index] = (new_prompt, weight)
 
-        # Cache the new prompt embedding
+        # Cache the new prompt embedding. Keyed by text, so this is a hit if
+        # new_prompt is already cached (e.g. reused elsewhere in the list) and
+        # a miss otherwise -- no separate lookup-or-encode dance needed here.
         self._cache_prompt_embeddings([(new_prompt, weight)], self._current_negative_prompt)
-
-        # Update cache index to point to the new prompt
-        if index in self._prompt_cache and self._prompt_cache[index]["text"] != new_prompt:
-            # Find if this prompt is already cached elsewhere
-            existing_cache_key = None
-            for cache_idx, cache_data in self._prompt_cache.items():
-                if cache_data["text"] == new_prompt:
-                    existing_cache_key = cache_idx
-                    break
-
-            if existing_cache_key is not None:
-                # Reuse existing cached embedding
-                self._prompt_cache[index] = self._prompt_cache[existing_cache_key].copy()
-                self._prompt_cache_stats.record_hit()
-            else:
-                # Encode new prompt
-                self._prompt_cache_stats.record_miss()
-                encoder_output = self.stream.pipe.encode_prompt(
-                    prompt=new_prompt,
-                    device=self.stream.device,
-                    num_images_per_prompt=1,
-                    do_classifier_free_guidance=False,
-                    negative_prompt=self._current_negative_prompt,
-                )
-                self._prompt_cache[index] = {"embed": encoder_output[0], "text": new_prompt}
 
         # Recompute blended embeddings with updated prompt
         self._apply_prompt_blending(prompt_interpolation_method)
@@ -1458,19 +1534,11 @@ class StreamParameterUpdater(OrchestratorUser):
     ) -> None:
         """Add a new prompt to the current list."""
         prompt_interpolation_method = prompt_interpolation_method or self._last_prompt_interpolation_method
-        new_index = len(self._current_prompt_list)
         self._current_prompt_list.append((prompt, weight))
 
-        # Cache the new prompt
-        encoder_output = self.stream.pipe.encode_prompt(
-            prompt=prompt,
-            device=self.stream.device,
-            num_images_per_prompt=1,
-            do_classifier_free_guidance=False,
-            negative_prompt=self._current_negative_prompt,
-        )
-        self._prompt_cache[new_index] = {"embed": encoder_output[0], "text": prompt}
-        self._prompt_cache_stats.record_miss()
+        # Cache the new prompt (hit if this text is already cached elsewhere
+        # in the list, miss otherwise -- same helper update_stream_params uses).
+        self._cache_prompt_embeddings([(prompt, weight)], self._current_negative_prompt)
 
         # Recompute blended embeddings
         self._apply_prompt_blending(prompt_interpolation_method)
@@ -1490,15 +1558,10 @@ class StreamParameterUpdater(OrchestratorUser):
             logger.warning("remove_prompt_at_index: Warning: Cannot remove last prompt")
             return
 
-        # Remove from current list
+        # Remove from current list. The cache is keyed by prompt text, not
+        # position, so no reindexing is needed (unlike _seed_cache below,
+        # which is still index-keyed and uses _reindex_cache after a removal).
         self._current_prompt_list.pop(index)
-
-        # Remove from cache and reindex
-        if index in self._prompt_cache:
-            del self._prompt_cache[index]
-
-        # Shift cache indices down
-        self._prompt_cache = self._reindex_cache(self._prompt_cache, index)
 
         # Recompute blended embeddings
         self._apply_prompt_blending(prompt_interpolation_method)

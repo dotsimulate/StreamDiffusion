@@ -78,6 +78,7 @@ class _Manager:
         "fi_threshold",
         "cn_cache_interval",
         "cn_cache_decay",
+        "lora_weights",
     }
 
     def __init__(self):
@@ -305,7 +306,7 @@ class TestValidParamsMatchesSchema(unittest.TestCase):
     Drift lock (Stage 2 Increment 4): td_manager.py's runtime whitelist (now
     `set(param_schema.PARAM_NAMES)` in the real module -- see
     StreamDiffusionTD/td_manager.py::_apply_parameters) must stay exactly
-    the 26-name set param_schema.py owns. _Manager.VALID_PARAMS above is a
+    the 27-name set param_schema.py owns. _Manager.VALID_PARAMS above is a
     frozen replica of the *pre-refactor* literal list, kept here so this
     file never needs to import the real td_manager.py (CUDA/TD deps -- see
     module docstring). If param_schema.PARAM_NAMES ever adds/removes/renames

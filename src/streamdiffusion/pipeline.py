@@ -231,6 +231,21 @@ class StreamDiffusion:
         # warp attenuation and vice versa.
         self._fi_strength_base: float = fi_strength
 
+        # Runtime-adjustable LoRA weight — a [num_loras] fp32 vector, one entry per
+        # loaded adapter, index-aligned with stream._lora_order. LoRA loading happens
+        # in wrapper.py._load_model *after* this constructor returns (adapters are
+        # discovered from lora_dict there, not here), so this starts None and is set
+        # for real by that call once _lora_order is known. Unlike fi_strength there is
+        # no per-frame recomputation in unet_step — only stream_parameter_updater
+        # mutates it in place (CUDA-graph-safe: same device address across frames).
+        self._lora_scale_tensor: Optional[torch.Tensor] = None
+
+        # Ordered (path, adapter_name) list wrapper.py._load_model populates once LoRA
+        # adapters are discovered from lora_dict — the index<->path mapping consumed by
+        # unet_unified_export.py and stream_parameter_updater.py. Declared here (not just
+        # assigned dynamically in wrapper.py) so static type checking can resolve it.
+        self._lora_order: List[Tuple[str, str]] = []
+
         # Pre-allocated CUDA timing events — reused every frame via .record()
         self._timing_start = torch.cuda.Event(enable_timing=True)
         self._timing_end = torch.cuda.Event(enable_timing=True)
@@ -1215,6 +1230,7 @@ class StreamDiffusion:
                             fio_cache=self.fio_cache,
                             fi_strength=self._fi_strength_tensor,
                             fi_threshold=self._fi_threshold_tensor,
+                            lora_scale=self._lora_scale_tensor,
                             **extra_kwargs,
                             # For TRT engines, ensure SDXL cond shapes match engine builds; if engine expects 81 tokens (77+4), append dummy image tokens when none
                             **added_cond_kwargs,  # SDXL conditioning as kwargs
@@ -1273,6 +1289,7 @@ class StreamDiffusion:
                     ip_scale_kw["fio_cache"] = self.fio_cache
                     ip_scale_kw["fi_strength"] = self._fi_strength_tensor
                     ip_scale_kw["fi_threshold"] = self._fi_threshold_tensor
+                    ip_scale_kw["lora_scale"] = self._lora_scale_tensor
 
                 _unet_result = self.unet(
                     x_t_latent_plus_uc,
