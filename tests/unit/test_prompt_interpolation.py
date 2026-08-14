@@ -237,9 +237,9 @@ class TestApplyPromptBlendingDispatch:
         e2 = _rand_embed(seed=21)
         e3 = _rand_embed(seed=22)
         self.upd._prompt_cache = {
-            0: {"embed": e1, "text": "cat"},
-            1: {"embed": e2, "text": "dog"},
-            2: {"embed": e3, "text": "bird"},
+            "cat": {"embed": e1},
+            "dog": {"embed": e2},
+            "bird": {"embed": e3},
         }
         self.upd._current_prompt_list = [("cat", 0.5), ("dog", 0.3), ("bird", 0.2)]
         self.upd._current_negative_prompt = ""
@@ -635,7 +635,7 @@ class TestStickyInterpolationMethods:
         self.upd = _make_updater()
         e1 = _rand_embed(seed=100)
         e2 = _rand_embed(seed=101)
-        self.upd._prompt_cache = {0: {"embed": e1, "text": "cat"}, 1: {"embed": e2, "text": "dog"}}
+        self.upd._prompt_cache = {"cat": {"embed": e1}, "dog": {"embed": e2}}
         self.upd._current_prompt_list = [("cat", 0.5), ("dog", 0.5)]
         self.upd._current_negative_prompt = ""
 

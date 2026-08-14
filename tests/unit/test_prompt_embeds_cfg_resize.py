@@ -62,7 +62,7 @@ def _make_cfg_updater(stream, prompt="cat"):
     has something to re-blend) and the lock/warn-once flags
     update_stream_params reads unconditionally."""
     updater = _make_updater(stream)
-    updater._prompt_cache = {0: {"embed": torch.full((1, TOKENS, HIDDEN), COND_VALUE), "text": prompt}}
+    updater._prompt_cache = {prompt: {"embed": torch.full((1, TOKENS, HIDDEN), COND_VALUE)}}
     updater._current_prompt_list = [(prompt, 1.0)]
     updater._current_negative_prompt = ""
     updater._last_prompt_interpolation_method = "average"
