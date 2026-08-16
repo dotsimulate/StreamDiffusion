@@ -27,6 +27,7 @@ from streamdiffusion.param_schema import (
     compute_sub_timesteps,
     delta_noise_cancellation_ceiling,
     floor_num_inference_steps,
+    materialise_timestep_grid,
     rescale_t_index_list,
 )
 from streamdiffusion.stream_parameter_updater import StreamParameterUpdater
@@ -187,6 +188,115 @@ class TestComputeSubTimesteps:
         4-step calibration used to sample."""
         timesteps = [999 - 20 * j for j in range(50)]
         assert compute_sub_timesteps(timesteps, [15, 21, 27]) == [699, 579, 459]
+
+
+class _FakeGrid(list):
+    """List that also answers `.to(device)` like a torch tensor, so
+    materialise_timestep_grid's `.to(device)` calls work without pulling in
+    real tensors (this test file stays CPU-only / tensor-free, per its own
+    docstring)."""
+
+    def to(self, device):
+        return self
+
+
+class _FakeSchedulerConfig:
+    def __init__(self, timestep_spacing):
+        self.timestep_spacing = timestep_spacing
+
+
+class _FakeScheduler:
+    """Minimal stand-in for a diffusers scheduler: only the surface
+    materialise_timestep_grid touches (set_timesteps, .config.timestep_spacing,
+    .timesteps). set_timesteps ignores `timestep_spacing` entirely, mirroring
+    LCMScheduler's real behaviour (fact #2 of the trailing finding in
+    docs/plans/SDXL-Turbo_Research_Verification.md)."""
+
+    def __init__(self, native_grid, timestep_spacing):
+        self._native_grid = native_grid
+        self.config = _FakeSchedulerConfig(timestep_spacing)
+        self.timesteps = _FakeGrid()
+
+    def set_timesteps(self, num_inference_steps, device):
+        self.timesteps = _FakeGrid(self._native_grid[:num_inference_steps])
+
+
+class TestMaterialiseTimestepGrid:
+    """Coverage for the shared spacing-override helper. Every call site that
+    materialises a timestep grid -- prepare(), the fp8 calibration path, and
+    stream_parameter_updater.py's live num_inference_steps handler -- must
+    route through this, per its own docstring."""
+
+    # LCM native grid @ S=50, t_index=[4,8,12] (see probe_schedule.py output).
+    NATIVE_GRID = [919, 839, 759]
+
+    def test_normal_sampler_passes_through_native_grid_untouched(self):
+        scheduler = _FakeScheduler(self.NATIVE_GRID, timestep_spacing="trailing")
+        spaced_calls = []
+
+        def get_spaced_timesteps(spacing, num_inference_steps):
+            spaced_calls.append((spacing, num_inference_steps))
+            return _FakeGrid([0])  # would prove up if wrongly invoked
+
+        result = materialise_timestep_grid(
+            scheduler,
+            num_inference_steps=3,
+            sampler_type="normal",
+            device="cpu",
+            get_spaced_timesteps=get_spaced_timesteps,
+        )
+
+        assert list(result) == self.NATIVE_GRID
+        assert spaced_calls == []  # "normal" is not in _SPACING_SAMPLERS
+
+    def test_spacing_sampler_overrides_native_grid(self):
+        scheduler = _FakeScheduler(self.NATIVE_GRID, timestep_spacing="trailing")
+        spaced_grid = [900, 820, 740]  # e.g. ddim/leading at S=50
+
+        result = materialise_timestep_grid(
+            scheduler,
+            num_inference_steps=3,
+            sampler_type="ddim",
+            device="cpu",
+            get_spaced_timesteps=lambda spacing, s: _FakeGrid(spaced_grid),
+        )
+
+        assert list(result) == spaced_grid
+        assert list(scheduler.timesteps) == spaced_grid  # mutated in place too
+
+    def test_spacing_sampler_passes_scheduler_config_spacing_through(self):
+        scheduler = _FakeScheduler(self.NATIVE_GRID, timestep_spacing="trailing")
+        seen = {}
+
+        def get_spaced_timesteps(spacing, num_inference_steps):
+            seen["spacing"] = spacing
+            seen["num_inference_steps"] = num_inference_steps
+            return _FakeGrid([1, 2, 3])
+
+        materialise_timestep_grid(
+            scheduler,
+            num_inference_steps=3,
+            sampler_type="sgm_uniform",
+            device="cpu",
+            get_spaced_timesteps=get_spaced_timesteps,
+        )
+
+        assert seen == {"spacing": "trailing", "num_inference_steps": 3}
+
+    def test_unrecognised_spacing_falls_back_to_native_grid(self):
+        """A `timestep_spacing` outside {trailing, linspace, leading} leaves
+        the native grid untouched -- matches the `if spacing in (...)` guard."""
+        scheduler = _FakeScheduler(self.NATIVE_GRID, timestep_spacing="unknown")
+
+        result = materialise_timestep_grid(
+            scheduler,
+            num_inference_steps=3,
+            sampler_type="simple",
+            device="cpu",
+            get_spaced_timesteps=lambda spacing, s: _FakeGrid([0]),
+        )
+
+        assert list(result) == self.NATIVE_GRID
 
 
 class TestBuildCalibrationTIndices:

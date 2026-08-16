@@ -20,6 +20,34 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _detect_turbo_from_scheduler(pipe: Optional[Any]) -> Optional[bool]:
+    """Discriminate ADD-distilled Turbo checkpoints from their base counterparts via the
+    pipeline's *source* scheduler config, evaluated before StreamDiffusion swaps in its own
+    LCMScheduler/TCDScheduler (pipeline.py calls this at __init__ time, ahead of
+    _initialize_scheduler).
+
+    Both sd-turbo and sdxl-turbo ship an EulerAncestralDiscreteScheduler with
+    timestep_spacing="trailing" (see docs/plans/SDXL-Turbo_Research_Verification.md). Their
+    non-Turbo counterparts (SD2.1, SDXL-Base-1.0) do not. This replaces a UNet-config
+    heuristic that keyed off `time_cond_proj_dim`, which is actually the LCM-distillation
+    guidance-embedding dim: stock SDXL-Base-1.0 also has it `None` (false positive for
+    Turbo), and it says nothing about non-SDXL UNets at all (sd-turbo was never flagged
+    Turbo).
+
+    Returns None (undecided) rather than False when no pipe/scheduler is available to
+    check, so callers can tell "confirmed non-Turbo" apart from "couldn't check" and fall
+    back to a corroborating hint (e.g. the model-id string) if they have one.
+    """
+    if pipe is None:
+        return None
+    scheduler_config = getattr(getattr(pipe, "scheduler", None), "config", None)
+    if scheduler_config is None:
+        return None
+    class_name = getattr(scheduler_config, "_class_name", "") or ""
+    spacing = getattr(scheduler_config, "timestep_spacing", None)
+    return "EulerAncestralDiscreteScheduler" in class_name and spacing == "trailing"
+
+
 def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str, Any]:
     """
     Comprehensive and robust model detection using definitive architectural features.
@@ -65,16 +93,20 @@ def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str
     elif isinstance(model, UNet2DConditionModel):
         config = model.config
 
+        # `time_cond_proj_dim` is the LCM-distillation guidance-embedding dim, not a
+        # Turbo/Base signal (see _detect_turbo_from_scheduler's docstring). Turbo detection
+        # uses the source scheduler instead; `time_cond_proj_dim` is surfaced separately as
+        # `has_time_conditioning` via detect_unet_characteristics() below.
+        turbo_from_scheduler = _detect_turbo_from_scheduler(pipe)
+
         # 2a. SDXL vs. non-SDXL
         # The `addition_embed_type` is the clearest indicator for the SDXL architecture.
         if config.get("addition_embed_type") is not None:
             model_type = "SDXL"
             is_sdxl = True
             confidence = 1.0
-            # Differentiate SDXL-Base from SDXL-Turbo.
-            # Base SDXL has `time_cond_proj_dim` (e.g., 256), while Turbo has it set to `None`.
-            if config.get("time_cond_proj_dim") is None:
-                is_turbo = True
+            if turbo_from_scheduler is not None:
+                is_turbo = turbo_from_scheduler
 
         # 2b. SD2.1 vs. SD1.5 (if not SDXL)
         # Differentiate based on the text encoder's projection dimension.
@@ -83,6 +115,10 @@ def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str
             if cross_attention_dim == 1024:
                 model_type = "SD2.1"
                 confidence = 1.0
+                # sd-turbo is SD2.1-architecture (cross_attention_dim=1024); the old
+                # heuristic never set is_turbo on this branch at all.
+                if turbo_from_scheduler is not None:
+                    is_turbo = turbo_from_scheduler
             elif cross_attention_dim == 768:
                 model_type = "SD1.5"
                 confidence = 1.0
@@ -95,14 +131,15 @@ def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str
     elif hasattr(model, "config") and hasattr(model.config, "cross_attention_dim"):
         # ControlNet models have UNet-like configs, detect their base architecture
         config = model.config
+        turbo_from_scheduler = _detect_turbo_from_scheduler(pipe)
 
         # Apply same detection logic as UNet models
         if config.get("addition_embed_type") is not None:
             model_type = "SDXL"
             is_sdxl = True
             confidence = 0.95  # Slightly lower confidence for ControlNet
-            if config.get("time_cond_proj_dim") is None:
-                is_turbo = True
+            if turbo_from_scheduler is not None:
+                is_turbo = turbo_from_scheduler
         else:
             cross_attention_dim = config.get("cross_attention_dim")
             if cross_attention_dim == 1024:

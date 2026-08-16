@@ -1019,33 +1019,6 @@ class StreamDiffusion:
         """Get the current seed weight normalization setting."""
         return self._param_updater.get_normalize_seed_weights()
 
-    def set_scheduler(
-        self,
-        scheduler: Literal["lcm", "tcd"] = None,
-        sampler: Literal["simple", "sgm_uniform", "normal", "ddim", "beta", "karras"] = None,
-    ) -> None:
-        """
-        Change the scheduler and/or sampler at runtime.
-
-        Parameters
-        ----------
-        scheduler : str, optional
-            The scheduler type to use ("lcm" or "tcd"). If None, keeps current scheduler.
-        sampler : str, optional
-            The sampler type to use. If None, keeps current sampler.
-        """
-        if scheduler is not None:
-            self.scheduler_type = scheduler
-        if sampler is not None:
-            self.sampler_type = sampler
-
-        self.scheduler = self._initialize_scheduler(self.scheduler_type, self.sampler_type, self.pipe.scheduler.config)
-        logger.info(f"Scheduler changed to {self.scheduler_type} with {self.sampler_type} sampler")
-
-    def _uses_lcm_logic(self) -> bool:
-        """Return True if scheduler uses LCM-style consistency boundary-condition math."""
-        return isinstance(self.scheduler, LCMScheduler)
-
     def add_noise(
         self,
         original_samples: torch.Tensor,
