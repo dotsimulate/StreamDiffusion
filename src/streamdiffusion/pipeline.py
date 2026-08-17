@@ -23,7 +23,7 @@ from streamdiffusion.hooks import (
     UnetKwargsDelta,
 )
 from streamdiffusion.image_filter import SimilarImageFilter
-from streamdiffusion.model_detection import detect_model
+from streamdiffusion.model_detection import detect_model, resolve_is_turbo
 from streamdiffusion.param_schema import (
     VALID_CFG_TYPES,
     bleed_risk_message,
@@ -64,6 +64,7 @@ class StreamDiffusion:
         use_feature_injection: bool = False,
         fi_strength: float = 0.75,
         fi_threshold: float = 0.98,
+        is_turbo: Optional[bool] = None,
     ) -> None:
         self.device = torch.device(device)
         self.dtype = torch_dtype
@@ -99,11 +100,16 @@ class StreamDiffusion:
         self.scheduler_type = scheduler
         self.sampler_type = sampler
 
-        # Detect model type
+        # Detect model type. Turbo status is resolved once, authoritatively, by the caller
+        # (StreamDiffusionWrapper._load_model, via resolve_is_turbo) and passed in as
+        # `is_turbo` -- detect_model only reports architecture. The fallback below keeps
+        # direct StreamDiffusion(...) construction (examples, tests) working without a
+        # wrapper: it re-derives the scheduler-only signal via resolve_is_turbo itself,
+        # same as _load_model would for a non-single-file load.
         detection_result = detect_model(pipe.unet, pipe)
         self.model_type = detection_result["model_type"]
         self.is_sdxl = detection_result["is_sdxl"]
-        self.is_turbo = detection_result["is_turbo"]
+        self.is_turbo = is_turbo if is_turbo is not None else resolve_is_turbo(pipe=pipe)[0]
         self.detection_confidence = detection_result["confidence"]
 
         # TCD scheduler is incompatible with denoising batch optimization due to Strategic Stochastic Sampling

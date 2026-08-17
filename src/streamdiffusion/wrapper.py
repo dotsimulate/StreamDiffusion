@@ -9,7 +9,7 @@ from diffusers import AutoencoderTiny, AutoPipelineForText2Image, StableDiffusio
 from PIL import Image
 
 from .image_utils import postprocess_image
-from .model_detection import detect_model, resolve_is_turbo
+from .model_detection import detect_model, resolve_is_turbo, turbo_hint_from_model_id
 from .param_schema import (
     PromptInterpolationMethod,
     SeedInterpolationMethod,
@@ -616,11 +616,13 @@ class StreamDiffusionWrapper:
         # Store use_lcm_lora for backwards compatibility processing in _load_model
         self.use_lcm_lora = use_lcm_lora
 
-        # Explicit override wins outright; otherwise fall back to a case-insensitive
-        # model-id substring check until _load_model resolves the authoritative verdict
-        # (self._is_turbo, via resolve_is_turbo) and reconciles self.sd_turbo below.
+        # Explicit override wins outright; otherwise fall back to a basename-only "turbo"
+        # hint (same rule turbo_hint_from_model_id enforces, so a base model staged under
+        # a `turbo_tests/` parent directory isn't misclassified here either) until
+        # _load_model resolves the authoritative verdict via resolve_is_turbo and
+        # reconciles self.sd_turbo (self._is_turbo, set at the end of _load_model).
         self._is_turbo_override = is_turbo
-        self.sd_turbo = is_turbo if is_turbo is not None else ("turbo" in str(model_id_or_path).lower())
+        self.sd_turbo = is_turbo if is_turbo is not None else turbo_hint_from_model_id(model_id_or_path)
         self.use_controlnet = use_controlnet
         self.use_ipadapter = use_ipadapter
         self.ipadapter_config = ipadapter_config
@@ -2149,6 +2151,15 @@ class StreamDiffusionWrapper:
             f"is_turbo={is_turbo} (source={is_turbo_source})"
         )
 
+        # Adopt the authoritative verdict -- until now self.sd_turbo held the pre-load
+        # basename guess from __init__. Must precede the LCM-LoRA gate below.
+        if self.sd_turbo != is_turbo:
+            logger.info(
+                f"_load_model: sd_turbo {self.sd_turbo} -> {is_turbo} "
+                f"(pre-load path hint corrected by {is_turbo_source})"
+            )
+        self.sd_turbo = is_turbo
+
         # Auto-resolve IP-Adapter model/encoder paths for detected architecture.
         # Runs once here so both pre-TRT and post-TRT installation paths see the resolved cfg.
         if use_ipadapter and ipadapter_config:
@@ -2215,6 +2226,7 @@ class StreamDiffusionWrapper:
             cache_maxframes=cache_maxframes,
             fio_cache=[],  # Set below if FI is enabled
             use_feature_injection=use_feature_injection and use_cached_attn,
+            is_turbo=self._is_turbo,  # authoritative verdict from resolve_is_turbo above
         )
 
         # Create KVO cache tensors using the pipeline's actual runtime batch size.
@@ -2322,17 +2334,14 @@ class StreamDiffusionWrapper:
                 logger.info(f"Activated {len(lora_adapters_to_merge)} LoRA adapter(s) (live, unfused)")
             except Exception as activate_error:
                 raise RuntimeError(
-                    f"LoRA activation failed — cannot build engine with partial adapter state. "
-                    f"Error: {activate_error}"
+                    f"LoRA activation failed — cannot build engine with partial adapter state. Error: {activate_error}"
                 ) from activate_error
 
         # Ordered adapter list — the index<->path mapping the export wrapper
         # (unet_unified_export.py) and the runtime updater (stream_parameter_updater.py)
         # both need to translate a lora_scale tensor slot back to a LoRA path. Path
         # normalized to forward slashes to match the YAML config builder's convention.
-        stream._lora_order = [
-            (_loaded_adapter_names[a][0].replace("\\", "/"), a) for a in lora_adapters_to_merge
-        ]
+        stream._lora_order = [(_loaded_adapter_names[a][0].replace("\\", "/"), a) for a in lora_adapters_to_merge]
 
         # Persistent fp32 [num_loras] tensor — the runtime lora_scale engine input.
         # Initialized to the configured per-LoRA weights (not 1.0) so the very first
@@ -3001,6 +3010,13 @@ class StreamDiffusionWrapper:
                         # guidance_scale still follows the turbo/non-turbo split (matches
                         # inference CFG); this axis is independent of *which* timesteps are
                         # calibrated, so it rides alongside the schedule derivation below.
+                        # Not covered by a live unit test: reaching this line means driving
+                        # _load_model all the way through real StreamDiffusion construction
+                        # plus engine-path resolution, which is well past the abort-after-
+                        # reconciliation seam the wrapper turbo-detection tests use (see
+                        # tests/unit/test_wrapper_sd_turbo_reconciliation.py's skipped
+                        # test_fp8_guidance_scale_follows_resolved_verdict for why, and what
+                        # would be needed to cover it directly).
                         _unet_build_opts["fp8_guidance_scale"] = 0.0 if _is_turbo else 7.5
 
                         # --- band-based, config-derived calibration schedule ---

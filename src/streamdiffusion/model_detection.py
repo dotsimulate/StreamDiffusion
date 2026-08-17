@@ -167,7 +167,12 @@ def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str
         A dictionary with detailed information about the detected model.
     """
     model_type = "Unknown"
-    is_turbo = False
+    # Optional[bool]: None = undecided (no pipe / scheduler available to check), True/False =
+    # a decision based on the *source* scheduler. This is a signal, not a verdict -- Turbo
+    # detection is resolved once, authoritatively, by resolve_is_turbo(); detect_model no
+    # longer collapses this into a bool of its own (see resolve_is_turbo's docstring for why
+    # a pipe-less scheduler check must never be read as "confirmed non-Turbo").
+    turbo_from_scheduler = None
     is_sdxl = False
     is_sd3 = False
     confidence = 0.0
@@ -186,7 +191,7 @@ def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str
             if pipe and hasattr(pipe, "scheduler"):
                 scheduler_name = getattr(pipe.scheduler.config, "_class_name", "").lower()
                 if "lcm" in scheduler_name or "turbo" in scheduler_name:
-                    is_turbo = True
+                    turbo_from_scheduler = True
                     model_type = "SD3-Turbo"
         else:
             model_type = "Unknown MMDiT"
@@ -208,8 +213,6 @@ def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str
             model_type = "SDXL"
             is_sdxl = True
             confidence = 1.0
-            if turbo_from_scheduler is not None:
-                is_turbo = turbo_from_scheduler
 
         # 2b. SD2.1 vs. SD1.5 (if not SDXL)
         # Differentiate based on the text encoder's projection dimension.
@@ -220,8 +223,6 @@ def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str
                 confidence = 1.0
                 # sd-turbo is SD2.1-architecture (cross_attention_dim=1024); the old
                 # heuristic never set is_turbo on this branch at all.
-                if turbo_from_scheduler is not None:
-                    is_turbo = turbo_from_scheduler
             elif cross_attention_dim == 768:
                 model_type = "SD1.5"
                 confidence = 1.0
@@ -241,8 +242,6 @@ def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str
             model_type = "SDXL"
             is_sdxl = True
             confidence = 0.95  # Slightly lower confidence for ControlNet
-            if turbo_from_scheduler is not None:
-                is_turbo = turbo_from_scheduler
         else:
             cross_attention_dim = config.get("cross_attention_dim")
             if cross_attention_dim == 1024:
@@ -296,7 +295,7 @@ def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str
 
     result = {
         "model_type": model_type,
-        "is_turbo": is_turbo,
+        "turbo_from_scheduler": turbo_from_scheduler,
         "is_sdxl": is_sdxl,
         "is_sd3": is_sd3,
         "confidence": confidence,

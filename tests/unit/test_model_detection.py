@@ -102,22 +102,26 @@ class TestDetectTurboFromScheduler:
 
 
 class TestDetectModelIsTurbo:
-    """End-to-end: detect_model(unet, pipe)['is_turbo'] for the three checkpoints
-    named in the verification doc's defect 2."""
+    """End-to-end: detect_model(unet, pipe)['turbo_from_scheduler'] for the three
+    checkpoints named in the verification doc's defect 2.
+
+    detect_model() no longer collapses this into a bool of its own -- it reports
+    the Optional[bool] scheduler signal verbatim; resolve_is_turbo() is the sole
+    place that resolves it into an authoritative Turbo/non-Turbo decision."""
 
     def test_sd_turbo_is_turbo(self):
         unet = _fake_unet(SD_TURBO_UNET_CONFIG)
         pipe = _fake_pipe(*TURBO_SCHEDULER)
         result = detect_model(unet, pipe)
         assert result["model_type"] == "SD2.1"
-        assert result["is_turbo"] is True
+        assert result["turbo_from_scheduler"] is True
 
     def test_sdxl_turbo_is_turbo(self):
         unet = _fake_unet(SDXL_TURBO_UNET_CONFIG)
         pipe = _fake_pipe(*TURBO_SCHEDULER)
         result = detect_model(unet, pipe)
         assert result["model_type"] == "SDXL"
-        assert result["is_turbo"] is True
+        assert result["turbo_from_scheduler"] is True
 
     def test_sdxl_base_is_not_turbo(self):
         """The regression case: sdxl-base-1.0's UNet config is indistinguishable
@@ -127,16 +131,30 @@ class TestDetectModelIsTurbo:
         pipe = _fake_pipe(*SDXL_BASE_SCHEDULER)
         result = detect_model(unet, pipe)
         assert result["model_type"] == "SDXL"
-        assert result["is_turbo"] is False
+        assert result["turbo_from_scheduler"] is False
 
-    def test_no_pipe_defaults_is_turbo_false(self):
-        """No pipe -> _detect_turbo_from_scheduler returns None -> is_turbo keeps
-        its initial False rather than being set. Matches the two non-pipe call
-        sites (unet_sdxl_export.py, controlnet_models.py) whose is_turbo output
-        is confirmed dead downstream."""
+    def test_no_pipe_is_undecided(self):
+        """No pipe -> _detect_turbo_from_scheduler returns None -> turbo_from_scheduler
+        stays None (undecided), not False. Matches the two non-pipe call sites
+        (unet_sdxl_export.py, controlnet_models.py), which no longer even read this
+        key -- Turbo status there is resolved authoritatively on the wrapper via
+        resolve_is_turbo(), never re-derived from a pipe-less detect_model() call."""
         unet = _fake_unet(SDXL_TURBO_UNET_CONFIG)
         result = detect_model(unet, pipe=None)
-        assert result["is_turbo"] is False
+        assert result["turbo_from_scheduler"] is None
+
+    def test_is_turbo_key_not_reintroduced(self):
+        """Tripwire: detect_model()'s output must never carry a collapsed
+        "is_turbo" bool again. Both unet_sdxl_export.py's get_sdxl_tensorrt_config
+        and controlnet_models.py's ControlNetSDXLTRT build a config dict straight
+        from this return value without an intermediate allowlist -- if "is_turbo"
+        reappeared here, either site would silently start propagating a stale
+        pipe-less signal instead of the wrapper's authoritative resolve_is_turbo()
+        verdict."""
+        unet = _fake_unet(SDXL_TURBO_UNET_CONFIG)
+        result = detect_model(unet, pipe=_fake_pipe(*TURBO_SCHEDULER))
+        assert "is_turbo" not in result
+        assert "turbo_from_scheduler" in result
 
 
 class TestDetectTurboFromSchedulerClassNameFallback:
