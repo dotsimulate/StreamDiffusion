@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 
 from diffusers.configuration_utils import FrozenDict
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
+from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteScheduler
 
 from streamdiffusion.model_detection import _detect_turbo_from_scheduler, detect_model
 
@@ -127,3 +128,32 @@ class TestDetectModelIsTurbo:
         unet = _fake_unet(SDXL_TURBO_UNET_CONFIG)
         result = detect_model(unet, pipe=None)
         assert result["is_turbo"] is False
+
+
+class TestDetectTurboFromSchedulerClassNameFallback:
+    """dotsimulate PR #58 gap, part 1: `_class_name` is only present on configs
+    loaded from a JSON scheduler_config.json (from_pretrained). A scheduler built
+    via `.from_config(...)` -- diffusers' `_legacy_load_scheduler` synthesized-
+    defaults path for single-file loads -- has no `_class_name` key at all, so the
+    old `getattr(scheduler_config, "_class_name", "")` silently degraded to "" and
+    every such scheduler read as non-Turbo regardless of its real class."""
+
+    def test_class_name_absent_falls_back_to_runtime_class(self):
+        # Real diffusers object, not a FrozenDict stand-in: from_config never
+        # stamps `_class_name` onto the resulting config (verified empirically).
+        scheduler = EulerAncestralDiscreteScheduler.from_config(
+            {"num_train_timesteps": 1000, "timestep_spacing": "trailing"}
+        )
+        assert "_class_name" not in scheduler.config
+
+        pipe = MagicMock()
+        pipe.scheduler = scheduler
+        assert _detect_turbo_from_scheduler(pipe) is True
+
+    def test_class_name_absent_non_trailing_is_not_turbo(self):
+        scheduler = EulerAncestralDiscreteScheduler.from_config(
+            {"num_train_timesteps": 1000, "timestep_spacing": "leading"}
+        )
+        pipe = MagicMock()
+        pipe.scheduler = scheduler
+        assert _detect_turbo_from_scheduler(pipe) is False

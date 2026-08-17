@@ -40,10 +40,16 @@ def _detect_turbo_from_scheduler(pipe: Optional[Any]) -> Optional[bool]:
     """
     if pipe is None:
         return None
-    scheduler_config = getattr(getattr(pipe, "scheduler", None), "config", None)
+    scheduler = getattr(pipe, "scheduler", None)
+    scheduler_config = getattr(scheduler, "config", None)
     if scheduler_config is None:
         return None
-    class_name = getattr(scheduler_config, "_class_name", "") or ""
+    # `_class_name` is only present on configs loaded from a JSON scheduler_config.json
+    # (from_pretrained). A scheduler built via `.from_config(...)` -- e.g. diffusers'
+    # single-file `_legacy_load_scheduler` synthesized-defaults path -- has no
+    # `_class_name` at all, which used to silently degrade this check to False. The
+    # runtime class name is always correct regardless of construction path.
+    class_name = getattr(scheduler_config, "_class_name", "") or type(scheduler).__name__
     spacing = getattr(scheduler_config, "timestep_spacing", None)
     return "EulerAncestralDiscreteScheduler" in class_name and spacing == "trailing"
 
