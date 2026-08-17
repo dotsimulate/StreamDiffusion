@@ -616,11 +616,11 @@ class StreamDiffusionWrapper:
         # Store use_lcm_lora for backwards compatibility processing in _load_model
         self.use_lcm_lora = use_lcm_lora
 
-        # Explicit override wins outright; otherwise fall back to a model-id substring
-        # check until _load_model resolves the authoritative verdict (self._is_turbo,
-        # via resolve_is_turbo) and reconciles self.sd_turbo below.
+        # Explicit override wins outright; otherwise fall back to a case-insensitive
+        # model-id substring check until _load_model resolves the authoritative verdict
+        # (self._is_turbo, via resolve_is_turbo) and reconciles self.sd_turbo below.
         self._is_turbo_override = is_turbo
-        self.sd_turbo = is_turbo if is_turbo is not None else ("turbo" in model_id_or_path)
+        self.sd_turbo = is_turbo if is_turbo is not None else ("turbo" in str(model_id_or_path).lower())
         self.use_controlnet = use_controlnet
         self.use_ipadapter = use_ipadapter
         self.ipadapter_config = ipadapter_config
