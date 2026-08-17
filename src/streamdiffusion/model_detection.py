@@ -1,6 +1,7 @@
 """Comprehensive model detection for TensorRT and pipeline support"""
 
-from typing import Any, Dict, Optional
+import os
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
@@ -52,6 +53,102 @@ def _detect_turbo_from_scheduler(pipe: Optional[Any]) -> Optional[bool]:
     class_name = getattr(scheduler_config, "_class_name", "") or type(scheduler).__name__
     spacing = getattr(scheduler_config, "timestep_spacing", None)
     return "EulerAncestralDiscreteScheduler" in class_name and spacing == "trailing"
+
+
+def read_safetensors_metadata(path: Optional[str]) -> Dict[str, str]:
+    """Header-only read of a `.safetensors` file's `__metadata__` block. No tensor
+    weights are loaded -- `safe_open` reads only the JSON header. Returns `{}` on any
+    failure (missing file, not a local path (repo id/URL), not a safetensors file,
+    corrupt header) rather than raising, so callers can treat metadata as
+    always-available-but-possibly-empty.
+    """
+    if not path:
+        return {}
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return {}
+    try:
+        with safe_open(path, framework="pt") as f:
+            return dict(f.metadata() or {})
+    except Exception:
+        return {}
+
+
+def turbo_from_checkpoint_metadata(path: Optional[str]) -> Optional[bool]:
+    """True/False when the checkpoint carries a SAI Model Spec
+    `modelspec.architecture` tag (e.g. "stable-diffusion-xl-turbo-v1" vs
+    "stable-diffusion-xl-v1-base"). None when the tag is absent, which is the common
+    case for community merges -- callers should fall back to a weaker signal rather
+    than treat None as a negative.
+    """
+    architecture = read_safetensors_metadata(path).get("modelspec.architecture")
+    if not architecture:
+        return None
+    return "turbo" in architecture.lower()
+
+
+def turbo_hint_from_model_id(model_id_or_path: Optional[str]) -> bool:
+    """Case-insensitive "turbo" match on the checkpoint's file *basename* only.
+    Deliberately ignores parent directories, so a base model staged under a path
+    like `D:/turbo_tests/sdxl_base.safetensors` is not misclassified. This is the
+    weakest signal in resolve_is_turbo's precedence -- a naming convention, not a
+    guarantee -- so it is consulted last.
+    """
+    if not model_id_or_path:
+        return False
+    basename = os.path.basename(str(model_id_or_path))
+    return "turbo" in basename.lower()
+
+
+def resolve_is_turbo(
+    *,
+    pipe: Optional[Any] = None,
+    explicit: Optional[bool] = None,
+    model_id_or_path: Optional[str] = None,
+    loaded_via_single_file: bool = False,
+) -> Tuple[bool, str]:
+    """Resolve whether the loaded checkpoint is an ADD-distilled Turbo variant.
+
+    Closes the gap flagged in dotsimulate's PR #58 review: `_detect_turbo_from_scheduler`
+    depends on `pipe.scheduler.config` reflecting the checkpoint's own published
+    scheduler_config.json. That holds for `from_pretrained` loads (repo id or a local
+    diffusers-format directory) but not for `from_single_file` -- diffusers borrows a
+    *reference repo's* scheduler config for the checkpoint's declared architecture family
+    (e.g. an SDXL-Turbo `.safetensors` merge inherits SDXL-Base's `EulerDiscreteScheduler`),
+    so the scheduler check returns a confident but wrong verdict there, not an "undecided"
+    one. This function therefore only trusts the scheduler for non-single-file loads and
+    falls back to checkpoint-embedded metadata, then a filename hint, for single-file ones.
+
+    Precedence (highest to lowest):
+      1. `explicit` -- caller-supplied override, wins outright.
+      2. Scheduler config -- only when `loaded_via_single_file` is False.
+      3. `.safetensors` `modelspec.architecture` metadata -- single-file loads only; a
+         present verdict is authoritative and can VETO a misleading filename.
+      4. "turbo" substring in the file basename -- single-file loads only, last resort.
+      5. Nothing decisive -- False, tagged "undecided" so callers can warn that no
+         automatic signal exists and an explicit override is needed.
+
+    Returns `(is_turbo, reason)` where `reason` is one of "explicit", "scheduler",
+    "modelspec", "filename", "undecided".
+    """
+    if explicit is not None:
+        return bool(explicit), "explicit"
+
+    if not loaded_via_single_file:
+        scheduler_verdict = _detect_turbo_from_scheduler(pipe)
+        if scheduler_verdict is not None:
+            return scheduler_verdict, "scheduler"
+        return False, "undecided"
+
+    metadata_verdict = turbo_from_checkpoint_metadata(model_id_or_path)
+    if metadata_verdict is not None:
+        return metadata_verdict, "modelspec"
+
+    if turbo_hint_from_model_id(model_id_or_path):
+        return True, "filename"
+
+    return False, "undecided"
 
 
 def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str, Any]:

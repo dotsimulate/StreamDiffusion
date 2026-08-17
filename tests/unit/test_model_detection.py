@@ -19,11 +19,20 @@ CPU-only, no CUDA required, no network access, no model weights loaded.
 
 from unittest.mock import MagicMock
 
+import torch
 from diffusers.configuration_utils import FrozenDict
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
 from diffusers.schedulers.scheduling_euler_ancestral_discrete import EulerAncestralDiscreteScheduler
+from safetensors.torch import save_file
 
-from streamdiffusion.model_detection import _detect_turbo_from_scheduler, detect_model
+from streamdiffusion.model_detection import (
+    _detect_turbo_from_scheduler,
+    detect_model,
+    read_safetensors_metadata,
+    resolve_is_turbo,
+    turbo_from_checkpoint_metadata,
+    turbo_hint_from_model_id,
+)
 
 
 def _fake_unet(config: dict) -> MagicMock:
@@ -157,3 +166,167 @@ class TestDetectTurboFromSchedulerClassNameFallback:
         pipe = MagicMock()
         pipe.scheduler = scheduler
         assert _detect_turbo_from_scheduler(pipe) is False
+
+
+class TestSafetensorsMetadata:
+    """dotsimulate PR #58 gap, part 2: for single-file loads, corroborate (or veto)
+    the unreliable scheduler signal with the checkpoint's own embedded SAI Model
+    Spec `modelspec.architecture` tag, read header-only (no weights loaded)."""
+
+    def _write_checkpoint(self, tmp_path, metadata=None):
+        path = str(tmp_path / "model.safetensors")
+        save_file({"weight": torch.zeros(2, 2)}, path, metadata=metadata)
+        return path
+
+    def test_read_safetensors_metadata_returns_embedded_dict(self, tmp_path):
+        path = self._write_checkpoint(tmp_path, {"modelspec.architecture": "stable-diffusion-xl-turbo-v1"})
+        assert read_safetensors_metadata(path) == {"modelspec.architecture": "stable-diffusion-xl-turbo-v1"}
+
+    def test_read_safetensors_metadata_missing_file_returns_empty_dict(self):
+        assert read_safetensors_metadata("D:/does/not/exist.safetensors") == {}
+
+    def test_read_safetensors_metadata_none_path_returns_empty_dict(self):
+        assert read_safetensors_metadata(None) == {}
+
+    def test_turbo_from_checkpoint_metadata_turbo_architecture(self, tmp_path):
+        path = self._write_checkpoint(tmp_path, {"modelspec.architecture": "stable-diffusion-xl-turbo-v1"})
+        assert turbo_from_checkpoint_metadata(path) is True
+
+    def test_turbo_from_checkpoint_metadata_base_architecture_is_veto(self, tmp_path):
+        """A confirmed non-Turbo architecture tag is a genuine negative -- this is
+        the case that must be able to override a misleading "turbo" filename."""
+        path = self._write_checkpoint(tmp_path, {"modelspec.architecture": "stable-diffusion-xl-v1-base"})
+        assert turbo_from_checkpoint_metadata(path) is False
+
+    def test_turbo_from_checkpoint_metadata_absent_is_undecided(self, tmp_path):
+        """The common case for community merges: no modelspec metadata at all."""
+        path = self._write_checkpoint(tmp_path, metadata=None)
+        assert turbo_from_checkpoint_metadata(path) is None
+
+
+class TestTurboHintFromModelId:
+    def test_turbo_in_basename_is_true(self):
+        assert turbo_hint_from_model_id("D:/models/SDXL-Turbo-merge.safetensors") is True
+
+    def test_turbo_case_insensitive(self):
+        assert turbo_hint_from_model_id("D:/models/sdxl_TURBO_merge.safetensors") is True
+
+    def test_turbo_in_parent_dir_only_is_false(self):
+        """Guard case: a base checkpoint staged under a `turbo_tests/` directory
+        must not be misread as a Turbo checkpoint from its path alone."""
+        assert turbo_hint_from_model_id("D:/turbo_tests/sdxl_base.safetensors") is False
+
+    def test_no_hint_is_false(self):
+        assert turbo_hint_from_model_id("D:/models/sdxl_base.safetensors") is False
+
+    def test_none_is_false(self):
+        assert turbo_hint_from_model_id(None) is False
+
+
+class TestResolveIsTurbo:
+    """Precedence-matrix tests covering the 7 validated cases from the plan plus
+    both explicit-override directions."""
+
+    def _checkpoint(self, tmp_path, metadata=None):
+        path = str(tmp_path / "model.safetensors")
+        save_file({"weight": torch.zeros(2, 2)}, path, metadata=metadata)
+        return path
+
+    def test_explicit_true_wins_outright(self, tmp_path):
+        path = self._checkpoint(tmp_path, {"modelspec.architecture": "stable-diffusion-xl-v1-base"})
+        is_turbo, source = resolve_is_turbo(explicit=True, model_id_or_path=path, loaded_via_single_file=True)
+        assert (is_turbo, source) == (True, "explicit")
+
+    def test_explicit_false_wins_outright(self):
+        pipe = _fake_pipe(*TURBO_SCHEDULER)
+        is_turbo, source = resolve_is_turbo(
+            pipe=pipe, explicit=False, model_id_or_path="turbo.safetensors", loaded_via_single_file=False
+        )
+        assert (is_turbo, source) == (False, "explicit")
+
+    def test_repo_id_load_trusts_scheduler(self):
+        """stabilityai/sdxl-turbo / stabilityai/sd-turbo (repo id) case: unchanged,
+        deployed behaviour."""
+        pipe = _fake_pipe(*TURBO_SCHEDULER)
+        is_turbo, source = resolve_is_turbo(
+            pipe=pipe, model_id_or_path="stabilityai/sdxl-turbo", loaded_via_single_file=False
+        )
+        assert (is_turbo, source) == (True, "scheduler")
+
+    def test_repo_id_base_load_trusts_scheduler(self):
+        """sdxl-base-1.0 (repo id) case."""
+        pipe = _fake_pipe(*SDXL_BASE_SCHEDULER)
+        is_turbo, source = resolve_is_turbo(
+            pipe=pipe, model_id_or_path="stabilityai/stable-diffusion-xl-base-1.0", loaded_via_single_file=False
+        )
+        assert (is_turbo, source) == (False, "scheduler")
+
+    def test_single_file_ignores_scheduler_even_if_present(self, tmp_path):
+        """The core gap: a from_single_file load's pipe carries a scheduler (the
+        *reference repo's*, not the checkpoint's own), but it must never be
+        trusted -- only metadata/filename corroborate single-file loads."""
+        path = self._checkpoint(tmp_path, {"modelspec.architecture": "stable-diffusion-xl-turbo-v1"})
+        pipe = _fake_pipe(*SDXL_BASE_SCHEDULER)  # would say False if trusted
+        is_turbo, source = resolve_is_turbo(pipe=pipe, model_id_or_path=path, loaded_via_single_file=True)
+        assert (is_turbo, source) == (True, "modelspec")
+
+    def test_single_file_community_sdxl_turbo_merge(self, tmp_path):
+        """community SDXL-Turbo merge `.safetensors`: no modelspec metadata, name
+        says turbo."""
+        path = str(tmp_path / "SDXL-Turbo-merge.safetensors")
+        save_file({"weight": torch.zeros(2, 2)}, path)
+        is_turbo, source = resolve_is_turbo(model_id_or_path=path, loaded_via_single_file=True)
+        assert (is_turbo, source) == (True, "filename")
+
+    def test_single_file_community_sd_turbo_merge(self, tmp_path):
+        """community sd-turbo merge `.safetensors`: same shape, non-SDXL name."""
+        path = str(tmp_path / "sd-turbo-merge.safetensors")
+        save_file({"weight": torch.zeros(2, 2)}, path)
+        is_turbo, source = resolve_is_turbo(model_id_or_path=path, loaded_via_single_file=True)
+        assert (is_turbo, source) == (True, "filename")
+
+    def test_single_file_metadata_vetoes_misleading_filename(self, tmp_path):
+        """modelspec.architecture outranks the filename hint: a confirmed-base
+        checkpoint stays False even if someone names the file "turbo"."""
+        path = str(tmp_path / "totally_turbo.safetensors")
+        save_file(
+            {"weight": torch.zeros(2, 2)}, path, metadata={"modelspec.architecture": "stable-diffusion-xl-v1-base"}
+        )
+        is_turbo, source = resolve_is_turbo(model_id_or_path=path, loaded_via_single_file=True)
+        assert (is_turbo, source) == (False, "modelspec")
+
+    def test_guard_base_dir_under_turbo_tests(self, tmp_path):
+        """guard: base checkpoint's directory contains "turbo" but its own
+        basename doesn't -- must not be misclassified."""
+        turbo_dir = tmp_path / "turbo_tests"
+        turbo_dir.mkdir()
+        path = str(turbo_dir / "sdxl_base.safetensors")
+        save_file({"weight": torch.zeros(2, 2)}, path)
+        is_turbo, source = resolve_is_turbo(model_id_or_path=path, loaded_via_single_file=True)
+        assert (is_turbo, source) == (False, "undecided")
+
+    def test_guard_base_safetensors_in_turbo_dir_with_metadata_veto(self, tmp_path):
+        """guard: base checkpoint under a turbo-named directory, this time with an
+        explicit base modelspec tag -- still False."""
+        turbo_dir = tmp_path / "turbo_tests"
+        turbo_dir.mkdir()
+        path = str(turbo_dir / "sdxl_base.safetensors")
+        save_file(
+            {"weight": torch.zeros(2, 2)}, path, metadata={"modelspec.architecture": "stable-diffusion-xl-v1-base"}
+        )
+        is_turbo, source = resolve_is_turbo(model_id_or_path=path, loaded_via_single_file=True)
+        assert (is_turbo, source) == (False, "modelspec")
+
+    def test_single_file_nothing_decisive_is_undecided(self, tmp_path):
+        """sdxl_merged.safetensors case: no metadata, no filename hint -- False,
+        tagged "undecided" so the fp8 build path can warn."""
+        path = str(tmp_path / "sdxl_merged.safetensors")
+        save_file({"weight": torch.zeros(2, 2)}, path)
+        is_turbo, source = resolve_is_turbo(model_id_or_path=path, loaded_via_single_file=True)
+        assert (is_turbo, source) == (False, "undecided")
+
+    def test_no_pipe_no_path_repo_id_load_is_undecided(self):
+        """Defensive: a from_pretrained-flagged load with no pipe at all (pipe=None)
+        has no scheduler to consult and falls straight to undecided."""
+        is_turbo, source = resolve_is_turbo(pipe=None, model_id_or_path=None, loaded_via_single_file=False)
+        assert (is_turbo, source) == (False, "undecided")

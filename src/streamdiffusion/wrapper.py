@@ -9,7 +9,7 @@ from diffusers import AutoencoderTiny, AutoPipelineForText2Image, StableDiffusio
 from PIL import Image
 
 from .image_utils import postprocess_image
-from .model_detection import detect_model
+from .model_detection import detect_model, resolve_is_turbo
 from .param_schema import (
     PromptInterpolationMethod,
     SeedInterpolationMethod,
@@ -345,6 +345,13 @@ class StreamDiffusionWrapper:
         acceleration: Literal["none", "xformers", "tensorrt"] = "tensorrt",
         do_add_noise: bool = True,
         device_ids: Optional[List[int]] = None,
+        # Explicit override for Turbo-checkpoint detection. None (default) auto-detects via
+        # (in order) the loaded pipe's scheduler config, then — for single-file loads only,
+        # where the scheduler config is unreliable (see model_detection.resolve_is_turbo) —
+        # the checkpoint's embedded modelspec.architecture metadata, then a "turbo" substring
+        # in the file basename. Set True/False to bypass auto-detection entirely, e.g. for a
+        # community merge with a misleading filename and no embedded metadata.
+        is_turbo: Optional[bool] = None,
         use_lcm_lora: Optional[bool] = None,  # DEPRECATED: Backwards compatibility parameter
         use_tiny_vae: bool = True,
         enable_similar_image_filter: bool = False,
@@ -489,6 +496,14 @@ class StreamDiffusionWrapper:
             by default True.
         device_ids : Optional[List[int]], optional
             The device ids to use for DataParallel, by default None.
+        is_turbo : Optional[bool], optional
+            Explicit override for Turbo-checkpoint detection, by default None (auto-detect).
+            Auto-detection trusts the loaded pipe's scheduler config for repo-id/directory
+            loads; for single-file (.safetensors/.ckpt) loads that signal is unreliable
+            (diffusers borrows a reference repo's scheduler config), so it falls back to the
+            checkpoint's embedded modelspec.architecture metadata, then a "turbo" substring in
+            the file basename. Set True/False directly when neither corroborating signal is
+            available (e.g. a community merge with a misleading filename and no metadata).
         use_lcm_lora : Optional[bool], optional
             DEPRECATED: Use lora_dict instead. For backwards compatibility only.
             If True, automatically adds appropriate LCM LoRA to lora_dict based on model type.
@@ -601,7 +616,11 @@ class StreamDiffusionWrapper:
         # Store use_lcm_lora for backwards compatibility processing in _load_model
         self.use_lcm_lora = use_lcm_lora
 
-        self.sd_turbo = "turbo" in model_id_or_path
+        # Explicit override wins outright; otherwise fall back to a model-id substring
+        # check until _load_model resolves the authoritative verdict (self._is_turbo,
+        # via resolve_is_turbo) and reconciles self.sd_turbo below.
+        self._is_turbo_override = is_turbo
+        self.sd_turbo = is_turbo if is_turbo is not None else ("turbo" in model_id_or_path)
         self.use_controlnet = use_controlnet
         self.use_ipadapter = use_ipadapter
         self.ipadapter_config = ipadapter_config
@@ -2017,12 +2036,19 @@ class StreamDiffusionWrapper:
             ]
 
         pipe = None
+        # Which loader actually produced the pipe -- resolve_is_turbo needs this because a
+        # from_single_file load's pipe.scheduler config is unreliable (see
+        # model_detection.resolve_is_turbo's docstring): it inherits a *reference repo's*
+        # scheduler config rather than the checkpoint's own, so a from_pretrained (repo id or
+        # local directory) load is the only case where the scheduler verdict alone is trusted.
+        loaded_via_single_file = False
         load_errors = []  # (method_name, exception) for every failed attempt, in order
         for method, method_name in loading_methods:
             try:
                 logger.info(f"_load_model: Attempting to load with {method_name}...")
                 pipe = method(model_id_or_path).to(dtype=self.dtype)
                 logger.info(f"_load_model: Successfully loaded using {method_name}")
+                loaded_via_single_file = "from_single_file" in method_name
 
                 # Verify that we have the right pipeline type for SDXL models
                 if is_sdxl_model and not isinstance(pipe, StableDiffusionXLPipeline):
@@ -2040,8 +2066,10 @@ class StreamDiffusionWrapper:
                         # structurally here.
                         if model_id_or_path.endswith(".safetensors") or os.path.exists(model_id_or_path):
                             pipe = StableDiffusionXLPipeline.from_single_file(model_id_or_path).to(dtype=self.dtype)
+                            loaded_via_single_file = True
                         else:
                             pipe = StableDiffusionXLPipeline.from_pretrained(model_id_or_path).to(dtype=self.dtype)
+                            loaded_via_single_file = False
                         logger.info("_load_model: Successfully loaded using SDXL pipeline on retry")
                     except Exception as retry_error:
                         # Discard the mismatched-type pipe so a subsequent loading-method
@@ -2096,16 +2124,30 @@ class StreamDiffusionWrapper:
         detection_result = detect_model(pipe.unet, pipe)
         model_type = detection_result["model_type"]
         is_sdxl = detection_result["is_sdxl"]
-        is_turbo = detection_result["is_turbo"]
         confidence = detection_result["confidence"]
+
+        # is_turbo is resolved separately from detect_model's own verdict: detect_model's
+        # scheduler-only check is confidently wrong (not merely undecided) for
+        # from_single_file loads (see resolve_is_turbo's docstring), so corroborate with
+        # checkpoint metadata / filename there, and let an explicit override win outright.
+        is_turbo, is_turbo_source = resolve_is_turbo(
+            pipe=pipe,
+            explicit=self._is_turbo_override,
+            model_id_or_path=model_id_or_path,
+            loaded_via_single_file=loaded_via_single_file,
+        )
 
         # Store comprehensive model info for later use (after TensorRT conversion)
         self._detected_model_type = model_type
         self._detection_confidence = confidence
         self._is_turbo = is_turbo
+        self._is_turbo_source = is_turbo_source
         self._is_sdxl = is_sdxl
 
-        logger.info(f"_load_model: Detected model type: {model_type} (confidence: {confidence:.2f})")
+        logger.info(
+            f"_load_model: Detected model type: {model_type} (confidence: {confidence:.2f}); "
+            f"is_turbo={is_turbo} (source={is_turbo_source})"
+        )
 
         # Auto-resolve IP-Adapter model/encoder paths for detected architecture.
         # Runs once here so both pre-TRT and post-TRT installation paths see the resolved cfg.
@@ -2929,6 +2971,23 @@ class StreamDiffusionWrapper:
                         _unet_build_opts["builder_optimization_level"] = self.builder_optimization_level
                     if fp8:
                         _is_turbo = getattr(self, "_is_turbo", False)
+                        _is_turbo_source = getattr(self, "_is_turbo_source", "undecided")
+                        if _is_turbo_source == "undecided":
+                            # No automatic signal decided is_turbo (e.g. a merged
+                            # .safetensors checkpoint with a name that doesn't say
+                            # "turbo" and no embedded modelspec.architecture metadata).
+                            # fp8_guidance_scale below silently falls back to the
+                            # non-turbo value (7.5) in this case -- flag it so a
+                            # misclassified turbo merge doesn't get calibrated against
+                            # the wrong guidance scale silently. Resolve via the
+                            # `is_turbo` config key / wrapper param.
+                            logger.warning(
+                                "[TRT] is_turbo could not be auto-detected for this "
+                                "checkpoint (no scheduler/metadata/filename signal); "
+                                f"defaulting to is_turbo={_is_turbo} for fp8 calibration. "
+                                "Set the `is_turbo` config key (or wrapper param) explicitly "
+                                "if this checkpoint is actually a Turbo/ADD-distilled model."
+                            )
                         _unet_build_opts["fp8"] = True
                         _unet_build_opts["onnx_opset"] = (
                             21  # FP8 Q/DQ scales with FP16 scale factors require opset ≥21
