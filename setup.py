@@ -52,7 +52,7 @@ _deps = [
     f"cuda-python{get_cuda_constraint()}",
     "xformers==0.0.30",
     "diffusers @ git+https://github.com/varshith15/diffusers.git@3e3b72f557e91546894340edabc845e894f00922",
-    "cuda-link @ https://github.com/forkni/cuda-link/releases/download/v1.12.1/cuda_link-1.12.1-cp311-cp311-win_amd64.whl ; sys_platform == 'win32' and python_version == \"3.11\"",
+    "cuda-link @ https://github.com/forkni/cuda-link/releases/download/v1.12.2/cuda_link-1.12.2-cp311-cp311-win_amd64.whl ; sys_platform == 'win32' and python_version == \"3.11\"",
     "transformers==4.56.0",
     "accelerate==1.13.0",
     "huggingface_hub==0.35.0",
