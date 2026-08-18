@@ -23,7 +23,7 @@ from streamdiffusion.hooks import (
     UnetKwargsDelta,
 )
 from streamdiffusion.image_filter import SimilarImageFilter
-from streamdiffusion.model_detection import detect_model
+from streamdiffusion.model_detection import detect_model, resolve_is_turbo
 from streamdiffusion.param_schema import (
     VALID_CFG_TYPES,
     bleed_risk_message,
@@ -64,6 +64,7 @@ class StreamDiffusion:
         use_feature_injection: bool = False,
         fi_strength: float = 0.75,
         fi_threshold: float = 0.98,
+        is_turbo: Optional[bool] = None,
     ) -> None:
         self.device = torch.device(device)
         self.dtype = torch_dtype
@@ -99,11 +100,16 @@ class StreamDiffusion:
         self.scheduler_type = scheduler
         self.sampler_type = sampler
 
-        # Detect model type
+        # Detect model type. Turbo status is resolved once, authoritatively, by the caller
+        # (StreamDiffusionWrapper._load_model, via resolve_is_turbo) and passed in as
+        # `is_turbo` -- detect_model only reports architecture. The fallback below keeps
+        # direct StreamDiffusion(...) construction (examples, tests) working without a
+        # wrapper: it re-derives the scheduler-only signal via resolve_is_turbo itself,
+        # same as _load_model would for a non-single-file load.
         detection_result = detect_model(pipe.unet, pipe)
         self.model_type = detection_result["model_type"]
         self.is_sdxl = detection_result["is_sdxl"]
-        self.is_turbo = detection_result["is_turbo"]
+        self.is_turbo = is_turbo if is_turbo is not None else resolve_is_turbo(pipe=pipe)[0]
         self.detection_confidence = detection_result["confidence"]
 
         # TCD scheduler is incompatible with denoising batch optimization due to Strategic Stochastic Sampling
@@ -1018,33 +1024,6 @@ class StreamDiffusion:
     def get_normalize_seed_weights(self) -> bool:
         """Get the current seed weight normalization setting."""
         return self._param_updater.get_normalize_seed_weights()
-
-    def set_scheduler(
-        self,
-        scheduler: Literal["lcm", "tcd"] = None,
-        sampler: Literal["simple", "sgm_uniform", "normal", "ddim", "beta", "karras"] = None,
-    ) -> None:
-        """
-        Change the scheduler and/or sampler at runtime.
-
-        Parameters
-        ----------
-        scheduler : str, optional
-            The scheduler type to use ("lcm" or "tcd"). If None, keeps current scheduler.
-        sampler : str, optional
-            The sampler type to use. If None, keeps current sampler.
-        """
-        if scheduler is not None:
-            self.scheduler_type = scheduler
-        if sampler is not None:
-            self.sampler_type = sampler
-
-        self.scheduler = self._initialize_scheduler(self.scheduler_type, self.sampler_type, self.pipe.scheduler.config)
-        logger.info(f"Scheduler changed to {self.scheduler_type} with {self.sampler_type} sampler")
-
-    def _uses_lcm_logic(self) -> bool:
-        """Return True if scheduler uses LCM-style consistency boundary-condition math."""
-        return isinstance(self.scheduler, LCMScheduler)
 
     def add_noise(
         self,

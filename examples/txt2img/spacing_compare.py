@@ -2,11 +2,16 @@
 Sweep num_inference_steps (S in {10, 15, 20, 25, 30}) across all samplers and both
 production models to find where timestep-spacing actually changes output.
 
-Key insight: the LCM distillation grid is [19, 39, ..., 999] (congruent 19 mod 20).
+NOTE: this script has not been run (images/outputs/spacing_compare/ does not exist).
+The numbers below are derived from the LCM scheduler's own algorithm, not measured.
+
+Key insight: pipeline.py's _initialize_scheduler forces original_inference_steps=100,
+so the LCM distillation grid is [9, 19, ..., 999] (congruent 9 mod 10), not [19, 39,
+..., 999] (mod 20) as an original_inference_steps=50 assumption would give.
   normal:       always subsamples this grid -> always on-grid at every S.
-  sgm_uniform:  (trailing) coincides with the distillation grid only when S divides 50
-                (divisors in this range: {10, 25}) -> MSE~0 vs normal.
-                At non-divisors (15, 20, 30) it steps off-grid and diverges from normal.
+  sgm_uniform:  (trailing) coincides with the distillation grid only when S divides 100
+                (divisors in this range: {10, 20, 25}) -> MSE~0 vs normal.
+                At non-divisors (15, 30) it steps off-grid and diverges from normal.
   ddim:         (leading) off-grid at essentially all non-trivial S; excludes t=999.
   simple:       (linspace) off-grid; spans full [0, 999].
 
@@ -36,10 +41,10 @@ MODELS = [
     "stabilityai/sd-turbo",
     "stabilityai/sdxl-turbo",
 ]
-STEP_COUNTS = [10, 15, 20, 25, 30]  # divisors of 50: {10, 25}; non-divisors: {15, 20, 30}
+STEP_COUNTS = [10, 15, 20, 25, 30]  # divisors of 100: {10, 20, 25}; non-divisors: {15, 30}
 SAMPLERS = [
     ("normal", "LCM native (baseline, always on distillation grid)"),
-    ("sgm_uniform", "trailing  — on-grid only when S divides 50"),
+    ("sgm_uniform", "trailing  — on-grid only when S divides 100"),
     ("ddim", "leading   — off-grid, excludes t=999"),
     ("simple", "linspace  — off-grid, spans [0, 999]"),
 ]
@@ -66,8 +71,8 @@ def mse(a: Image.Image, b: Image.Image) -> float:
 
 
 def on_grid(sub_ts) -> bool:
-    """All sub-timesteps on the LCM distillation grid (congruent 19 mod 20)."""
-    return all(int(t) % 20 == 19 for t in sub_ts)
+    """All sub-timesteps on the LCM distillation grid (congruent 9 mod 10)."""
+    return all(int(t) % 10 == 9 for t in sub_ts)
 
 
 def run_model(model_id: str) -> None:
@@ -76,11 +81,11 @@ def run_model(model_id: str) -> None:
 
     for S in STEP_COUNTS:
         t_index = proportional_t_index(S)
-        is_divisor = 50 % S == 0
+        is_divisor = 100 % S == 0
         print(f"\n{'=' * 70}")
         print(
             f"Model: {model_id}  S={S}  t_index={t_index}  "
-            f"({'divides 50 -> trailing==normal' if is_divisor else 'does NOT divide 50 -> trailing diverges'})"
+            f"({'divides 100 -> trailing==normal' if is_divisor else 'does NOT divide 100 -> trailing diverges'})"
         )
         print(f"{'=' * 70}")
 

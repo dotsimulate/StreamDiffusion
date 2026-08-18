@@ -14,6 +14,7 @@ from .param_schema import (
     compute_sub_timesteps,
     delta_noise_cancellation_ceiling,
     floor_num_inference_steps,
+    materialise_timestep_grid,
     rescale_t_index_list,
 )
 from .preprocessing.orchestrator_user import OrchestratorUser
@@ -378,8 +379,18 @@ class StreamParameterUpdater(OrchestratorUser):
                         num_inference_steps = floored
 
                 old_num_steps = len(self.stream.timesteps)
-                self.stream.scheduler.set_timesteps(num_inference_steps, self.stream.device)
-                self.stream.timesteps = self.stream.scheduler.timesteps.to(self.stream.device)
+                # Route through the shared helper rather than calling set_timesteps directly:
+                # for sampler_type in {"simple", "sgm_uniform", "ddim"}, prepare() applies a
+                # spacing override on top of the scheduler's native grid (see
+                # param_schema.materialise_timestep_grid's docstring). A bare set_timesteps()
+                # here would silently discard that override on the first live step change.
+                self.stream.timesteps = materialise_timestep_grid(
+                    self.stream.scheduler,
+                    num_inference_steps,
+                    self.stream.sampler_type,
+                    self.stream.device,
+                    self.stream._get_spaced_timesteps,
+                )
 
                 # If t_index_list wasn't explicitly provided, rescale existing t_list proportionally
                 if t_index_list is None and old_num_steps > 0:
@@ -712,8 +723,7 @@ class StreamParameterUpdater(OrchestratorUser):
 
         if missing:
             logger.warning(
-                "_apply_prompt_blending: %d prompt(s) have no cached embedding and were "
-                "dropped from the blend: %r",
+                "_apply_prompt_blending: %d prompt(s) have no cached embedding and were dropped from the blend: %r",
                 len(missing),
                 missing,
             )

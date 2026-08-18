@@ -133,7 +133,10 @@ class ControlNetSDXLTRT(ControlNetTRT):
                 "has_time_cond": detection_result["architecture_details"]["has_time_conditioning"],
                 "has_addition_embed": detection_result["architecture_details"]["has_addition_embeds"],
                 "model_type": detection_result["model_type"],
-                "is_turbo": detection_result["is_turbo"],
+                # Note: no "is_turbo" key -- detect_model() here is called without a pipe, so
+                # its scheduler-based Turbo signal is always undecided. Turbo status is unread
+                # by SDXLConditioningHandler; the authoritative verdict lives on the wrapper
+                # (resolve_is_turbo), not here.
                 "is_sd3": detection_result["is_sd3"],
                 "confidence": detection_result["confidence"],
                 "architecture_details": detection_result["architecture_details"],

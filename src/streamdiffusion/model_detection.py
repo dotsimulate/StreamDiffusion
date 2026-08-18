@@ -1,6 +1,7 @@
 """Comprehensive model detection for TensorRT and pipeline support"""
 
-from typing import Any, Dict, Optional
+import os
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
@@ -20,6 +21,136 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _detect_turbo_from_scheduler(pipe: Optional[Any]) -> Optional[bool]:
+    """Discriminate ADD-distilled Turbo checkpoints from their base counterparts via the
+    pipeline's *source* scheduler config, evaluated before StreamDiffusion swaps in its own
+    LCMScheduler/TCDScheduler (pipeline.py calls this at __init__ time, ahead of
+    _initialize_scheduler).
+
+    Both sd-turbo and sdxl-turbo ship an EulerAncestralDiscreteScheduler with
+    timestep_spacing="trailing" (see docs/plans/SDXL-Turbo_Research_Verification.md). Their
+    non-Turbo counterparts (SD2.1, SDXL-Base-1.0) do not. This replaces a UNet-config
+    heuristic that keyed off `time_cond_proj_dim`, which is actually the LCM-distillation
+    guidance-embedding dim: stock SDXL-Base-1.0 also has it `None` (false positive for
+    Turbo), and it says nothing about non-SDXL UNets at all (sd-turbo was never flagged
+    Turbo).
+
+    Returns None (undecided) rather than False when no pipe/scheduler is available to
+    check, so callers can tell "confirmed non-Turbo" apart from "couldn't check" and fall
+    back to a corroborating hint (e.g. the model-id string) if they have one.
+    """
+    if pipe is None:
+        return None
+    scheduler = getattr(pipe, "scheduler", None)
+    scheduler_config = getattr(scheduler, "config", None)
+    if scheduler_config is None:
+        return None
+    # `_class_name` is only present on configs loaded from a JSON scheduler_config.json
+    # (from_pretrained). A scheduler built via `.from_config(...)` -- e.g. diffusers'
+    # single-file `_legacy_load_scheduler` synthesized-defaults path -- has no
+    # `_class_name` at all, which used to silently degrade this check to False. The
+    # runtime class name is always correct regardless of construction path.
+    class_name = getattr(scheduler_config, "_class_name", "") or type(scheduler).__name__
+    spacing = getattr(scheduler_config, "timestep_spacing", None)
+    return "EulerAncestralDiscreteScheduler" in class_name and spacing == "trailing"
+
+
+def read_safetensors_metadata(path: Optional[str]) -> Dict[str, str]:
+    """Header-only read of a `.safetensors` file's `__metadata__` block. No tensor
+    weights are loaded -- `safe_open` reads only the JSON header. Returns `{}` on any
+    failure (missing file, not a local path (repo id/URL), not a safetensors file,
+    corrupt header) rather than raising, so callers can treat metadata as
+    always-available-but-possibly-empty.
+    """
+    if not path:
+        return {}
+    try:
+        from safetensors import safe_open
+    except ImportError:
+        return {}
+    try:
+        with safe_open(path, framework="pt") as f:
+            return dict(f.metadata() or {})
+    except Exception:
+        return {}
+
+
+def turbo_from_checkpoint_metadata(path: Optional[str]) -> Optional[bool]:
+    """True/False when the checkpoint carries a SAI Model Spec
+    `modelspec.architecture` tag (e.g. "stable-diffusion-xl-turbo-v1" vs
+    "stable-diffusion-xl-v1-base"). None when the tag is absent, which is the common
+    case for community merges -- callers should fall back to a weaker signal rather
+    than treat None as a negative.
+    """
+    architecture = read_safetensors_metadata(path).get("modelspec.architecture")
+    if not architecture:
+        return None
+    return "turbo" in architecture.lower()
+
+
+def turbo_hint_from_model_id(model_id_or_path: Optional[str]) -> bool:
+    """Case-insensitive "turbo" match on the checkpoint's file *basename* only.
+    Deliberately ignores parent directories, so a base model staged under a path
+    like `D:/turbo_tests/sdxl_base.safetensors` is not misclassified. This is the
+    weakest signal in resolve_is_turbo's precedence -- a naming convention, not a
+    guarantee -- so it is consulted last.
+    """
+    if not model_id_or_path:
+        return False
+    basename = os.path.basename(str(model_id_or_path))
+    return "turbo" in basename.lower()
+
+
+def resolve_is_turbo(
+    *,
+    pipe: Optional[Any] = None,
+    explicit: Optional[bool] = None,
+    model_id_or_path: Optional[str] = None,
+    loaded_via_single_file: bool = False,
+) -> Tuple[bool, str]:
+    """Resolve whether the loaded checkpoint is an ADD-distilled Turbo variant.
+
+    Closes the gap flagged in dotsimulate's PR #58 review: `_detect_turbo_from_scheduler`
+    depends on `pipe.scheduler.config` reflecting the checkpoint's own published
+    scheduler_config.json. That holds for `from_pretrained` loads (repo id or a local
+    diffusers-format directory) but not for `from_single_file` -- diffusers borrows a
+    *reference repo's* scheduler config for the checkpoint's declared architecture family
+    (e.g. an SDXL-Turbo `.safetensors` merge inherits SDXL-Base's `EulerDiscreteScheduler`),
+    so the scheduler check returns a confident but wrong verdict there, not an "undecided"
+    one. This function therefore only trusts the scheduler for non-single-file loads and
+    falls back to checkpoint-embedded metadata, then a filename hint, for single-file ones.
+
+    Precedence (highest to lowest):
+      1. `explicit` -- caller-supplied override, wins outright.
+      2. Scheduler config -- only when `loaded_via_single_file` is False.
+      3. `.safetensors` `modelspec.architecture` metadata -- single-file loads only; a
+         present verdict is authoritative and can VETO a misleading filename.
+      4. "turbo" substring in the file basename -- single-file loads only, last resort.
+      5. Nothing decisive -- False, tagged "undecided" so callers can warn that no
+         automatic signal exists and an explicit override is needed.
+
+    Returns `(is_turbo, reason)` where `reason` is one of "explicit", "scheduler",
+    "modelspec", "filename", "undecided".
+    """
+    if explicit is not None:
+        return bool(explicit), "explicit"
+
+    if not loaded_via_single_file:
+        scheduler_verdict = _detect_turbo_from_scheduler(pipe)
+        if scheduler_verdict is not None:
+            return scheduler_verdict, "scheduler"
+        return False, "undecided"
+
+    metadata_verdict = turbo_from_checkpoint_metadata(model_id_or_path)
+    if metadata_verdict is not None:
+        return metadata_verdict, "modelspec"
+
+    if turbo_hint_from_model_id(model_id_or_path):
+        return True, "filename"
+
+    return False, "undecided"
+
+
 def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str, Any]:
     """
     Comprehensive and robust model detection using definitive architectural features.
@@ -36,7 +167,12 @@ def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str
         A dictionary with detailed information about the detected model.
     """
     model_type = "Unknown"
-    is_turbo = False
+    # Optional[bool]: None = undecided (no pipe / scheduler available to check), True/False =
+    # a decision based on the *source* scheduler. This is a signal, not a verdict -- Turbo
+    # detection is resolved once, authoritatively, by resolve_is_turbo(); detect_model no
+    # longer collapses this into a bool of its own (see resolve_is_turbo's docstring for why
+    # a pipe-less scheduler check must never be read as "confirmed non-Turbo").
+    turbo_from_scheduler = None
     is_sdxl = False
     is_sd3 = False
     confidence = 0.0
@@ -55,7 +191,7 @@ def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str
             if pipe and hasattr(pipe, "scheduler"):
                 scheduler_name = getattr(pipe.scheduler.config, "_class_name", "").lower()
                 if "lcm" in scheduler_name or "turbo" in scheduler_name:
-                    is_turbo = True
+                    turbo_from_scheduler = True
                     model_type = "SD3-Turbo"
         else:
             model_type = "Unknown MMDiT"
@@ -65,16 +201,18 @@ def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str
     elif isinstance(model, UNet2DConditionModel):
         config = model.config
 
+        # `time_cond_proj_dim` is the LCM-distillation guidance-embedding dim, not a
+        # Turbo/Base signal (see _detect_turbo_from_scheduler's docstring). Turbo detection
+        # uses the source scheduler instead; `time_cond_proj_dim` is surfaced separately as
+        # `has_time_conditioning` via detect_unet_characteristics() below.
+        turbo_from_scheduler = _detect_turbo_from_scheduler(pipe)
+
         # 2a. SDXL vs. non-SDXL
         # The `addition_embed_type` is the clearest indicator for the SDXL architecture.
         if config.get("addition_embed_type") is not None:
             model_type = "SDXL"
             is_sdxl = True
             confidence = 1.0
-            # Differentiate SDXL-Base from SDXL-Turbo.
-            # Base SDXL has `time_cond_proj_dim` (e.g., 256), while Turbo has it set to `None`.
-            if config.get("time_cond_proj_dim") is None:
-                is_turbo = True
 
         # 2b. SD2.1 vs. SD1.5 (if not SDXL)
         # Differentiate based on the text encoder's projection dimension.
@@ -83,6 +221,8 @@ def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str
             if cross_attention_dim == 1024:
                 model_type = "SD2.1"
                 confidence = 1.0
+                # sd-turbo is SD2.1-architecture (cross_attention_dim=1024); the old
+                # heuristic never set is_turbo on this branch at all.
             elif cross_attention_dim == 768:
                 model_type = "SD1.5"
                 confidence = 1.0
@@ -95,14 +235,13 @@ def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str
     elif hasattr(model, "config") and hasattr(model.config, "cross_attention_dim"):
         # ControlNet models have UNet-like configs, detect their base architecture
         config = model.config
+        turbo_from_scheduler = _detect_turbo_from_scheduler(pipe)
 
         # Apply same detection logic as UNet models
         if config.get("addition_embed_type") is not None:
             model_type = "SDXL"
             is_sdxl = True
             confidence = 0.95  # Slightly lower confidence for ControlNet
-            if config.get("time_cond_proj_dim") is None:
-                is_turbo = True
         else:
             cross_attention_dim = config.get("cross_attention_dim")
             if cross_attention_dim == 1024:
@@ -156,7 +295,7 @@ def detect_model(model: torch.nn.Module, pipe: Optional[Any] = None) -> Dict[str
 
     result = {
         "model_type": model_type,
-        "is_turbo": is_turbo,
+        "turbo_from_scheduler": turbo_from_scheduler,
         "is_sdxl": is_sdxl,
         "is_sd3": is_sd3,
         "confidence": confidence,

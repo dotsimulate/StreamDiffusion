@@ -125,6 +125,9 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
         "do_add_noise": config.get("do_add_noise", True),
         "device_ids": config.get("device_ids"),
         "use_lcm_lora": config.get("use_lcm_lora"),  # Backwards compatibility
+        # Explicit override for Turbo-checkpoint detection; None (default) auto-detects.
+        # See StreamDiffusionWrapper.__init__'s is_turbo docstring for the precedence.
+        "is_turbo": config.get("is_turbo"),
         "use_tiny_vae": config.get("use_tiny_vae", True),
         "enable_similar_image_filter": config.get("enable_similar_image_filter", False),
         "similar_image_filter_threshold": config.get("similar_image_filter_threshold", 0.98),
