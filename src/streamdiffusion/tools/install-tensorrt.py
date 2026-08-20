@@ -28,9 +28,9 @@ def install(cu: Optional[Literal["11", "12"]] = get_cuda_major()):
         run_pip(f"install --extra-index-url https://pypi.nvidia.com {trt_package} --no-cache-dir")
 
     if not is_installed("polygraphy"):
-        run_pip("install polygraphy==0.49.26 --extra-index-url https://pypi.ngc.nvidia.com")
+        run_pip("install polygraphy==0.49.26 --extra-index-url https://pypi.nvidia.com")
     if not is_installed("onnx_graphsurgeon"):
-        run_pip("install onnx-graphsurgeon==0.6.1 --extra-index-url https://pypi.ngc.nvidia.com")
+        run_pip("install onnx-graphsurgeon==0.6.1 --extra-index-url https://pypi.nvidia.com")
     if platform.system() == "Windows" and not is_installed("pywin32"):
         run_pip("install pywin32==311")
     if platform.system() == "Windows" and not is_installed("triton"):
