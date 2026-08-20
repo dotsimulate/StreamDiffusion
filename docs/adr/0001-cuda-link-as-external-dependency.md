@@ -12,7 +12,7 @@ relative-import patches re-applied on every re-vendor) and the dependency seam w
 dishonest — `wrapper.py` hard-imported `cuda_link` while `setup.py` never declared it.
 
 We now **depend solely on the pip-installed `cuda-link`** (declared in `setup.py` as
-`cuda-link @ git+https://github.com/forkni/cuda-link@v1.12.1`, exposed via the `cuda_ipc`
+`cuda-link @ git+https://github.com/forkni/cuda-link@v1.12.2`, exposed via the `cuda_ipc`
 optional extra). The TouchDesigner side consumes the same installed package through
 `CUDALinkBootstrap`'s **library mode** (`CUDALINK_LIB_PATH` injects the venv onto TD's
 `sys.path` and aliases the 14 bare module names used by TD DATs), so the TD DAT mirror
@@ -35,8 +35,8 @@ inside the repo is no longer needed either.
 - IPC is an **optional feature**: `pip install -e .[cuda_ipc]`. The `wrapper.py` imports
   are lazy/in-method so the core package installs and runs without cuda-link.
 - The `github.com/forkni/cuda-link` remote **must carry the referenced tag** or clean installs
-  fail. Current pin in `setup.py`: **`v1.12.1`** (tagged 2026-07-12; published release
-  `v1.12.1` on the cuda-link remote — https://github.com/forkni/cuda-link/releases/tag/v1.12.1).
+  fail. Current pin in `setup.py`: **`v1.12.2`** (tagged 2026-08-11; published release
+  `v1.12.2` on the cuda-link remote — https://github.com/forkni/cuda-link/releases/tag/v1.12.2).
 - **1.10.x history and the CUDA 719 incident (2026-06-10):** cuda-link 1.10.0 introduced
   async-by-default `export()` (no per-frame `cudaStreamSynchronize`) and opt-in
   `CUDALINK_D2H_PIPELINED` for overlapped D2H copy. However, **1.10.0 had a producer-side
@@ -120,6 +120,25 @@ inside the repo is no longer needed either.
     `phase4b`/`phase4c` and confirming the vars they declare are sufficient on their own).
     `CUDALINK_WAIT_BACKEND` is intentionally left unset — its default `"auto"` already selects the
     native path.
+- **1.12.2 migration (2026-08-11 pin bump; bugfix-only, no consumer API change):** per the
+  [cuda-link 1.12.2 release notes](https://github.com/forkni/cuda-link/releases/tag/v1.12.2):
+  - Fixes an undersized `cudaPointerAttributes` ctypes binding (`cuda_runtime_types.py`) — CUDA
+    13.x's `driver_types.h` grew a `reserved[8]` field the 12.x-era struct didn't account for,
+    and the loader probes 13.x cudart candidates before 12.x ones, so a 13.x runtime on the host
+    could receive an undersized out-parameter on the per-frame `pointer_get_attributes()` path.
+  - Fixes `cudaDevAttrAsyncEngineCount` being mislabeled as attribute index `4` (the real
+    `cudaDevAttrMaxBlockDimZ`) in `cuda_ipc_wrapper.py` — per the release notes this was latent,
+    with no production caller querying it yet.
+  - Fixes the new `check_ipc_capability()` IPC probe (added earlier in this release) hard-failing
+    `Exporter.open()` on a CUDA 11.x runtime instead of degrading gracefully — relevant here
+    because the release notes call out that TouchDesigner ships `cudart64_110.dll`, which the
+    loader also probes.
+  - Adds `check_ipc_capability()` itself to the `CudaPort` protocol/adapters, called once from
+    `Exporter.open()` before minting an IPC handle; logs an informational note on a driver-support
+    gap rather than hard-failing, raising only if the driver reports IPC flatly unsupported.
+  - This entry summarizes the published release notes; unlike the 1.10.x–1.12.1 entries above, it
+    was not re-verified against SD's own exporter/importer code paths with a live reproduction
+    test this pass — worth a follow-up pass if any of these prove reachable in practice.
 - The `CUDALINK_LIB_PATH` env var enables `CUDALinkBootstrap`'s library mode (`sys.path`
   injection of the installed `cuda_link` package + the 14 bare-name DAT aliases); without it,
   `CUDALinkBootstrap` falls back to classic Text-DAT module discovery (still works, but requires
