@@ -1,19 +1,32 @@
 """
 HED TensorRT preprocessor — GPU-native edge detection via TRT engine.
 
-The HED network (ControlNetHED_Apache2) is wrapped in HEDExportWrapper so
-that ONNX export sees a single output tensor (full-resolution edge map) rather
-than the native 5-output multi-scale tuple.  The wrapper input/output contract:
+The HED network (ControlNetHED_Apache2) is wrapped in HEDExportWrapper so that
+ONNX export sees a single output tensor (full-resolution edge map) rather than
+the native 5-output multi-scale tuple.  The wrapper reproduces exactly what
+``controlnet_aux.HEDdetector.__call__`` does on the CPU:
 
-    input  : float32 (B, 3, H, W) in [0, 1]   ← same as validate_tensor_input output
-    output : float32 (B, 1, H, W) in [0, 1]   ← sigmoid edge map at full resolution
+    1. feed the network 0-255 pixels (its learned ``norm`` parameter is a
+       per-channel mean of ~[122, 117, 104] and expects that range),
+    2. bilinearly upsample the five side outputs to the input resolution,
+    3. average them and apply a sigmoid.
+
+Wrapper input/output contract:
+
+    input  : float32 (B, 3, H, W) in [0, 1]   <- same as validate_tensor_input output
+    output : float32 (B, 1, H, W) in [0, 1]   <- fused sigmoid edge map ("edge_map")
+
+Engines built by the previous wrapper (block-1 side output only, 0-1 input) are
+detected by their output tensor name and rebuilt automatically on load.
 """
 
 import logging
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
+from .category_params import EDGE_SMOOTHNESS_PARAM, apply_edge_smoothness
 from .trt_base import SelfBuildingTRTPreprocessor, _first_output
 
 logger = logging.getLogger(__name__)
@@ -25,9 +38,16 @@ try:
 except ImportError:
     CONTROLNET_AUX_AVAILABLE = False
 
+#: Default post-process knobs, tuned on images/inputs/input.png at 640x384 against
+#: SargeZT/controlnet-sd-xl-1.0-softedge-dexined: 0.3 drops the low-probability
+#: texture haze (hair/cloth interiors) while keeping the soft outline values; a
+#: light post-blur matches the DexiNed-style soft edges the ControlNet was trained on.
+DEFAULT_EDGE_THRESHOLD = 0.3
+DEFAULT_HED_SMOOTHNESS = 0.15
+
 
 # ---------------------------------------------------------------------------
-# ONNX export wrapper — returns only the full-resolution output
+# ONNX export wrapper — fused multi-scale sigmoid edge map
 # ---------------------------------------------------------------------------
 
 
@@ -35,21 +55,32 @@ class HEDExportWrapper(torch.nn.Module):
     """
     Thin wrapper around ControlNetHED_Apache2 for ONNX export.
 
-    The native forward returns a 5-element tuple of tensors at decreasing
-    resolutions.  ONNX export requires a single output of consistent shape.
-    This wrapper returns only output[0] (the full-resolution sigmoid map).
+    The native forward returns five side-output logit maps at (H, H/2, H/4,
+    H/8, H/16).  Following ``HEDdetector.__call__`` the maps are upsampled to
+    (H, W), averaged, and passed through a sigmoid, giving one (B, 1, H, W)
+    edge-probability map.  Returning only ``outputs[0]`` (as an earlier version
+    did) makes the exporter drop four of the five VGG blocks and yields a
+    texture-sensitive first-layer response instead of HED.
     """
+
+    #: Scale applied to the [0, 1] pipeline tensor before the network.
+    INPUT_SCALE = 255.0
 
     def __init__(self, netNetwork: torch.nn.Module):
         super().__init__()
         self.netNetwork = netNetwork
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, 3, H, W) in [0, 1]
-        outputs = self.netNetwork(x)
-        # outputs is a list/tuple of 5 tensors at (H, H/2, H/4, H/8, H/16);
-        # take the first = full-resolution edge map  shape (B, 1, H, W)
-        return outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+        # x: (B, 3, H, W) in [0, 1]  ->  network expects 0-255 (mean-subtracted inside)
+        outputs = self.netNetwork(x * self.INPUT_SCALE)
+        if not isinstance(outputs, (list, tuple)):
+            return torch.sigmoid(outputs)
+        full = outputs[0]
+        size = full.shape[-2:]
+        acc = full
+        for side in outputs[1:]:
+            acc = acc + F.interpolate(side, size=size, mode="bilinear", align_corners=False)
+        return torch.sigmoid(acc / float(len(outputs)))
 
 
 # ---------------------------------------------------------------------------
@@ -69,17 +100,39 @@ class HEDTensorrtPreprocessor(SelfBuildingTRTPreprocessor):
     engine_filename = "hed.engine"
     onnx_filename = "hed.onnx"
     default_detect_resolution = 512
+    #: Output tensor name of the current export format.  Engines whose output is
+    #: still called ``output`` were built by the block-1-only wrapper and are stale.
+    ENGINE_OUTPUT_NAME = "edge_map"
 
     @classmethod
     def get_preprocessor_metadata(cls):
         return {
-            "display_name": "HED Edge Detection (TensorRT)",
+            "display_name": "HED Soft Edges (TensorRT)",
             "description": (
-                "GPU-native HED (Holistically-Nested Edge Detection) via TensorRT. "
-                "Self-builds its engine from the controlnet_aux model on first run. "
-                "No CPU/PIL round-trips — satisfies the GPU-residency constraint."
+                "GPU-native HED (Holistically-Nested Edge Detection) via TensorRT: the soft "
+                "white-on-black edge map expected by HED ControlNets. Self-builds hed.engine "
+                "from the controlnet_aux model on first run; the Scribble preprocessor runs "
+                "the same engine and only differs in post-processing. No CPU/PIL round-trips."
             ),
-            "parameters": {},
+            "parameters": {
+                "edge_threshold": {
+                    "type": "float",
+                    "default": DEFAULT_EDGE_THRESHOLD,
+                    "range": [0.0, 1.0],
+                    "description": (
+                        "Zero out edge probabilities below this value (thins the map, keeps the "
+                        "surviving values soft). 0 = raw HED output."
+                    ),
+                },
+                "smoothness": {
+                    **EDGE_SMOOTHNESS_PARAM["smoothness"],
+                    "default": DEFAULT_HED_SMOOTHNESS,
+                    "description": (
+                        "Gaussian post-blur of the edge map, applied after the threshold "
+                        "(0 = sharp; 1 = σ≈2, ~13×13 kernel)."
+                    ),
+                },
+            },
             "use_cases": [
                 "HED ControlNet conditioning",
                 "Structured edge maps (real-time)",
@@ -92,6 +145,24 @@ class HEDTensorrtPreprocessor(SelfBuildingTRTPreprocessor):
                 "controlnet_aux is required for HEDTensorrtPreprocessor. Install with: pip install controlnet_aux"
             )
         super().__init__(**kwargs)
+
+    # ------------------------------------------------------------------
+    # Stale-engine detection
+    # ------------------------------------------------------------------
+
+    def _engine_is_current(self, trt_engine) -> bool:
+        """True when the loaded engine exposes the fused ``edge_map`` output."""
+        eng = trt_engine.engine
+        names = [eng.get_tensor_name(i) for i in range(eng.num_io_tensors)]
+        if self.ENGINE_OUTPUT_NAME in names:
+            return True
+        logger.warning(
+            "%s: engine outputs %s lack '%s' — built by the pre-fix wrapper (block-1 only, 0-1 input); rebuilding.",
+            self.__class__.__name__,
+            names,
+            self.ENGINE_OUTPUT_NAME,
+        )
+        return False
 
     # ------------------------------------------------------------------
     # ONNX export
@@ -119,10 +190,10 @@ class HEDTensorrtPreprocessor(SelfBuildingTRTPreprocessor):
                 str(onnx_path),
                 opset_version=17,
                 input_names=["input"],
-                output_names=["output"],
+                output_names=[self.ENGINE_OUTPUT_NAME],
                 dynamic_axes={
                     "input": {0: "batch", 2: "height", 3: "width"},
-                    "output": {0: "batch", 2: "height", 3: "width"},
+                    self.ENGINE_OUTPUT_NAME: {0: "batch", 2: "height", 3: "width"},
                 },
                 dynamo=False,
             )
@@ -140,8 +211,17 @@ class HEDTensorrtPreprocessor(SelfBuildingTRTPreprocessor):
         """
         Convert TRT output to a 3-channel [0, 1] edge map GPU tensor (CHW).
 
-        Input  : engine_outputs["output"]  shape (B, 1, H, W)  or (B, H, W)
+        Input  : engine_outputs["edge_map"]  shape (B, 1, H, W)  or (B, H, W)
         Output : (3, H, W) in [0, 1]
+
+        The engine output is already a sigmoid probability, so no min/max
+        normalisation is applied (it would amplify noise on flat frames and
+        break the absolute threshold semantics of the scribble post-process).
+
+        Optional knobs (``self.params``, live-updatable from TD):
+          * ``edge_threshold`` — probabilities below it become 0, the rest keep
+            their value (thins the map without binarising it).
+          * ``smoothness``     — Gaussian post-blur of the result.
         """
         out = _first_output(engine_outputs).float()
 
@@ -151,11 +231,15 @@ class HEDTensorrtPreprocessor(SelfBuildingTRTPreprocessor):
         if out.dim() == 3:
             out = out.squeeze(0)  # (H, W)
 
-        # Normalize to [0, 1]  (edge map may already be in this range)
-        v_min, v_max = out.min(), out.max()
-        if v_max > v_min:
-            out = (out - v_min) / (v_max - v_min)
         out = out.clamp(0.0, 1.0)
+
+        threshold = float(self.params.get("edge_threshold", DEFAULT_EDGE_THRESHOLD))
+        if threshold > 0.0:
+            out = torch.where(out >= threshold, out, torch.zeros_like(out))
+
+        smoothness = float(self.params.get("smoothness", DEFAULT_HED_SMOOTHNESS))
+        if smoothness > 0.0:
+            out = apply_edge_smoothness(out, smoothness)  # (H, W) in, (H, W) out
 
         # Expand to 3-channel RGB  →  (3, H, W)
         return out.unsqueeze(0).repeat(3, 1, 1)

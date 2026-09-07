@@ -411,6 +411,14 @@ class SelfBuildingTRTPreprocessor(BasePreprocessor):
                     try:
                         trt_engine = TensorRTEngine(str(engine_path))
                         trt_engine.load()
+                        if not self._engine_is_current(trt_engine):
+                            # Stale export format on disk (see subclass hook): rebuild in place.
+                            logger.warning("%s: rebuilding stale engine %s", cls_name, engine_path)
+                            del trt_engine
+                            engine_path.unlink()
+                            self._ensure_engine()
+                            trt_engine = TensorRTEngine(str(engine_path))
+                            trt_engine.load()
                         trt_engine.activate()
                         trt_engine.allocate_buffers(
                             device=self.device,
@@ -427,6 +435,12 @@ class SelfBuildingTRTPreprocessor(BasePreprocessor):
                             f"{cls_name}: engine load/activate/allocate failed for {engine_path}: {exc}"
                         ) from exc
         return self._engine
+
+    def _engine_is_current(self, trt_engine: TensorRTEngine) -> bool:
+        """Hook: return False when the engine on disk was built by an older export
+        format and must be rebuilt.  Called once, right after deserialisation and
+        before activation.  Default: every engine is accepted."""
+        return True
 
     def _ensure_engine(self) -> None:
         """Build the TRT engine from scratch if it doesn't exist yet."""

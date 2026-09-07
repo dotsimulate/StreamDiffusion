@@ -2,15 +2,18 @@
 Scribble TensorRT preprocessor — GPU-native scribble edge maps via TRT.
 
 Reuses the HED TRT engine (no second build needed).  Overrides _postprocess
-to apply a GPU-native NMS + binarization that replicates the scribble=True
-post-processing from controlnet_aux HEDdetector.__call__:
+with a GPU port of the ``scribble=True`` branch of
+``controlnet_aux.HEDdetector.__call__``:
 
-    1. Gaussian-blur the sigmoid edge map (smooth noise)
-    2. Directional NMS — keep only local maxima  (thin lines)
-    3. Threshold at 0.5 → binary edge mask
+    1. nms(edge, 127, 3.0):  Gaussian blur (sigma 3) -> keep pixels that are a
+       local maximum along any of the 4 scan lines (h / v / two diagonals)
+       -> threshold at 127/255
+    2. Gaussian blur (sigma 3) of the binary map, re-threshold at 4/255
+       (thickens the thin ridges into scribble strokes)
 """
 
 import logging
+import math
 
 import torch
 import torch.nn.functional as F
@@ -21,44 +24,86 @@ from .trt_base import _first_output
 
 logger = logging.getLogger(__name__)
 
+#: controlnet_aux ``nms(x, t=127, s=3.0)`` threshold expressed on a [0, 1] map.
+DEFAULT_SCRIBBLE_THRESHOLD = 127.0 / 255.0
+#: Gaussian sigma used by both the NMS pre-blur and the stroke-thickening blur.
+SCRIBBLE_SIGMA = 3.0
+#: ``detected_map[detected_map > 4] = 255`` on a [0, 1] map.
+THICKEN_THRESHOLD = 4.0 / 255.0
+
 
 # ---------------------------------------------------------------------------
-# GPU scribble NMS helper
+# GPU scribble NMS helpers
 # ---------------------------------------------------------------------------
 
 
-def _scribble_nms_gpu(edge_map: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
+def _gaussian_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Separable Gaussian blur of a (1, 1, H, W) tensor (cv2.GaussianBlur((0, 0), sigma) equivalent)."""
+    radius = max(1, int(math.ceil(4.0 * sigma)))
+    t = torch.arange(-radius, radius + 1, device=x.device, dtype=x.dtype)
+    k = torch.exp(-(t * t) / (2.0 * sigma * sigma))
+    k = k / k.sum()
+    h, w = x.shape[-2:]
+    # cv2 default border is BORDER_REFLECT_101 (= torch "reflect"); it needs pad < dim.
+    mode = "reflect" if radius < min(h, w) else "replicate"
+    x = F.pad(x, (radius, radius, 0, 0), mode=mode)
+    x = F.conv2d(x, k.view(1, 1, 1, -1))
+    x = F.pad(x, (0, 0, radius, radius), mode=mode)
+    x = F.conv2d(x, k.view(1, 1, -1, 1))
+    return x
+
+
+def _directional_nms(x: torch.Tensor) -> torch.Tensor:
+    """Keep pixels of a (1, 1, H, W) map that are a local max along any of the 4 scan lines.
+
+    Mirrors the ``cv2.dilate(x, kernel=f) == x`` loop in controlnet_aux ``nms``
+    with the four 3-pixel line kernels (horizontal, vertical, both diagonals).
+    Replicate padding leaves border pixels unaffected, like cv2's default
+    morphology border.
     """
-    Approximate GPU version of controlnet_aux nms() used by scribble=True mode.
+    xp = F.pad(x, (1, 1, 1, 1), mode="replicate")
+    c = xp[..., 1:-1, 1:-1]
 
-    Performs:
-      1. Light Gaussian blur  (3×3 average pool — avoids kornia dependency)
-      2. 4-directional local-max suppression  (keep only ridge pixels)
-      3. Threshold at `threshold`
+    def _dil(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.maximum(torch.maximum(a, c), b)
+
+    horiz = _dil(xp[..., 1:-1, :-2], xp[..., 1:-1, 2:])
+    vert = _dil(xp[..., :-2, 1:-1], xp[..., 2:, 1:-1])
+    diag1 = _dil(xp[..., :-2, :-2], xp[..., 2:, 2:])
+    diag2 = _dil(xp[..., :-2, 2:], xp[..., 2:, :-2])
+    keep = (horiz == c) | (vert == c) | (diag1 == c) | (diag2 == c)
+    return torch.where(keep, c, torch.zeros_like(c))
+
+
+def _scribble_nms_gpu(
+    edge_map: torch.Tensor,
+    threshold: float = DEFAULT_SCRIBBLE_THRESHOLD,
+    sigma: float = SCRIBBLE_SIGMA,
+    thicken: bool = True,
+) -> torch.Tensor:
+    """
+    GPU port of the controlnet_aux scribble post-process.
 
     Args:
-        edge_map: (H, W) float32 tensor in [0, 1] on GPU
-        threshold: binarization threshold (default 0.5)
+        edge_map:  (H, W) float tensor in [0, 1] (HED sigmoid probabilities)
+        threshold: ridge threshold on the blurred map (controlnet_aux: 127/255)
+        sigma:     Gaussian sigma for the pre-blur and the thickening blur
+        thicken:   apply the blur + 4/255 re-threshold that widens ridges into strokes
 
     Returns:
-        (H, W) float32 binary tensor on GPU
+        (H, W) float tensor in {0.0, 1.0}
     """
-    x = edge_map.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    h, w = edge_map.shape[-2:]
+    x = edge_map.reshape(1, 1, h, w).float()
 
-    # Step 1: smooth
-    x = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+    x = _gaussian_blur(x, sigma)
+    ridges = _directional_nms(x)
+    binary = (ridges > threshold).to(x.dtype)
 
-    # Step 2: directional NMS — keep pixel if it is the local max along
-    #         each of the 4 scanning directions (horizontal, vertical, two diagonals).
-    #         We approximate with isotropic max-pool (good enough for thin-line extraction).
-    x_max = F.max_pool2d(x, kernel_size=3, stride=1, padding=1)
-    is_max = (x == x_max).float()
-    thinned = x * is_max
+    if thicken:
+        binary = (_gaussian_blur(binary, sigma) > THICKEN_THRESHOLD).to(x.dtype)
 
-    # Step 3: binarize
-    binary = (thinned.squeeze() > threshold).float()
-
-    return binary
+    return binary.reshape(h, w)
 
 
 # ---------------------------------------------------------------------------
@@ -85,20 +130,21 @@ class ScribbleTensorrtPreprocessor(HEDTensorrtPreprocessor):
     @classmethod
     def get_preprocessor_metadata(cls):
         return {
-            "display_name": "Scribble Edge Detection (TensorRT)",
+            "display_name": "Scribble Strokes (HED + NMS, TensorRT)",
             "description": (
-                "GPU-native scribble-style edge maps. Uses the HED TRT engine with "
-                "GPU NMS + binarization post-processing (no CPU round-trips). "
-                "Compatible with scribble ControlNets."
+                "GPU-native scribble strokes for scribble ControlNets. Runs the same "
+                "hed.engine as the HED preprocessor and applies the controlnet_aux "
+                "scribble=True post-process on the GPU: NMS thinning, binarisation at "
+                "scribble_threshold, then stroke thickening (no CPU round-trips)."
             ),
             "parameters": {
                 "scribble_threshold": {
                     "type": "float",
-                    "default": 0.01,  # was 0.5 — post-NMS ridge values live near zero (~0.005–0.05)
-                    "range": [0.0, 0.05],  # was [0.0, 1.0] — spreads useful control across full travel
+                    "default": round(DEFAULT_SCRIBBLE_THRESHOLD, 3),
+                    "range": [0.0, 1.0],
                     "description": (
-                        "Binarization threshold for scribble edge NMS. Operates on the post-NMS ridge map "
-                        "whose values are small (~0.005–0.05); lower keeps more edges."
+                        "Ridge threshold applied after the Gaussian-blurred directional NMS, on the "
+                        "HED edge probability in [0, 1] (controlnet_aux uses 127/255). Lower keeps more edges."
                     ),
                 },
                 **EDGE_SMOOTHNESS_PARAM,
@@ -113,7 +159,7 @@ class ScribbleTensorrtPreprocessor(HEDTensorrtPreprocessor):
         """
         Apply scribble NMS + threshold to the HED output, return 3-channel CHW.
 
-        Input  : engine_outputs["output"]  shape (B, 1, H, W)  or (B, H, W)
+        Input  : engine_outputs["edge_map"]  shape (B, 1, H, W)  or (B, H, W)
         Output : (3, H, W) in {0.0, 1.0}   (binary scribble map)
         """
         out = _first_output(engine_outputs).float()
@@ -123,10 +169,8 @@ class ScribbleTensorrtPreprocessor(HEDTensorrtPreprocessor):
         if out.dim() == 3:
             out = out.squeeze(0)  # (H, W)
 
-        # Normalize to [0, 1] before NMS
-        v_min, v_max = out.min(), out.max()
-        if v_max > v_min:
-            out = (out - v_min) / (v_max - v_min)
+        # Engine output is a sigmoid probability map; keep absolute values so the
+        # threshold matches controlnet_aux (no min/max normalisation).
         out = out.clamp(0.0, 1.0)
 
         # Optional smoothness pre-blur (category-standard edge param) applied before
@@ -136,7 +180,7 @@ class ScribbleTensorrtPreprocessor(HEDTensorrtPreprocessor):
         if smoothness > 0.0:
             out = apply_edge_smoothness(out, smoothness)  # (H, W) in, (H, W) out
 
-        threshold = float(self.params.get("scribble_threshold", 0.5))
+        threshold = float(self.params.get("scribble_threshold", DEFAULT_SCRIBBLE_THRESHOLD))
         scribble = _scribble_nms_gpu(out, threshold=threshold)  # (H, W)
 
         # Expand to 3-channel RGB
