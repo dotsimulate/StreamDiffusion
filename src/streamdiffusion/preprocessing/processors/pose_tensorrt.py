@@ -228,7 +228,8 @@ def show_predictions_from_batch_format(
     keypoint_radius: int = 4,
     canvas_width: int = 640,
     canvas_height: int = 640,
-    letterbox_scale: float = 1.0,
+    letterbox_scale_x: float = 1.0,
+    letterbox_scale_y: float = 1.0,
     letterbox_pad_x: int = 0,
     letterbox_pad_y: int = 0,
 ):
@@ -239,16 +240,20 @@ def show_predictions_from_batch_format(
         keypoint_threshold:  Confidence cutoff for drawing joints (category-standard param).
         joint_thickness:     Skeleton limb ellipse half-width, in pixels.
         keypoint_radius:     Keypoint dot radius in pixels.
-        canvas_width:        Output canvas width, in pixels. Should match the caller's
-                              get_target_dimensions() so no further resize is needed -- a
-                              mismatch crops/misplaces the skeleton silently (no exception).
-        canvas_height:       Output canvas height, in pixels. See canvas_width.
-        letterbox_scale:     Scale factor from `_letterbox_resize` that produced the
-                              detection-space image. Joints from iterate_over_batch_predictions
-                              are in that padded square's pixel space, not the original frame's;
-                              this (with the pad offsets below) maps them back.
-        letterbox_pad_x:     Horizontal letterbox padding (pixels) to undo.
-        letterbox_pad_y:     Vertical letterbox padding (pixels) to undo.
+        canvas_width:        Output canvas width, in pixels.
+        canvas_height:       Output canvas height, in pixels.
+        letterbox_scale_x:   Combined per-axis scale mapping detection-space (the letterboxed
+                              detect_resolution square) directly to this canvas: undoes
+                              `_letterbox_resize`'s scale, then rescales the original frame to
+                              (canvas_width, canvas_height) -- the same squash the base class's
+                              `_ensure_target_size` applies to every other preprocessor's output.
+                              The original frame's own size is *not* necessarily canvas_width x
+                              canvas_height (that's the pipeline's configured resolution, not the
+                              source frame's), so this must not be conflated with the plain
+                              `1/letterbox_scale` undo.
+        letterbox_scale_y:   Combined per-axis scale, vertical. See letterbox_scale_x.
+        letterbox_pad_x:     Horizontal letterbox padding (pixels) to undo, applied before scale.
+        letterbox_pad_y:     Vertical letterbox padding (pixels) to undo, applied before scale.
 
     The canvas is allocated uint8, not the numpy float64 default: cv2.LINE_AA (used by
     PoseVisualization.draw_skeleton) is silently a no-op on float64 images -- measured 2 unique pixel
@@ -268,11 +273,15 @@ def show_predictions_from_batch_format(
     try:
         pred_joints = pred_joints.astype(np.float32, copy=True)
 
-        # Undo the letterbox: joints are in the padded detect_resolution-square's pixel space,
-        # not the original frame's -- see _letterbox_resize.
-        if letterbox_scale != 1.0 or letterbox_pad_x or letterbox_pad_y:
-            pred_joints[..., 0] = (pred_joints[..., 0] - letterbox_pad_x) / letterbox_scale
-            pred_joints[..., 1] = (pred_joints[..., 1] - letterbox_pad_y) / letterbox_scale
+        # Undo the letterbox directly into canvas space: joints are in the padded
+        # detect_resolution-square's pixel space, not this canvas's -- see _letterbox_resize
+        # and the letterbox_scale_x/y docstring above (this is NOT a plain 1/letterbox_scale
+        # undo -- that would land joints in the original frame's own pixel space, which is a
+        # different rectangle than (canvas_width, canvas_height) whenever the source frame's
+        # resolution doesn't happen to match the pipeline's configured output resolution).
+        if letterbox_scale_x != 1.0 or letterbox_scale_y != 1.0 or letterbox_pad_x or letterbox_pad_y:
+            pred_joints[..., 0] = (pred_joints[..., 0] - letterbox_pad_x) * letterbox_scale_x
+            pred_joints[..., 1] = (pred_joints[..., 1] - letterbox_pad_y) * letterbox_scale_y
 
         # Remap COCO-17 -> OpenPose-18 (see OPENPOSE18_FROM_COCO17). "neck" (index 1) is
         # synthesized as the shoulder midpoint, gated on the *lower* of the two shoulder
@@ -389,6 +398,7 @@ class YoloNasPoseTensorrtPreprocessor(BasePreprocessor):
 
         image_tensor = torch.from_numpy(np.array(image)).float() / 255.0
         image_tensor = image_tensor.permute(2, 0, 1).unsqueeze(0)
+        _, _, orig_height, orig_width = image_tensor.shape
 
         image_resized, letterbox_scale, pad_x, pad_y = _letterbox_resize(image_tensor, detect_resolution)
 
@@ -406,6 +416,12 @@ class YoloNasPoseTensorrtPreprocessor(BasePreprocessor):
         joint_thickness = int(self.params.get("joint_thickness", 4))
         keypoint_radius = int(self.params.get("keypoint_radius", 4))
 
+        # Compose the letterbox undo with the (possibly anisotropic) squash from the source
+        # frame's own resolution to the pipeline's configured canvas resolution -- these are
+        # independent quantities, see letterbox_scale_x/y's docstring.
+        letterbox_scale_x = (target_width / orig_width) / letterbox_scale
+        letterbox_scale_y = (target_height / orig_height) / letterbox_scale
+
         try:
             pose_image = show_predictions_from_batch_format(
                 predictions,
@@ -414,7 +430,8 @@ class YoloNasPoseTensorrtPreprocessor(BasePreprocessor):
                 keypoint_radius=keypoint_radius,
                 canvas_width=target_width,
                 canvas_height=target_height,
-                letterbox_scale=letterbox_scale,
+                letterbox_scale_x=letterbox_scale_x,
+                letterbox_scale_y=letterbox_scale_y,
                 letterbox_pad_x=pad_x,
                 letterbox_pad_y=pad_y,
             )
@@ -446,6 +463,7 @@ class YoloNasPoseTensorrtPreprocessor(BasePreprocessor):
 
         detect_resolution = self.params.get("detect_resolution", 640)
         target_width, target_height = self.get_target_dimensions()
+        _, _, orig_height, orig_width = image_tensor.shape
 
         image_resized, letterbox_scale, pad_x, pad_y = _letterbox_resize(image_tensor, detect_resolution)
 
@@ -460,6 +478,11 @@ class YoloNasPoseTensorrtPreprocessor(BasePreprocessor):
         joint_thickness = int(self.params.get("joint_thickness", 4))
         keypoint_radius = int(self.params.get("keypoint_radius", 4))
 
+        # Compose the letterbox undo with the squash from the source frame's own resolution to
+        # the pipeline's configured canvas resolution -- see letterbox_scale_x/y's docstring.
+        letterbox_scale_x = (target_width / orig_width) / letterbox_scale
+        letterbox_scale_y = (target_height / orig_height) / letterbox_scale
+
         try:
             pose_image = show_predictions_from_batch_format(
                 predictions,
@@ -468,7 +491,8 @@ class YoloNasPoseTensorrtPreprocessor(BasePreprocessor):
                 keypoint_radius=keypoint_radius,
                 canvas_width=target_width,
                 canvas_height=target_height,
-                letterbox_scale=letterbox_scale,
+                letterbox_scale_x=letterbox_scale_x,
+                letterbox_scale_y=letterbox_scale_y,
                 letterbox_pad_x=pad_x,
                 letterbox_pad_y=pad_y,
             )

@@ -156,7 +156,7 @@ class TestSuccessFallbackReconciliation:
 class TestLetterboxUndo:
     """Regression guard for plan Finding 3e: joints returned by the TRT engine are in the
     padded detect-resolution-square's pixel space, not the original frame's -- the
-    letterbox_scale/pad_x/pad_y params must be applied before drawing."""
+    letterbox_scale_x/y/pad_x/pad_y params must be applied before drawing."""
 
     def test_pad_offset_shifts_the_drawn_pose(self):
         image_no_pad = show_predictions_from_batch_format(_predictions_one_pose(), canvas_width=640, canvas_height=640)
@@ -164,7 +164,8 @@ class TestLetterboxUndo:
             _predictions_one_pose(),
             canvas_width=640,
             canvas_height=640,
-            letterbox_scale=1.0,
+            letterbox_scale_x=1.0,
+            letterbox_scale_y=1.0,
             letterbox_pad_x=50,
             letterbox_pad_y=0,
         )
@@ -177,8 +178,45 @@ class TestLetterboxUndo:
             _predictions_one_pose(), canvas_width=640, canvas_height=640
         )
         image_scaled = show_predictions_from_batch_format(
-            _predictions_one_pose(), canvas_width=640, canvas_height=640, letterbox_scale=2.0
+            _predictions_one_pose(),
+            canvas_width=640,
+            canvas_height=640,
+            letterbox_scale_x=2.0,
+            letterbox_scale_y=2.0,
         )
         assert not np.array_equal(image_no_scale, image_scaled), (
-            "letterbox_scale had no effect -- scale undo looks unapplied"
+            "letterbox_scale_x/y had no effect -- scale undo looks unapplied"
+        )
+
+    def test_per_axis_scale_is_independent(self):
+        """The letterbox undo and the raw-input-to-canvas squash are composed into a single
+        per-axis factor precisely because they can differ per axis (e.g. a 1280x720 source
+        frame rendered onto a 512x512 canvas). Scaling only one axis must only move the pose
+        along that axis, proving x and y aren't coupled through a single scalar anymore."""
+        baseline = show_predictions_from_batch_format(
+            _predictions_one_pose(),
+            canvas_width=640,
+            canvas_height=640,
+            letterbox_scale_x=1.0,
+            letterbox_scale_y=1.0,
+        )
+        x_only = show_predictions_from_batch_format(
+            _predictions_one_pose(),
+            canvas_width=640,
+            canvas_height=640,
+            letterbox_scale_x=1.5,
+            letterbox_scale_y=1.0,
+        )
+        y_only = show_predictions_from_batch_format(
+            _predictions_one_pose(),
+            canvas_width=640,
+            canvas_height=640,
+            letterbox_scale_x=1.0,
+            letterbox_scale_y=1.5,
+        )
+        assert not np.array_equal(baseline, x_only), "letterbox_scale_x alone had no effect"
+        assert not np.array_equal(baseline, y_only), "letterbox_scale_y alone had no effect"
+        assert not np.array_equal(x_only, y_only), (
+            "scaling x-only and y-only produced the same image -- axes look coupled, "
+            "defeating the point of separate letterbox_scale_x/y factors"
         )
