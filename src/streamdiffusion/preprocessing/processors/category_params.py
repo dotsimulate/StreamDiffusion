@@ -78,15 +78,17 @@ POSE_DRAW_PARAMS: dict = {
     },
     "joint_thickness": {
         "type": "int",
-        "default": 10,
+        "default": 4,
         "range": [1, 30],
-        "description": "Thickness of skeleton limb lines (pixels).",
+        "description": "Half-width of the filled skeleton limb ellipses (pixels). Default matches "
+        "the OpenPose rendering convention xinsir/controlnet-openpose-sdxl-1.0 was trained on.",
     },
     "keypoint_radius": {
         "type": "int",
-        "default": 10,
+        "default": 4,
         "range": [1, 30],
-        "description": "Radius of keypoint dots (pixels).",
+        "description": "Radius of keypoint dots (pixels). Default matches the OpenPose rendering "
+        "convention xinsir/controlnet-openpose-sdxl-1.0 was trained on.",
     },
 }
 
