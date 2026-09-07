@@ -250,8 +250,12 @@ def compile_yolo_nas_pose(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    engine_path = output_path / "yolonas_pose.engine"
-    onnx_path = output_path / "yolonas_pose.onnx"
+    # Matches the example configs' engine_path (yolo_nas_pose_l_0.8-fp16.engine), not a
+    # generic "yolonas_pose.engine" -- see YOLO_NAS_POSE_HF_REPO comment above.
+    onnx_basename = YOLO_NAS_POSE_VARIANTS[model_size].removesuffix(".onnx")
+    engine_name = f"{onnx_basename}-fp16.engine" if fp16 else f"{onnx_basename}.engine"
+    engine_path = output_path / engine_name
+    onnx_path = output_path / f"{onnx_basename}.onnx"
 
     if engine_path.exists():
         logger.info(f"Engine already exists: {engine_path}")
