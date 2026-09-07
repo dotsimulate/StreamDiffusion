@@ -159,12 +159,10 @@ def test_scribble_default_threshold_matches_controlnet_aux():
     assert meta["default"] == pytest.approx(DEFAULT_SCRIBBLE_THRESHOLD, abs=1e-3)
 
 
-@pytest.mark.skipif(
-    pytest.importorskip("cv2", reason="cv2 needed for controlnet_aux nms parity") is None,
-    reason="cv2 missing",
-)
 def test_scribble_nms_matches_controlnet_aux_reference():
     """Bit-for-bit-ish parity with controlnet_aux.util.nms + the thickening step."""
+    pytest.importorskip("cv2", reason="cv2 needed for controlnet_aux nms parity")
+    pytest.importorskip("controlnet_aux", reason="controlnet_aux needed for nms reference")
     import cv2
     import numpy as np
     from controlnet_aux.util import nms as ref_nms
