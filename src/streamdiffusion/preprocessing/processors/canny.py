@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from .base import BasePreprocessor
-from .category_params import EDGE_SMOOTHNESS_PARAM
+from .category_params import EDGE_SMOOTHNESS_PARAM, apply_edge_smoothness
 
 
 class CannyPreprocessor(BasePreprocessor):
@@ -118,6 +118,13 @@ class CannyPreprocessor(BasePreprocessor):
 
         # (1, 1, H, W) for conv2d; float32 for numerical precision in gradient computation
         gray_4d = gray.unsqueeze(0).unsqueeze(0).to(dtype=torch.float32)
+
+        # Optional smoothness pre-blur — mirrors _process_core so the CPU and GPU paths agree.
+        # Applied to the float32 tensor (not the possibly-fp16 `gray`) to avoid a needless
+        # precision round-trip.  strength=0 is a no-op early return inside the helper.
+        smoothness = float(self.params.get("smoothness", 0.0))
+        if smoothness > 0.0:
+            gray_4d = apply_edge_smoothness(gray_4d, smoothness)
 
         # Gaussian blur (5×5, σ≈1.4) — reduces noise before gradient computation
         blurred = F.conv2d(gray_4d, self._gauss_k, padding=2)
