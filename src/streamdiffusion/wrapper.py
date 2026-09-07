@@ -664,6 +664,7 @@ class StreamDiffusionWrapper:
         self._cuda_ipc_exporter = None  # lazy-init on first frame via _lazy_init_ipc_exporter
         self._cuda_ipc_cn_processed_shm_name = cuda_ipc_cn_processed_shm_name
         self._cuda_ipc_cn_exporter = None  # lazy-init on first CN frame via _lazy_init_cn_ipc_exporter
+        self._cn_ipc_export_warned = False  # emit one logger.warning for export_controlnet_preview_ipc, debug after
         self._controlnet_preview_passthrough = controlnet_preview_passthrough
         self.debug_mode = debug_mode
         # IPC health tracking — updated per-frame only when debug_mode is True
@@ -1586,7 +1587,14 @@ class StreamDiffusionWrapper:
                 )
             )
         except Exception:
-            logger.debug("export_controlnet_preview_ipc: export failed", exc_info=True)
+            # First failure is loud (warning + traceback) so a dead preview path is visible in
+            # the console rather than only in DEBUG-level logs; repeats fall back to debug so a
+            # sustained failure (e.g. TD's receiver never connecting) doesn't spam every frame.
+            if not self._cn_ipc_export_warned:
+                logger.warning("export_controlnet_preview_ipc: export failed", exc_info=True)
+                self._cn_ipc_export_warned = True
+            else:
+                logger.debug("export_controlnet_preview_ipc: export failed", exc_info=True)
 
     def get_ipc_health_status(self) -> str:
         """Return a short health string for the CUDA-IPC zero-copy output path.
