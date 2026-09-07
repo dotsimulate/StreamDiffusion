@@ -349,17 +349,37 @@ def _count_attn_bmm_dq_fed(onnx_path: str) -> Optional[Tuple[int, int]]:
         return None
 
 
-def _find_best_sibling_mha_ratio(engine_dir: str, precision: str) -> Optional[float]:
-    """Best (highest) mha_kernels_per_attn_block seen among sibling engine dirs'
-    build_stats.json files at the same precision -- the same-precision regression
-    baseline for the inspector block's warning gate (FP8 Round 11).
+def _find_best_sibling_mha_ratio(engine_dir: str, precision: str, window: int = 5) -> Optional[float]:
+    """Best (lowest) mha_kernels_per_attn_block seen among the `window` most recent
+    sibling engine dirs' build_stats.json files at the same precision -- the
+    same-precision regression baseline for the inspector block's warning gate
+    (FP8 Round 11; direction and windowing corrected by the 2026-09-06 MHA-fusion
+    investigation, see the comment at the gate's call site in `EngineBuilder.build`).
 
-    Replaces the old ``_mha_count == 0`` guard, which never caught the FP8-vs-FP16
-    fusion regression this round found because the inspector block used to be
-    FP8-gated and so only ever compared FP8 against FP8. Same-precision only here by
-    design: FP8 quantization is *expected* to change kernel fusion vs FP16, so
-    flagging that difference as a warning on every FP8 build would be noise, not
-    signal -- the cross-precision delta is reported separately as INFO.
+    Lower is better here. This ratio is *kernels needed per attention block*, not
+    "modules fused": SDXL's UNet has `kvo_cache_count` self-attention (attn1) blocks
+    and an equal number of cross-attention (attn2) blocks (`get_kvo_cache_info` in
+    `models/utils.py` counts attn1 only), so TRT's fusion ceiling is one kernel per
+    attention module, i.e. ratio == 2.0. A build needing *more* kernels per block than
+    history means some attention sites stopped fusing into a single kernel each --
+    worse fusion, not better. Originally this function returned the historical
+    *maximum* and the gate warned when a build fell *below* it, which flagged a fully
+    saturated 1-kernel-per-module build (ratio 2.0) as a regression against a
+    worse-fused historical outlier (ratio 3.0, one build on 2026-08-22) that needed
+    two kernels for some sites. Confirmed empirically via
+    scripts/fp8/probe_engine_evidence.py: every sibling engine's fused-MHA layer names
+    normalize (stripping the trailing `_myl<N>_<M>` suffix) to the single pattern
+    `_gemm_mha_v2` -- the 3.0-ratio build never fused a second *kind* of kernel, its
+    per-Myelin-partition kernel counts are uniformly 1.5x the 2.0-ratio builds', i.e.
+    the same sites needing more kernels each, not more sites being covered.
+
+    Restricted to the `window` most recent sibling builds (by `build_end`, falling
+    back to `build_start`, falling back to the stats file's mtime) rather than an
+    all-time extremum, so a single anomalous historical build cannot pin the gate
+    forever once enough newer builds age it out of the window -- a defect independent
+    of the polarity bug above: an unbounded, unfiltered all-time extremum over
+    incomparable graph revisions/resolutions/opt levels is fragile regardless of which
+    direction counts as "best".
 
     Skips sibling files with no ``precision`` key (e.g. VAE engine dirs, which never
     run this inspector) or no ``mha_kernels_per_attn_block`` key (e.g. builds from
@@ -369,7 +389,7 @@ def _find_best_sibling_mha_ratio(engine_dir: str, precision: str) -> Optional[fl
     """
     try:
         root = Path(engine_dir).parent
-        best = None
+        candidates = []  # (sort_key, ratio), sort_key is an ISO-8601 string
         for sibling in root.iterdir():
             if not sibling.is_dir():
                 continue
@@ -386,9 +406,18 @@ def _find_best_sibling_mha_ratio(engine_dir: str, precision: str) -> Optional[fl
             ratio = sibling_stats.get("mha_kernels_per_attn_block")
             if ratio is None:
                 continue
-            if best is None or ratio > best:
-                best = ratio
-        return best
+            sort_key = sibling_stats.get("build_end") or sibling_stats.get("build_start")
+            if sort_key is None:
+                try:
+                    sort_key = datetime.fromtimestamp(stats_path.stat().st_mtime, tz=timezone.utc).isoformat()
+                except OSError:
+                    sort_key = ""
+            candidates.append((sort_key, ratio))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: c[0])
+        recent_ratios = [ratio for _, ratio in candidates[-window:]]
+        return min(recent_ratios)
     except Exception:
         return None
 
@@ -496,6 +525,7 @@ class EngineBuilder:
                 )
                 os.remove(onnx_path)
             print(f"Exporting model: {onnx_path}")
+            _build_logger.info(f"Exporting model: {onnx_path}")
             t0 = time.perf_counter()
             _export_kwargs = {
                 "onnx_path": onnx_path,
@@ -520,6 +550,7 @@ class EngineBuilder:
             stats["stages"]["onnx_optimize"] = {"status": "cached"}
         else:
             print(f"Generating optimizing model: {onnx_opt_path}")
+            _build_logger.info(f"Generating optimizing model: {onnx_opt_path}")
             t0 = time.perf_counter()
             optimize_onnx(
                 onnx_path=onnx_path,
@@ -765,6 +796,7 @@ class EngineBuilder:
             _engine = None
             if not force_engine_build and os.path.exists(engine_path):
                 print(f"Found cached engine: {engine_path}")
+                _build_logger.info(f"Found cached engine: {engine_path}")
                 stats["stages"]["trt_build"] = {"status": "cached"}
             else:
                 t0 = time.perf_counter()
@@ -793,6 +825,14 @@ class EngineBuilder:
                     stats["dynamic_shapes"] = _tiling_info.get("dynamic_shapes")
                     stats["tiling_optimization_level"] = _tiling_info.get("tiling_optimization_level")
                     stats["l2_limit_for_tiling_mib"] = _tiling_info.get("l2_limit_for_tiling_mib")
+                    # Effective builder_optimization_level (2026-09-06 MHA-fusion
+                    # investigation) -- previously a build parameter that was forwarded
+                    # all the way to build_engine() but never persisted anywhere, which
+                    # made it impossible to tell whether a historical build's fusion
+                    # outcome was influenced by a different optimization level without a
+                    # full rebuild. Sourced from _apply_gpu_profile_to_config's return
+                    # value, which already reflects the requested override (if any).
+                    stats["builder_optimization_level"] = _tiling_info.get("builder_optimization_level")
 
             # --- Engine inspector: Q/DQ + fused-MHA + attn-BMM evidence record (FP8 Round 11) ---
             # Was `if fp8 and os.path.exists(engine_path)` -- FP16 builds never ran this, so
@@ -888,15 +928,26 @@ class EngineBuilder:
                     # different kvo_cache_count remain comparable. kvo_cache_count only
                     # exists on the model when use_cached_attn is set (models.py), hence
                     # getattr with a 0 default -- 0 skips the normalized metric entirely.
+                    #
+                    # Direction (corrected 2026-09-06 MHA-fusion investigation): LOWER is
+                    # better. mha_kernels_per_attn_block is kernels needed per block, and
+                    # SDXL's fusion ceiling is exactly 2.0 (one kernel per attn1 + one per
+                    # attn2, per kvo_cache_count blocks) -- a build needing *more* kernels
+                    # per block than its best-known sibling means some attention sites
+                    # stopped fusing into a single kernel each. The original comparison
+                    # (`ratio < best`, where `best` was the historical *maximum*) flagged
+                    # full 1-kernel-per-module fusion as a regression against a worse-fused
+                    # historical outlier that needed two kernels for some sites -- see
+                    # `_find_best_sibling_mha_ratio`'s docstring for the empirical evidence.
                     _kvo_count = getattr(self.model, "kvo_cache_count", 0)
                     if _kvo_count > 0:
                         _ratio = _mha_count / _kvo_count
                         stats["mha_kernels_per_attn_block"] = _ratio
                         _best_same = _find_best_sibling_mha_ratio(engine_dir_early, stats["precision"])
-                        if _best_same is not None and _ratio < _best_same:
+                        if _best_same is not None and _ratio > _best_same:
                             _build_logger.warning(
-                                f"[BUILD] MHA fusion regression vs best same-precision sibling: "
-                                f"{_ratio:.3f} kernels/block (this build) < {_best_same:.3f} (best sibling)."
+                                f"[BUILD] MHA fusion regression vs best (lowest) same-precision sibling: "
+                                f"{_ratio:.3f} kernels/block (this build) > {_best_same:.3f} (best sibling)."
                             )
                         _other_precision = "fp16" if fp8 else "fp8"
                         _best_other = _find_best_sibling_mha_ratio(engine_dir_early, _other_precision)
