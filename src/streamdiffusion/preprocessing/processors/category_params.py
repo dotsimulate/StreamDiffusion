@@ -134,7 +134,8 @@ def apply_edge_smoothness(t: torch.Tensor, strength: float) -> torch.Tensor:
     Args:
         t:        Input tensor.  Accepts (H, W), (C, H, W), or (1, C, H, W).
         strength: Blur intensity in [0, 1].  Maps to σ ∈ [0, 2] (3σ gives the kernel radius).
-                  At strength=1: σ=2, radius=6, k_size=13.
+                  At strength=1: σ=2, radius=6, k_size=13.  The convolutions run with
+                  cuDNN benchmarking disabled so a changing kernel size never re-autotunes.
 
     Returns:
         Blurred tensor with the same shape and dtype as *t*.
@@ -166,8 +167,12 @@ def apply_edge_smoothness(t: torch.Tensor, strength: float) -> torch.Tensor:
     k_h = kernel_1d.view(1, 1, k_size, 1).expand(c, 1, k_size, 1).contiguous()
     k_w = kernel_1d.view(1, 1, 1, k_size).expand(c, 1, 1, k_size).contiguous()
 
-    x = F.conv2d(x, k_h, padding=(radius, 0), groups=c)
-    x = F.conv2d(x, k_w, padding=(0, radius), groups=c)
+    # The kernel size follows the knob, so with the pipeline's global cudnn.benchmark=True
+    # every new strength would be a new conv shape and trigger a ~750 ms cuDNN autotune
+    # (a visible freeze while dragging the Smoothing knob). Use heuristic algo selection here.
+    with torch.backends.cudnn.flags(enabled=True, benchmark=False):
+        x = F.conv2d(x, k_h, padding=(radius, 0), groups=c)
+        x = F.conv2d(x, k_w, padding=(0, radius), groups=c)
 
     # Restore original shape
     if len(orig_shape) == 2:
