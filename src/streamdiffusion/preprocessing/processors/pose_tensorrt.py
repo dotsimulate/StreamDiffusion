@@ -501,11 +501,11 @@ class YoloNasPoseTensorrtPreprocessor(BasePreprocessor):
                 pose_image = pose_image.clip(0, 255).astype(np.uint8)
 
             # NOTE: no cv2.cvtColor(BGR2RGB) here -- see _process_core.
-            pose_tensor = torch.from_numpy(pose_image).to(dtype=torch.float16) / 255.0
+            pose_tensor = torch.from_numpy(pose_image).to(dtype=self.dtype) / 255.0
             pose_tensor = pose_tensor.permute(2, 0, 1).unsqueeze(0).cuda()
 
         except Exception:
             # Fallback to black tensor on error
-            pose_tensor = torch.zeros(1, 3, target_height, target_width, dtype=torch.float16).cuda()
+            pose_tensor = torch.zeros(1, 3, target_height, target_width, dtype=self.dtype).cuda()
 
         return pose_tensor
