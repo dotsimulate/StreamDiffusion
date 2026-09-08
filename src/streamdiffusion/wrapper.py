@@ -1565,15 +1565,18 @@ class StreamDiffusionWrapper:
         )
         return self._cuda_ipc_cn_exporter
 
-    def export_controlnet_preview_ipc(self, tensor: torch.Tensor) -> None:
+    def export_controlnet_preview_ipc(self, tensor: torch.Tensor) -> bool:
         """Export a ControlNet preprocessor output tensor to TD via zero-copy GPU IPC.
 
         The tensor must be in [0, 1] range (CHW or NCHW); it is NOT denormalized.
-        This is a display-only path — no health tracking, no return value.
-        No-op if cuda_ipc_cn_processed_shm_name was not configured.
+        Display-only path. Returns True if the frame was handed off to the IPC exporter,
+        False otherwise (not configured, or the export itself failed) -- this method never
+        raises, so callers that want to track transport health (e.g. TD reporting an honest
+        "connected" state) poll the return value rather than catching an exception.
+        No-op (returns False) if cuda_ipc_cn_processed_shm_name was not configured.
         """
         if not self._cuda_ipc_cn_processed_shm_name:
-            return
+            return False
         try:
             from cuda_link import GpuFrame
 
@@ -1586,6 +1589,7 @@ class StreamDiffusionWrapper:
                     producer_stream=torch.cuda.current_stream().cuda_stream,
                 )
             )
+            return True
         except Exception:
             # First failure is loud (warning + traceback) so a dead preview path is visible in
             # the console rather than only in DEBUG-level logs; repeats fall back to debug so a
@@ -1595,6 +1599,7 @@ class StreamDiffusionWrapper:
                 self._cn_ipc_export_warned = True
             else:
                 logger.debug("export_controlnet_preview_ipc: export failed", exc_info=True)
+            return False
 
     def get_ipc_health_status(self) -> str:
         """Return a short health string for the CUDA-IPC zero-copy output path.
