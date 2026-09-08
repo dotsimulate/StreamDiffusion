@@ -459,11 +459,7 @@ class ErrorReporter:
             if context:
                 merged_context.update(context)
 
-            report_path = (
-                write_error_report(exc, stage=stage, wrapper=wrapper, config=config, context=merged_context)
-                if write_error_report is not None
-                else None
-            )
+            report_path = write_error_report(exc, stage=stage, wrapper=wrapper, config=config, context=merged_context)
 
             msg = f"Error [{where}]: {exc}"
             if report_path:
