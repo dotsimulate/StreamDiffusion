@@ -7,9 +7,11 @@ texture/contour response.  These tests pin the export contract and the
 controlnet_aux-faithful scribble post-process without needing a GPU or TRT.
 
 Also covered: the HED post-process knobs (``edge_threshold`` keeps values soft,
-``smoothness`` post-blurs) and the cuDNN-benchmark guard in
-``apply_edge_smoothness`` (a strength-dependent kernel size must never trigger
-a per-size autotune while the pipeline runs with cudnn.benchmark=True).
+``smoothness`` post-blurs) and that ``apply_edge_smoothness`` restores the global
+cudnn.benchmark flag afterward. The guard's actual inner-call behavior (that the
+strength-dependent kernel size never triggers a per-size autotune) is covered in
+tests/unit/test_edge_smoothness_cudnn_guard.py, alongside apply_edge_smoothness's
+owning PR.
 """
 
 import types
@@ -267,24 +269,3 @@ def test_edge_smoothness_leaves_global_cudnn_benchmark_untouched():
         assert torch.backends.cudnn.benchmark is True
     finally:
         torch.backends.cudnn.benchmark = prev
-
-
-def test_edge_smoothness_disables_benchmark_inside_conv(monkeypatch):
-    import torch.nn.functional as F
-
-    real_conv2d = F.conv2d
-    seen = []
-
-    def recording_conv2d(*args, **kwargs):
-        seen.append(torch.backends.cudnn.benchmark)
-        return real_conv2d(*args, **kwargs)
-
-    monkeypatch.setattr(F, "conv2d", recording_conv2d)
-    prev = torch.backends.cudnn.benchmark
-    try:
-        torch.backends.cudnn.benchmark = True
-        apply_edge_smoothness(torch.rand(1, 16, 16), 0.4)
-    finally:
-        torch.backends.cudnn.benchmark = prev
-    assert len(seen) == 2  # separable: one horizontal + one vertical pass
-    assert seen == [False, False]
