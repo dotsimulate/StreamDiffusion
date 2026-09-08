@@ -15,6 +15,7 @@ owning PR.
 """
 
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -269,3 +270,28 @@ def test_edge_smoothness_leaves_global_cudnn_benchmark_untouched():
         assert torch.backends.cudnn.benchmark is True
     finally:
         torch.backends.cudnn.benchmark = prev
+
+
+# ---------------------------------------------------------------------------
+# Shared engine lock: HED and Scribble both build "hed.engine"
+# ---------------------------------------------------------------------------
+
+
+def test_hed_and_scribble_share_one_engine_lock():
+    """ScribbleTensorrtPreprocessor reuses HEDTensorrtPreprocessor's engine_filename
+    ("hed.engine"), so two concurrent instances (get_preprocessor() never caches —
+    each ControlNet unit gets its own, and the orchestrator runs them on separate
+    ThreadPoolExecutor workers) must serialize on the SAME lock. Per-instance locks
+    would let both take the stale-engine rebuild branch at once and race on
+    engine_path.unlink() / TensorRTEngine(...).load(). No TRT/GPU required."""
+    from streamdiffusion.preprocessing.processors.trt_base import _engine_lock_for
+
+    assert HEDTensorrtPreprocessor.engine_filename == ScribbleTensorrtPreprocessor.engine_filename
+
+    engine_dir = Path("engines/preprocessors")
+    hed_path = engine_dir / HEDTensorrtPreprocessor.engine_filename
+    scribble_path = engine_dir / ScribbleTensorrtPreprocessor.engine_filename
+    assert _engine_lock_for(hed_path) is _engine_lock_for(scribble_path)
+
+    other_path = engine_dir / "some_other.engine"
+    assert _engine_lock_for(other_path) is not _engine_lock_for(hed_path)
