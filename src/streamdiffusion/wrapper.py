@@ -1228,20 +1228,21 @@ class StreamDiffusionWrapper:
         if image is None:
             raise ValueError("_process_skip_diffusion: image required for skip diffusion mode")
 
-        # Handle input tensor normalization to [-1,1] pipeline range
+        # Image preprocessing hooks ("image_pre") receive and return [-1,1] pipeline
+        # range (same contract StreamDiffusion.__call__ uses for its main txt2img/img2img
+        # path: image_processor.preprocess(..., do_normalize=True) -> hooks -> encode_image,
+        # with no conversion at either boundary). Any [0,1]<->[-1,1] round trip a processor
+        # needs internally is its own responsibility per custom_processors/sdtd_fx/README.md.
         if isinstance(image, str) or isinstance(image, Image.Image):
-            processed_tensor = self.preprocess_image(image)
-            preprocessor_input = self._denormalize_on_gpu(processed_tensor)
+            preprocessor_input = self.preprocess_image(image)
         elif isinstance(image, torch.Tensor):
-            # Ensure tensor is on correct device and dtype first
+            # Ensure tensor is on correct device and dtype first. Assumed already in
+            # [-1,1] pipeline range, matching the PIL/str branch above.
             preprocessor_input = image.to(device=self.device, dtype=self.dtype)
         else:
             preprocessor_input = image
 
-        preprocessor_output = self.stream._apply_image_preprocessing_hooks(preprocessor_input)
-
-        # Convert [0,1] -> [-1,1] back to pipeline range for postprocessing hooks
-        processed_tensor = self._normalize_on_gpu(preprocessor_output)
+        processed_tensor = self.stream._apply_image_preprocessing_hooks(preprocessor_input)
 
         # Apply image postprocessing hooks (expect [-1,1] range - post-VAE decoding)
         processed_tensor = self.stream._apply_image_postprocessing_hooks(processed_tensor)
