@@ -14,6 +14,11 @@ logger = logging.getLogger(__name__)
 # Type alias for control image input
 ControlImage = Union[str, Image.Image, np.ndarray, torch.Tensor]
 
+# Per-preprocessor-class dedup for the GPU-tensor-path fallback warning below, so a
+# persistent per-frame failure (e.g. a missing TensorRT engine) logs once instead of
+# flooding at frame rate. Mirrors the _pil_fallback_warned pattern in processors/base.py.
+_tensor_path_fallback_warned: set = set()
+
 
 class PreprocessingOrchestrator(BaseOrchestrator[ControlImage, List[Optional[torch.Tensor]]]):
     """
@@ -654,8 +659,19 @@ class PreprocessingOrchestrator(BaseOrchestrator[ControlImage, List[Optional[tor
                 if processed_tensor.dim() == 3:
                     processed_tensor = processed_tensor.unsqueeze(0)
                 return processed_tensor.to(device=self.device, dtype=self.dtype)
-            except Exception:
-                pass  # Fall through to standard processing
+            except Exception as e:
+                # Fall through to the CPU uint8/PIL path below. Silent-by-default here used
+                # to mean a persistently failing GPU preprocessor (e.g. a missing TensorRT
+                # engine) would quietly downgrade to a uint8 round trip every frame with no
+                # sign in the logs -- warn once per class so that regression is visible.
+                cls_name = type(preprocessor).__name__
+                if cls_name not in _tensor_path_fallback_warned:
+                    _tensor_path_fallback_warned.add(cls_name)
+                    logger.warning(
+                        f"[CN tensor-path fallback] {cls_name}.process_tensor raised "
+                        f"({type(e).__name__}: {e}); falling back to the CPU uint8/PIL "
+                        "path for every subsequent frame. (This warning fires once per class.)"
+                    )
 
         # Direct tensor passthrough (no preprocessor) - preprocessors handle their own sizing
         if preprocessor is None:

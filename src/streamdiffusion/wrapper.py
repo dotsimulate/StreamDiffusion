@@ -664,6 +664,7 @@ class StreamDiffusionWrapper:
         self._cuda_ipc_exporter = None  # lazy-init on first frame via _lazy_init_ipc_exporter
         self._cuda_ipc_cn_processed_shm_name = cuda_ipc_cn_processed_shm_name
         self._cuda_ipc_cn_exporter = None  # lazy-init on first CN frame via _lazy_init_cn_ipc_exporter
+        self._cn_ipc_export_warned = False  # emit one logger.warning for export_controlnet_preview_ipc, debug after
         self._controlnet_preview_passthrough = controlnet_preview_passthrough
         self.debug_mode = debug_mode
         # IPC health tracking — updated per-frame only when debug_mode is True
@@ -1228,20 +1229,21 @@ class StreamDiffusionWrapper:
         if image is None:
             raise ValueError("_process_skip_diffusion: image required for skip diffusion mode")
 
-        # Handle input tensor normalization to [-1,1] pipeline range
+        # Image preprocessing hooks ("image_pre") receive and return [-1,1] pipeline
+        # range (same contract StreamDiffusion.__call__ uses for its main txt2img/img2img
+        # path: image_processor.preprocess(..., do_normalize=True) -> hooks -> encode_image,
+        # with no conversion at either boundary). Any [0,1]<->[-1,1] round trip a processor
+        # needs internally is its own responsibility per custom_processors/sdtd_fx/README.md.
         if isinstance(image, str) or isinstance(image, Image.Image):
-            processed_tensor = self.preprocess_image(image)
-            preprocessor_input = self._denormalize_on_gpu(processed_tensor)
+            preprocessor_input = self.preprocess_image(image)
         elif isinstance(image, torch.Tensor):
-            # Ensure tensor is on correct device and dtype first
+            # Ensure tensor is on correct device and dtype first. Assumed already in
+            # [-1,1] pipeline range, matching the PIL/str branch above.
             preprocessor_input = image.to(device=self.device, dtype=self.dtype)
         else:
             preprocessor_input = image
 
-        preprocessor_output = self.stream._apply_image_preprocessing_hooks(preprocessor_input)
-
-        # Convert [0,1] -> [-1,1] back to pipeline range for postprocessing hooks
-        processed_tensor = self._normalize_on_gpu(preprocessor_output)
+        processed_tensor = self.stream._apply_image_preprocessing_hooks(preprocessor_input)
 
         # Apply image postprocessing hooks (expect [-1,1] range - post-VAE decoding)
         processed_tensor = self.stream._apply_image_postprocessing_hooks(processed_tensor)
@@ -1586,7 +1588,14 @@ class StreamDiffusionWrapper:
                 )
             )
         except Exception:
-            logger.debug("export_controlnet_preview_ipc: export failed", exc_info=True)
+            # First failure is loud (warning + traceback) so a dead preview path is visible in
+            # the console rather than only in DEBUG-level logs; repeats fall back to debug so a
+            # sustained failure (e.g. TD's receiver never connecting) doesn't spam every frame.
+            if not self._cn_ipc_export_warned:
+                logger.warning("export_controlnet_preview_ipc: export failed", exc_info=True)
+                self._cn_ipc_export_warned = True
+            else:
+                logger.debug("export_controlnet_preview_ipc: export failed", exc_info=True)
 
     def get_ipc_health_status(self) -> str:
         """Return a short health string for the CUDA-IPC zero-copy output path.

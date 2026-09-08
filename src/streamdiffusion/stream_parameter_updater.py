@@ -1812,6 +1812,21 @@ class StreamParameterUpdater(OrchestratorUser):
                     and controlnet_pipeline.preprocessors[existing_index]
                 ):
                     preprocessor = controlnet_pipeline.preprocessors[existing_index]
+
+                    # Invalidate a cached lazily-loaded TensorRT engine when engine_path
+                    # actually changes. pose_tensorrt.py / depth_tensorrt.py's `engine` property
+                    # only builds self._engine once and never re-checks params afterwards, so
+                    # without this a live config update that repoints engine_path is silently
+                    # ignored -- the preprocessor keeps using whatever engine it first loaded.
+                    # Compare before params.update() overwrites the old value.
+                    new_engine_path = desired_cfg["preprocessor_params"].get("engine_path")
+                    if (
+                        new_engine_path is not None
+                        and hasattr(preprocessor, "_engine")
+                        and preprocessor.params.get("engine_path") != new_engine_path
+                    ):
+                        preprocessor._engine = None
+
                     preprocessor.params.update(desired_cfg["preprocessor_params"])
                     for param_name, param_value in desired_cfg["preprocessor_params"].items():
                         if hasattr(preprocessor, param_name):

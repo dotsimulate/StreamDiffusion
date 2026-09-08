@@ -18,6 +18,7 @@ NumPy helper: apply_depth_grade_numpy
 from __future__ import annotations
 
 import math
+import threading
 
 import numpy as np
 import torch
@@ -78,15 +79,17 @@ POSE_DRAW_PARAMS: dict = {
     },
     "joint_thickness": {
         "type": "int",
-        "default": 10,
+        "default": 4,
         "range": [1, 30],
-        "description": "Thickness of skeleton limb lines (pixels).",
+        "description": "Half-width of the filled skeleton limb ellipses (pixels). Default matches "
+        "the OpenPose rendering convention xinsir/controlnet-openpose-sdxl-1.0 was trained on.",
     },
     "keypoint_radius": {
         "type": "int",
-        "default": 10,
+        "default": 4,
         "range": [1, 30],
-        "description": "Radius of keypoint dots (pixels).",
+        "description": "Radius of keypoint dots (pixels). Default matches the OpenPose rendering "
+        "convention xinsir/controlnet-openpose-sdxl-1.0 was trained on.",
     },
 }
 
@@ -123,6 +126,12 @@ SEGMENTATION_PARAMS: dict = {
 # GPU helpers (operate on torch.Tensor, no CPU round-trip)
 # ---------------------------------------------------------------------------
 
+# torch.backends.cudnn.flags(...) snapshots/restores process-global state, not thread-local
+# state. apply_edge_smoothness is called concurrently from ThreadPoolExecutor worker threads
+# (preprocessing_orchestrator.py's parallel ControlNet dispatch), so unsynchronized enter/exit
+# can leave the global cudnn.benchmark flag stuck in the wrong state. Serialize with a lock.
+_EDGE_SMOOTHNESS_CUDNN_LOCK = threading.Lock()
+
 
 def apply_edge_smoothness(t: torch.Tensor, strength: float) -> torch.Tensor:
     """Apply an adaptive separable Gaussian pre-blur to a grayscale / edge-map tensor.
@@ -134,7 +143,8 @@ def apply_edge_smoothness(t: torch.Tensor, strength: float) -> torch.Tensor:
     Args:
         t:        Input tensor.  Accepts (H, W), (C, H, W), or (1, C, H, W).
         strength: Blur intensity in [0, 1].  Maps to σ ∈ [0, 2] (3σ gives the kernel radius).
-                  At strength=1: σ=2, radius=6, k_size=13.
+                  At strength=1: σ=2, radius=6, k_size=13.  cuDNN benchmarking is disabled
+                  (under a lock) so a changing kernel size never re-autotunes.
 
     Returns:
         Blurred tensor with the same shape and dtype as *t*.
@@ -166,8 +176,14 @@ def apply_edge_smoothness(t: torch.Tensor, strength: float) -> torch.Tensor:
     k_h = kernel_1d.view(1, 1, k_size, 1).expand(c, 1, k_size, 1).contiguous()
     k_w = kernel_1d.view(1, 1, 1, k_size).expand(c, 1, 1, k_size).contiguous()
 
-    x = F.conv2d(x, k_h, padding=(radius, 0), groups=c)
-    x = F.conv2d(x, k_w, padding=(0, radius), groups=c)
+    # The kernel size follows the knob, so with the pipeline's global cudnn.benchmark=True
+    # every new strength would be a new conv shape and trigger a ~750 ms cuDNN autotune
+    # (a visible freeze while dragging the Smoothing knob). Use heuristic algo selection here,
+    # guarded by a lock since the flag context manager mutates process-global state and this
+    # function runs from concurrent ThreadPoolExecutor worker threads.
+    with _EDGE_SMOOTHNESS_CUDNN_LOCK, torch.backends.cudnn.flags(enabled=True, benchmark=False):
+        x = F.conv2d(x, k_h, padding=(radius, 0), groups=c)
+        x = F.conv2d(x, k_w, padding=(0, radius), groups=c)
 
     # Restore original shape
     if len(orig_shape) == 2:

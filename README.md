@@ -121,21 +121,12 @@ pip install torch==2.7.1+cu118 torchvision==0.22.0+cu118 torchaudio==2.7.1 --ind
 <summary><b>CUDA 12.8</b></summary>
 
 ```bash
-pip install torch==2.8.0+cu128 torchvision==0.23.0+cu128 torchaudio==2.8.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+pip install torch==2.11.0+cu128 torchvision==0.26.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 ```
 
 </details>
 
-<details>
-<summary><b>CUDA 12.9</b></summary>
-
-```bash
-pip install torch==2.8.0+cu129 torchvision==0.23.0+cu129 torchaudio==2.8.0+cu129 --index-url https://download.pytorch.org/whl/cu129
-```
-
-</details>
-
-For other CUDA targets or future PyTorch releases, consult https://pytorch.org/get-started/previous-versions/.
+For other CUDA targets or future PyTorch releases, consult <https://pytorch.org/get-started/previous-versions/>.
 
 ### Step3: Install StreamDiffusion
 

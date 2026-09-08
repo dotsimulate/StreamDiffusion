@@ -309,21 +309,33 @@ def _apply_gpu_profile_to_config(
         dict with the tiling decision actually applied (FP8 Round 11 evidence record —
         callers persist this in build_stats.json rather than it existing only as an
         INFO log line): {"dynamic_shapes": bool, "tiling_optimization_level": str or
-        None, "l2_limit_for_tiling_mib": int or None}. `tiling_optimization_level` is
-        the applied level name, or one of "skipped (no gpu_profile)", "skipped
-        (dynamic_shapes)", "disabled (NONE)", "unsupported" when nothing was applied.
+        None, "l2_limit_for_tiling_mib": int or None, "builder_optimization_level": int
+        or str or None}. `tiling_optimization_level` is the applied level name, or one
+        of "skipped (no gpu_profile)", "skipped (dynamic_shapes)", "disabled (NONE)",
+        "unsupported" when nothing was applied. `builder_optimization_level` is the
+        effective level actually assigned to `config` — already reflects the caller's
+        override, if any (`build_engine` replaces `gpu_profile` with an overridden copy
+        before this function ever sees it) — or "unsupported"/"skipped (no gpu_profile)"
+        when it could not be applied. Added by the 2026-09-06 MHA-fusion-regression
+        investigation: this was a build parameter forwarded all the way from
+        `EngineBuilder.build`'s `builder_optimization_level` kwarg but never persisted
+        anywhere, which made it impossible to tell whether a historical build's fusion
+        outcome (see builder.py's `_find_best_sibling_mha_ratio`) was influenced by a
+        different optimization level without a full rebuild.
     """
     if gpu_profile is None:
         return {
             "dynamic_shapes": dynamic_shapes,
             "tiling_optimization_level": "skipped (no gpu_profile)",
             "l2_limit_for_tiling_mib": None,
+            "builder_optimization_level": "skipped (no gpu_profile)",
         }
 
     applied = {
         "dynamic_shapes": dynamic_shapes,
         "tiling_optimization_level": None,
         "l2_limit_for_tiling_mib": None,
+        "builder_optimization_level": None,
     }
 
     # builder_optimization_level (0–5):
@@ -335,8 +347,10 @@ def _apply_gpu_profile_to_config(
     try:
         config.builder_optimization_level = gpu_profile.builder_optimization_level
         logger.info(f"[TRT Config] builder_optimization_level={gpu_profile.builder_optimization_level}")
+        applied["builder_optimization_level"] = gpu_profile.builder_optimization_level
     except AttributeError:
         logger.debug("[TRT Config] builder_optimization_level not supported — skipping")
+        applied["builder_optimization_level"] = "unsupported"
 
     # tiling_optimization_level + l2_limit_for_tiling:
     # TRT's L2 tiling cache optimization requires static/concrete shapes to work.

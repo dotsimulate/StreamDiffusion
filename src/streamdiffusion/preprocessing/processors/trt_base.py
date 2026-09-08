@@ -313,6 +313,33 @@ def _first_output(engine_outputs: dict) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# Cross-instance engine locks
+# ---------------------------------------------------------------------------
+#
+# Subclasses can share an engine_filename (e.g. ScribbleTensorrtPreprocessor reuses
+# HEDTensorrtPreprocessor's "hed.engine") while still being distinct instances with
+# distinct per-instance state. get_preprocessor() never caches instances, and the
+# ControlNet orchestrator runs each preprocessor group on its own ThreadPoolExecutor
+# worker, so two such instances can race on the SAME engine file: both take the
+# stale-engine branch below on the same frame, and one's engine_path.unlink() /
+# rebuild collides with the other's in-flight load. A lock keyed by the resolved
+# engine path (rather than one lock per instance) is required to serialize them.
+_ENGINE_LOCKS: Dict[str, threading.Lock] = {}
+_ENGINE_LOCKS_GUARD = threading.Lock()
+
+
+def _engine_lock_for(path: Path) -> threading.Lock:
+    """Process-wide lock shared by every preprocessor resolving to the same engine file."""
+    key = str(path.resolve())
+    with _ENGINE_LOCKS_GUARD:
+        lock = _ENGINE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _ENGINE_LOCKS[key] = lock
+        return lock
+
+
+# ---------------------------------------------------------------------------
 # Self-building TRT preprocessor base
 # ---------------------------------------------------------------------------
 
@@ -364,7 +391,6 @@ class SelfBuildingTRTPreprocessor(BasePreprocessor):
             )
         super().__init__(**kwargs)
         self._engine: Optional[TensorRTEngine] = None
-        self._engine_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # PIL fallback path — goes through tensor for GPU residency
@@ -396,9 +422,15 @@ class SelfBuildingTRTPreprocessor(BasePreprocessor):
 
     @property
     def engine(self) -> TensorRTEngine:
-        """Lazy-load the TRT engine (double-checked locking)."""
+        """Lazy-load the TRT engine (double-checked locking).
+
+        Locks on the resolved engine path, not on ``self`` — subclasses that share an
+        engine_filename (HED/Scribble both build "hed.engine") are otherwise distinct
+        instances with independent locks and can race on the same file. See
+        ``_engine_lock_for``.
+        """
         if self._engine is None:
-            with self._engine_lock:
+            with _engine_lock_for(self._get_engine_path()):
                 if self._engine is None:
                     cls_name = self.__class__.__name__
                     engine_path = self._get_engine_path()
@@ -411,6 +443,11 @@ class SelfBuildingTRTPreprocessor(BasePreprocessor):
                     try:
                         trt_engine = TensorRTEngine(str(engine_path))
                         trt_engine.load()
+                        if not self._engine_is_current(trt_engine):
+                            raise RuntimeError(
+                                f'Incompatible cached engine at {engine_path}; existing file preserved. '
+                                'Select a new engine_path to build the current export.'
+                            )
                         trt_engine.activate()
                         trt_engine.allocate_buffers(
                             device=self.device,
@@ -427,6 +464,12 @@ class SelfBuildingTRTPreprocessor(BasePreprocessor):
                             f"{cls_name}: engine load/activate/allocate failed for {engine_path}: {exc}"
                         ) from exc
         return self._engine
+
+    def _engine_is_current(self, trt_engine: TensorRTEngine) -> bool:
+        """Hook: return False when the engine on disk was built by an older export
+        format and must be rebuilt.  Called once, right after deserialisation and
+        before activation.  Default: every engine is accepted."""
+        return True
 
     def _ensure_engine(self) -> None:
         """Build the TRT engine from scratch if it doesn't exist yet."""

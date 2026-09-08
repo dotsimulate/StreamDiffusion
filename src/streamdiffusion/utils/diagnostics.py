@@ -14,6 +14,7 @@ the two are deliberately not shared code since they live in separate git repos.
 from __future__ import annotations
 
 import collections
+import contextlib
 import importlib.metadata
 import logging
 import os
@@ -26,6 +27,14 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+# Hardened against branch drift, same rationale as td_manager.py's own guarded import of
+# this pair: reporting.py lives alongside this module but isn't guaranteed present on
+# every branch the deployed (gitignored) copy of this file gets checked out against.
+try:
+    from .reporting import report_error
+except ImportError:
+    report_error = None
 
 SCHEMA_VERSION = "v1"
 # Only these env-var prefixes are dumped -- never the full os.environ (avoids leaking secrets).
@@ -62,7 +71,6 @@ WRAPPER_CONFIG_ATTRS = (
 _LOG_TAIL_MAXLEN = 200
 _log_tail_buffer: collections.deque = collections.deque(maxlen=_LOG_TAIL_MAXLEN)
 _log_tail_lock = threading.Lock()
-_log_tail_installed = False
 
 
 class _TailBufferHandler(logging.Handler):
@@ -76,20 +84,26 @@ class _TailBufferHandler(logging.Handler):
 
 
 def _install_log_tail_handler() -> None:
-    """Attach the tail-buffer handler to the root logger, once per process. Best-effort."""
-    global _log_tail_installed
+    """Attach the tail-buffer handler to the root logger. Best-effort and idempotent --
+    safe to call repeatedly.
+
+    Re-attaches whenever no _TailBufferHandler instance is currently on the root
+    logger, rather than gating on a one-shot "already installed" flag. td_main.py
+    strips every non-OSCLoggingHandler handler from root during its startup
+    reconfiguration, which silently removes this handler too; a one-shot flag would
+    then block it from ever coming back, leaving LOG TAIL permanently empty.
+    """
     with _log_tail_lock:
-        if _log_tail_installed:
+        root = logging.getLogger()
+        if any(isinstance(h, _TailBufferHandler) for h in root.handlers):
             return
         try:
             handler = _TailBufferHandler()
             handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
             handler.setLevel(logging.INFO)
-            logging.getLogger().addHandler(handler)
+            root.addHandler(handler)
         except Exception:
             pass
-        finally:
-            _log_tail_installed = True
 
 
 def _get_log_tail(n: int = 50) -> list:
@@ -379,6 +393,95 @@ def write_error_report(
         except Exception:
             pass
         return None
+
+
+class ErrorReporter:
+    """
+    Shared, dedup-aware wrapper around write_error_report() + report_error().
+
+    Generalizes the debounce block that used to live inline in
+    TouchDesignerManager._streaming_loop (a single `_last_error_report_sig`
+    attribute, usable only from that one call site) so every call site --
+    the streaming thread, the OSC server thread, the main thread's model-load
+    and start() excepts, and the process-wide excepthooks -- shares one
+    signature cache and one report cap instead of each needing its own.
+
+    Best-effort by construction, like write_error_report() itself: report()
+    must never raise, so a bug in reporting can never mask the exception that
+    triggered it.
+    """
+
+    def __init__(self, *, max_reports: int = 20) -> None:
+        self._max_reports = max_reports
+        self._lock = threading.Lock()
+        self._seen_sigs: set = set()
+        self._report_count = 0
+
+    def report(
+        self,
+        exc: BaseException,
+        *,
+        stage: str,
+        where: str,
+        wrapper: Any = None,
+        config: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Path]:
+        """
+        Write a diagnostic report for `exc`, deduped by (where, exception type,
+        truncated message) and capped at `max_reports` writes per process.
+
+        Args:
+            exc: The caught exception.
+            stage: Report stage label, forwarded to write_error_report (e.g.
+                "inference", "model_load", "start", "main").
+            where: Call-site label. Folded into the dedup signature and also
+                surfaced as `context["where"]` (the SUMMARY "Context:" line),
+                same as the streaming-loop block it replaces.
+            wrapper, config: Forwarded to write_error_report unchanged.
+            context: Extra key/value pairs merged into CONFIG; `where` is
+                injected automatically and does not need to be repeated here.
+
+        Returns:
+            Path to the newly written report, or None when the signature was
+            already seen, the per-process cap was reached, or writing itself
+            failed. Never raises.
+        """
+        try:
+            sig = f"{where}|{type(exc).__name__}:{str(exc)[:200]}"
+            with self._lock:
+                if sig in self._seen_sigs or self._report_count >= self._max_reports:
+                    return None
+                self._seen_sigs.add(sig)
+                self._report_count += 1
+
+            merged_context: Dict[str, Any] = {"where": where}
+            if context:
+                merged_context.update(context)
+
+            report_path = write_error_report(exc, stage=stage, wrapper=wrapper, config=config, context=merged_context)
+
+            msg = f"Error [{where}]: {exc}"
+            if report_path:
+                msg += f". Report written to {report_path}"
+                # Belt-and-braces: this is backend subprocess code (no TD debug()), and
+                # td_main.py briefly strips/reconfigures logging handlers at startup --
+                # a bare print() guarantees the path still reaches the console even in
+                # that window. The report file, not this line, is the persistent record.
+                with contextlib.suppress(Exception):
+                    print(f"[StreamDiffusionTD] Error report written to {report_path}")
+
+            if report_error is not None:
+                report_error(msg)
+            else:
+                logging.getLogger(__name__).error(msg)
+            return report_path
+        except Exception as report_exc:
+            with contextlib.suppress(Exception):
+                logging.getLogger(__name__).error(
+                    f"Error [{where}]: {exc} (error-reporting also failed: {report_exc})"
+                )
+            return None
 
 
 _install_log_tail_handler()
