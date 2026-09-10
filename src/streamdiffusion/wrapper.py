@@ -2867,14 +2867,18 @@ class StreamDiffusionWrapper:
                     builder_optimization_level=_vae_optlvl,
                 )
 
-                # Check if all required engines exist
+                # Check if all required engines exist. A full VAE never gets a TRT engine
+                # built (see _skip_trt_vae_for_full above) so its absence here is expected,
+                # not a missing-engine condition that should block a launch or trigger a
+                # doomed build attempt.
                 missing_engines = []
                 if not unet_path.exists():
                     missing_engines.append(f"UNet engine: {unet_path}")
-                if not vae_decoder_path.exists():
-                    missing_engines.append(f"VAE decoder engine: {vae_decoder_path}")
-                if not vae_encoder_path.exists():
-                    missing_engines.append(f"VAE encoder engine: {vae_encoder_path}")
+                if not _skip_trt_vae_for_full:
+                    if not vae_decoder_path.exists():
+                        missing_engines.append(f"VAE decoder engine: {vae_decoder_path}")
+                    if not vae_encoder_path.exists():
+                        missing_engines.append(f"VAE encoder engine: {vae_encoder_path}")
 
                 if missing_engines:
                     if build_engines_if_missing:
@@ -3128,75 +3132,90 @@ class StreamDiffusionWrapper:
                     else self.builder_optimization_level
                 )
 
-                # Compile VAE decoder engine using EngineManager
-                vae_decoder_model = VAE(
-                    device=self.device,
-                    max_batch_size=self.batch_size if self.mode == "txt2img" else stream.frame_bff_size,
-                    min_batch_size=self.batch_size if self.mode == "txt2img" else stream.frame_bff_size,
-                )
+                # A full AutoencoderKL is never TRT-compiled (see _skip_trt_vae_for_full
+                # above): TorchVAEEncoder/VAE(...) below assume the TAESD-shaped forward
+                # signature the ONNX export was validated against, and — more importantly
+                # — an untraced full-VAE encode is stochastic (latent_dist.sample), which
+                # ONNX export would silently freeze to whichever of sample()/mode()
+                # diffusers happens to trace.
+                if not _skip_trt_vae_for_full:
+                    # Compile VAE decoder engine using EngineManager
+                    vae_decoder_model = VAE(
+                        device=self.device,
+                        max_batch_size=self.batch_size if self.mode == "txt2img" else stream.frame_bff_size,
+                        min_batch_size=self.batch_size if self.mode == "txt2img" else stream.frame_bff_size,
+                    )
 
-                engine_manager.compile_and_load_engine(
-                    EngineType.VAE_DECODER,
-                    vae_decoder_path,
-                    load_engine=False,
-                    model=stream.vae,
-                    model_config=vae_decoder_model,
-                    batch_size=self.batch_size if self.mode == "txt2img" else stream.frame_bff_size,
-                    cuda_stream=None,
-                    stream_vae=stream.vae,
-                    engine_build_options={
-                        "opt_image_height": self.height,
-                        "opt_image_width": self.width,
-                        "build_dynamic_shape": not self.static_shapes,
-                        "build_static_batch": self.static_shapes,
-                        # NOTE: this used to also set build_all_tactics=True — that knob
-                        # was dead (never forwarded) and has been replaced by the
-                        # profile-driven max_num_tactics computed centrally in
-                        # build_engine() (utilities.py), which already applies a wider
-                        # tactic budget (128) to dynamic/Flexible builds like this one.
-                        **(
-                            {"min_image_resolution": 384, "max_image_resolution": 1024}
-                            if not self.static_shapes
-                            else {}
-                        ),
-                        **({"builder_optimization_level": _vae_build_optlvl} if _vae_build_optlvl is not None else {}),
-                    },
-                )
+                    engine_manager.compile_and_load_engine(
+                        EngineType.VAE_DECODER,
+                        vae_decoder_path,
+                        load_engine=False,
+                        model=stream.vae,
+                        model_config=vae_decoder_model,
+                        batch_size=self.batch_size if self.mode == "txt2img" else stream.frame_bff_size,
+                        cuda_stream=None,
+                        stream_vae=stream.vae,
+                        engine_build_options={
+                            "opt_image_height": self.height,
+                            "opt_image_width": self.width,
+                            "build_dynamic_shape": not self.static_shapes,
+                            "build_static_batch": self.static_shapes,
+                            # NOTE: this used to also set build_all_tactics=True — that knob
+                            # was dead (never forwarded) and has been replaced by the
+                            # profile-driven max_num_tactics computed centrally in
+                            # build_engine() (utilities.py), which already applies a wider
+                            # tactic budget (128) to dynamic/Flexible builds like this one.
+                            **(
+                                {"min_image_resolution": 384, "max_image_resolution": 1024}
+                                if not self.static_shapes
+                                else {}
+                            ),
+                            **(
+                                {"builder_optimization_level": _vae_build_optlvl}
+                                if _vae_build_optlvl is not None
+                                else {}
+                            ),
+                        },
+                    )
 
-                # Compile VAE encoder engine using EngineManager
-                vae_encoder = TorchVAEEncoder(stream.vae)
-                vae_encoder_model = VAEEncoder(
-                    device=self.device,
-                    max_batch_size=self.batch_size if self.mode == "txt2img" else stream.frame_bff_size,
-                    min_batch_size=self.batch_size if self.mode == "txt2img" else stream.frame_bff_size,
-                )
+                    # Compile VAE encoder engine using EngineManager
+                    vae_encoder = TorchVAEEncoder(stream.vae)
+                    vae_encoder_model = VAEEncoder(
+                        device=self.device,
+                        max_batch_size=self.batch_size if self.mode == "txt2img" else stream.frame_bff_size,
+                        min_batch_size=self.batch_size if self.mode == "txt2img" else stream.frame_bff_size,
+                    )
 
-                engine_manager.compile_and_load_engine(
-                    EngineType.VAE_ENCODER,
-                    vae_encoder_path,
-                    load_engine=False,
-                    model=vae_encoder,
-                    model_config=vae_encoder_model,
-                    batch_size=self.batch_size if self.mode == "txt2img" else stream.frame_bff_size,
-                    cuda_stream=None,
-                    engine_build_options={
-                        "opt_image_height": self.height,
-                        "opt_image_width": self.width,
-                        "build_dynamic_shape": not self.static_shapes,
-                        "build_static_batch": self.static_shapes,
-                        # NOTE: this used to also set build_all_tactics=True — that knob
-                        # was dead (never forwarded) and has been replaced by the
-                        # profile-driven max_num_tactics computed centrally in
-                        # build_engine() (utilities.py), which already applies a wider
-                        # tactic budget (128) to dynamic/Flexible builds like this one.
-                        **(
-                            {"min_image_resolution": 384, "max_image_resolution": 1024}
-                            if not self.static_shapes
-                            else {}
-                        ),
-                        **({"builder_optimization_level": _vae_build_optlvl} if _vae_build_optlvl is not None else {}),
-                    },
-                )
+                    engine_manager.compile_and_load_engine(
+                        EngineType.VAE_ENCODER,
+                        vae_encoder_path,
+                        load_engine=False,
+                        model=vae_encoder,
+                        model_config=vae_encoder_model,
+                        batch_size=self.batch_size if self.mode == "txt2img" else stream.frame_bff_size,
+                        cuda_stream=None,
+                        engine_build_options={
+                            "opt_image_height": self.height,
+                            "opt_image_width": self.width,
+                            "build_dynamic_shape": not self.static_shapes,
+                            "build_static_batch": self.static_shapes,
+                            # NOTE: this used to also set build_all_tactics=True — that knob
+                            # was dead (never forwarded) and has been replaced by the
+                            # profile-driven max_num_tactics computed centrally in
+                            # build_engine() (utilities.py), which already applies a wider
+                            # tactic budget (128) to dynamic/Flexible builds like this one.
+                            **(
+                                {"min_image_resolution": 384, "max_image_resolution": 1024}
+                                if not self.static_shapes
+                                else {}
+                            ),
+                            **(
+                                {"builder_optimization_level": _vae_build_optlvl}
+                                if _vae_build_optlvl is not None
+                                else {}
+                            ),
+                        },
+                    )
 
                 # A NonBlocking engine stream used to produce black/zero output frames
                 # here, because it skips the legacy/per-thread NULL-stream auto-sync
@@ -3500,7 +3519,7 @@ class StreamDiffusionWrapper:
                         logger.error(f"TensorRT UNet engine loading failed (non-OOM): {e}")
                         raise e
 
-                if load_engine:
+                if load_engine and not _skip_trt_vae_for_full:
                     try:
                         logger.info(
                             f"Loading TensorRT VAE engines vae_encoder_path: {vae_encoder_path}, vae_decoder_path: {vae_decoder_path}"
