@@ -914,8 +914,12 @@ class StreamParameterUpdater(OrchestratorUser):
         dot_product = torch.clamp(torch.dot(flat1_norm, flat2_norm), -1.0, 1.0)
         theta = torch.acos(dot_product)
 
-        # Handle parallel vectors (degenerate SLERP → LERP)
-        if theta.abs() < 1e-6:
+        # Handle parallel AND antiparallel vectors (degenerate SLERP -> LERP).
+        # sin(theta) is the divisor below and is ~0 at both theta~=0 and
+        # theta~=pi; dot_product is clamped to exactly -1.0 above, so theta==pi
+        # is reachable and would otherwise divide into NaN (same guard as
+        # _slerp_noise).
+        if theta.abs() < 1e-6 or (math.pi - theta.abs()) < 1e-6:
             result = (1 - t) * flat1 + t * flat2
         else:
             # SLERP on unit sphere, rescaled to linearly-interpolated magnitude.

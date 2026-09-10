@@ -394,9 +394,7 @@ class TestNormalizeWeightsDegenerateSum:
         with caplog.at_level(logging.WARNING, logger="streamdiffusion.stream_parameter_updater"):
             self.upd._normalize_weights([0.0, 0.0], normalize=True)
             self.upd._normalize_weights([0.0, 0.0], normalize=True)
-        degenerate_warnings = [
-            r for r in caplog.records if "degenerate" not in r.message and "all weights are" in r.message
-        ]
+        degenerate_warnings = [r for r in caplog.records if "all weights are" in r.message]
         assert len(degenerate_warnings) == 1, "expected exactly one warning across repeated degenerate calls"
 
 
@@ -605,6 +603,44 @@ class TestSlerpNoiseAntiparallel:
         result = self.upd._slerp_noise(n1, n2, 0.5)
         assert torch.isfinite(result).all()
         assert result.norm().item() < 1e6, "near-antiparallel slerp should not blow up"
+
+
+class TestSlerpAntiparallel:
+    """Same theta==pi divide-by-zero, but in _slerp (prompt embeddings). _slerp backs
+    the 2-way "slerp" prompt path and, via _multi_slerp, the N-way "slerp" and
+    "cosine_weighted" paths, so an unguarded antiparallel pair would have tripped the
+    cold NaN guard in _apply_prompt_blending and silently frozen the blend instead
+    of producing the linear-fallback result."""
+
+    def setup_method(self):
+        self.upd = _make_updater()
+
+    def test_exactly_antiparallel_embeddings_stay_finite(self):
+        e1 = _rand_embed(seed=120)
+        e2 = -e1  # theta == pi exactly
+        result = self.upd._slerp(e1, e2, 0.5)
+        assert torch.isfinite(result).all(), "antiparallel embeddings must not divide-by-zero into NaN"
+
+    def test_exactly_antiparallel_embeddings_match_linear_fallback(self):
+        e1 = _rand_embed(seed=121)
+        e2 = -e1
+        t = 0.3
+        result = self.upd._slerp(e1, e2, t)
+        expected = (1 - t) * e1 + t * e2
+        assert torch.allclose(result, expected, atol=1e-5)
+
+    def test_nearly_antiparallel_embeddings_stay_finite(self):
+        e1 = _rand_embed(seed=122)
+        e2 = -e1 + 1e-7 * _rand_embed(seed=123)
+        result = self.upd._slerp(e1, e2, 0.5)
+        assert torch.isfinite(result).all()
+        assert result.norm().item() < 1e6, "near-antiparallel slerp should not blow up"
+
+    def test_multi_slerp_antiparallel_pair_stays_finite(self):
+        """The N-way path folds pairs through _slerp; an antiparallel pair must survive it."""
+        e1 = _rand_embed(seed=124)
+        result = self.upd._multi_slerp([e1, -e1], [0.5, 0.5])
+        assert torch.isfinite(result).all()
 
 
 # ---------------------------------------------------------------------------
