@@ -2613,17 +2613,26 @@ class StreamDiffusionWrapper:
             }
             lora_dict = fused_lora_dict if fused_lora_dict else None
 
-        if use_tiny_vae:
-            if vae_id is not None:
-                stream.vae = AutoencoderTiny.from_pretrained(vae_id).to(device=self.device, dtype=self.dtype)
-            else:
-                # Use TAESD XL for SDXL models, regular TAESD for SD 1.5
-                taesd_model = "madebyollin/taesdxl" if is_sdxl else "madebyollin/taesd"
-                stream.vae = AutoencoderTiny.from_pretrained(taesd_model).to(device=self.device, dtype=self.dtype)
-        elif acceleration != "tensorrt":
-            # For non-TensorRT acceleration, ensure VAE is on device if it wasn't moved earlier
-            if hasattr(pipe, "vae") and pipe.vae is not None:
-                pipe.vae = pipe.vae.to(device=self.device)
+        # _resolve_vae replaces the old hardcoded-AutoencoderTiny dispatch (the reported
+        # bug: any vae_id was force-loaded as AutoencoderTiny regardless of its actual
+        # architecture). It always moves the result to device/dtype itself — see its
+        # docstring for why that must not depend on `acceleration` (the F2 device-move
+        # trap: nothing else moves a PyTorch VAE to device once the TensorRT VAE-engine
+        # build, which incidentally used to do this, is skipped below for a full VAE).
+        stream.vae, _vae_class_name, _vae_source = _resolve_vae(vae_id, use_tiny_vae, is_sdxl, self.device, self.dtype)
+        _skip_trt_vae_for_full = _should_skip_trt_vae(_vae_class_name, acceleration)
+        if _skip_trt_vae_for_full:
+            logger.warning(
+                f"Custom VAE {_vae_source} is a full AutoencoderKL — running it in PyTorch "
+                f"(TensorRT VAE engines support TAESD only). UNet remains TensorRT-accelerated; "
+                f"expect a few ms/frame extra at {self.width}x{self.height}. Its encode is also "
+                f"stochastic per frame (Gaussian posterior sampling), unlike TAESD's deterministic "
+                f"encode — this can read as faint per-frame shimmer on static input."
+            )
+        logger.info(
+            f"VAE: {_vae_class_name} from {_vae_source} — "
+            f"{'PyTorch' if (acceleration != 'tensorrt' or _skip_trt_vae_for_full) else 'TensorRT'}"
+        )
 
         try:
             if acceleration == "xformers":
