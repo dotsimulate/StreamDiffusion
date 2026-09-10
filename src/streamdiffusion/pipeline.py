@@ -1,4 +1,5 @@
 import logging
+import math
 import time
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
@@ -34,6 +35,7 @@ from streamdiffusion.param_schema import (
 )
 from streamdiffusion.stream_parameter_updater import StreamParameterUpdater
 from streamdiffusion.tools.gpu_profiler import profiler
+from streamdiffusion.utils.nan_guard import NanGuard
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -174,6 +176,20 @@ class StreamDiffusion:
         self._sync_counter = 0  # counts __call__ invocations for timing-sync cadence (P2)
         self.similar_filter_sleep_fraction = 0.025
         self.last_frame_was_skipped = False  # True when similar filter skipped inference this frame
+
+        # NaN/Inf guards on the hot path — see utils/nan_guard.py docstring. One
+        # instance per guarded buffer so each keeps its own warn-once state and
+        # names itself in the WARNING. Sanitizing is unconditional every call
+        # (branch-free); only the recovery ACTION below (stock_noise reseed) is
+        # gated on a 1-frame-delayed, non-blocking verdict.
+        self._nan_guard_model_pred = NanGuard("unet_step.model_pred")
+        self._nan_guard_image_input = NanGuard("__call__.image_input")
+        self._nan_guard_prev_image = NanGuard("_prev_image_buf")
+        self._nan_guard_latent_cache = NanGuard("_latent_cache")
+        # Guard 7 (_fi_warp_attenuation) already forces a host sync via float() every call,
+        # so it checks isfinite() inline rather than through NanGuard -- but still needs its
+        # own warn-once flag to avoid flooding if fx_frame_transform stays NaN.
+        self._warned_fi_warp_attenuation: bool = False
 
         # Initialize SDXL-specific attributes
         if self.is_sdxl:
@@ -444,6 +460,22 @@ class StreamDiffusion:
 
     def disable_similar_image_filter(self) -> None:
         self.similar_image_filter = False
+
+    def _nan_guard(self, attr: str, name: str) -> NanGuard:
+        """Lazily fetch/create a NanGuard stored at `attr`.
+
+        __init__ already sets the standard guards up front (self-documenting,
+        the normal path), but some tests construct StreamDiffusion via
+        object.__new__ to drive predict_x0_batch/unet_step directly without a
+        real model (test_rcfg_self_single_step_reseed.py, test_derived_tensor_sync.py),
+        bypassing __init__ entirely. Falling back to lazy creation here keeps
+        the guards resilient to that construction path too.
+        """
+        guard = getattr(self, attr, None)
+        if guard is None:
+            guard = NanGuard(name)
+            setattr(self, attr, guard)
+        return guard
 
     @torch.inference_mode()
     def prepare(
@@ -1070,7 +1102,25 @@ class StreamDiffusion:
         linear_dev = (theta[:, :, :2] - identity).flatten(1).norm(dim=1)
         translation_dev = theta[:, :, 2].norm(dim=1)
         warp_mag = (linear_dev + translation_dev).max()
-        return float(torch.exp(-self._FI_WARP_ATTENUATION_K * warp_mag).clamp(0.0, 1.0))
+        attenuation = float(torch.exp(-self._FI_WARP_ATTENUATION_K * warp_mag).clamp(0.0, 1.0))
+        # NaN guard 7: this already forces a host read via float() above (no extra sync
+        # cost), so check inline rather than through NanGuard. A non-finite fx_frame_transform
+        # (e.g. a NaN FX zoom/rotation) would otherwise become a NaN FI strength at the call
+        # site below and NaN the entire UNet -- fall back to no attenuation instead.
+        if not math.isfinite(attenuation):
+            # getattr fallback: tests construct StreamDiffusion via object.__new__,
+            # bypassing __init__ (see pipeline._nan_guard docstring for the same concern).
+            if not getattr(self, "_warned_fi_warp_attenuation", False):
+                logger.warning(
+                    "pipeline._fi_warp_attenuation: non-finite result (fx_frame_transform has "
+                    "NaN/Inf) -- falling back to 1.0 (no attenuation); further occurrences "
+                    "logged at DEBUG"
+                )
+                self._warned_fi_warp_attenuation = True
+            else:
+                logger.debug("pipeline._fi_warp_attenuation: non-finite result -- falling back to 1.0")
+            return 1.0
+        return attenuation
 
     def unet_step(
         self,
@@ -1175,6 +1225,9 @@ class StreamDiffusion:
 
         # Extract potential ControlNet residual kwargs / extra kwargs (e.g., ipadapter_scale), then call UNet
         with profiler.region("unet_step.engine"):
+            # Guard 1's verdict is read unconditionally in unet_step.post (:1375), so it must be
+            # bound on EVERY branch below -- the two SDXL branches previously left it unbound.
+            nan_guard_bad_last_frame = False
             hook_down_res = unet_kwargs.get("down_block_additional_residuals", None)
             hook_mid_res = unet_kwargs.get("mid_block_additional_residual", None)
             hook_extra_kwargs = (
@@ -1217,6 +1270,11 @@ class StreamDiffusion:
                         model_pred = _unet_result[0]
                         kvo_cache_out = _unet_result[1] if len(_unet_result) > 1 else []
                         fio_cache_out = _unet_result[2] if len(_unet_result) > 2 else []
+                        # Sanitize predictions now; cache ingress has its own guards.
+                        # A delayed model verdict cannot identify this call's cache values.
+                        nan_guard_bad_last_frame = self._nan_guard(
+                            "_nan_guard_model_pred", "unet_step.model_pred"
+                        ).sanitize_(model_pred)
                         self.update_kvo_cache(kvo_cache_out, fio_cache_out)
                     else:
                         # PyTorch UNet expects diffusers-style named arguments. Any processor scaling is handled by IP-Adapter hook
@@ -1235,6 +1293,11 @@ class StreamDiffusion:
                             call_kwargs["mid_block_additional_residual"] = hook_mid_res
                         model_pred = self.unet(**call_kwargs)[0]
                         # No restoration for per-layer scale; next step will set again via updater/time factor
+
+                        # NaN guard 1: this branch never calls update_kvo_cache, so sanitize only.
+                        nan_guard_bad_last_frame = self._nan_guard(
+                            "_nan_guard_model_pred", "unet_step.model_pred"
+                        ).sanitize_(model_pred)
 
                 except Exception as e:
                     logger.error(f"[PIPELINE] unet_step: *** ERROR: SDXL UNet call failed: {e} ***")
@@ -1281,6 +1344,16 @@ class StreamDiffusion:
                 model_pred = _unet_result[0]
                 kvo_cache_out = _unet_result[1] if len(_unet_result) > 1 else []
                 fio_cache_out = _unet_result[2] if len(_unet_result) > 2 else []
+
+                # NaN guard 1 (highest value): sanitizes model_pred unconditionally so a
+                # poisoned UNet output can't propagate into the CFG combine, the scheduler
+                # step, or the self/initialize stock_noise recurrence below. The returned
+                # CUDA verdict is delayed (possibly several calls on a busy stream).
+                # Use it below to reseed stock_noise, not to discard current cache
+                # outputs: sanitized cache writes must continue replacing old history.
+                nan_guard_bad_last_frame = self._nan_guard("_nan_guard_model_pred", "unet_step.model_pred").sanitize_(
+                    model_pred
+                )
                 self.update_kvo_cache(kvo_cache_out, fio_cache_out)
 
         with profiler.region("unet_step.post"):
@@ -1309,6 +1382,13 @@ class StreamDiffusion:
             # treats as a throwaway (_alpha_next/_beta_next degenerate to 1.0), and
             # predict_x0_batch reseeds stock_noise from init_noise every frame anyway.
             if (self.cfg_type == "self" or self.cfg_type == "initialize") and self.denoising_steps_num > 1:
+                if nan_guard_bad_last_frame:
+                    # NaN guard 1 recovery: the previous frame poisoned model_pred, which
+                    # (pre-guard) would have poisoned self.stock_noise via this same
+                    # recurrence -- reseed from the clean init_noise before continuing it,
+                    # reusing predict_x0_batch's n==1 recovery (pipeline.py's per-frame
+                    # reseed comment above `self.stock_noise.copy_(self.init_noise)`).
+                    self.stock_noise.copy_(self.init_noise)
                 scaled_noise = self.beta_prod_t_sqrt * self.stock_noise
                 delta_x = self.scheduler_step_batch(model_pred, scaled_noise, idx)
                 delta_x = self._alpha_next * delta_x
@@ -1354,17 +1434,20 @@ class StreamDiffusion:
                 # Each kvo_cache_out[i] arrives shape (2, 1, B, S, H); squeeze(1) → (2, B, S, H).
                 for bucket_idx, output_indices in enumerate(self._kvo_outputs_by_bucket):
                     stacked = torch.stack([kvo_cache_out[i].squeeze(1) for i in output_indices], dim=0)
+                    stacked.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
                     self._kvo_buckets[bucket_idx][:, :, write_slot].copy_(stacked)
             else:
                 # Fallback path — used when buckets were dropped after a kvo_cache resize
                 # (stream_parameter_updater rebinds kvo_cache[i] to standalone tensors).
                 for i, new_kv in enumerate(kvo_cache_out):
+                    new_kv.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
                     self.kvo_cache[i][:, write_slot].copy_(new_kv.squeeze(1))
 
         if has_fio:
             # FI output cache update — each fio_cache_out[i] has shape (1, B, S, H).
             # Squeeze dim 0 to (B, S, H) and write into the circular buffer slot.
             for i, new_fi in enumerate(fio_cache_out):
+                new_fi.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
                 self.fio_cache[i][write_slot].copy_(new_fi.squeeze(0))
 
     def encode_image(self, image_tensors: torch.Tensor) -> torch.Tensor:
@@ -1392,6 +1475,12 @@ class StreamDiffusion:
     def predict_x0_batch(self, x_t_latent: torch.Tensor) -> torch.Tensor:
         with profiler.region("predict_x0_batch"):
             prev_latent_batch = self.x_t_latent_buffer
+            # Repair recurrent inputs as well as outputs: overflow in scheduler
+            # arithmetic or a latent hook can poison these independently of UNet.
+            x_t_latent.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+            if prev_latent_batch is not None:
+                prev_latent_batch.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+            self.stock_noise.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
 
             # LCM supports our denoising-batch trick. TCD must use standard scheduler.step() sequentially
             # but now properly processes ControlNet hooks through unet_step()
@@ -1511,6 +1600,13 @@ class StreamDiffusion:
             # IMAGE PREPROCESSING HOOKS: After built-in preprocessing, before filtering
             x = self._apply_image_preprocessing_hooks(x)
 
+            # NaN guard 2: single choke point for all image input, including anything an
+            # image-preprocessing hook (FX chain) may have injected. Sanitizes in place,
+            # unconditionally -- see utils/nan_guard.py. No recovery action needed here
+            # (unlike guard 1's stock_noise reseed): cutting off propagation into
+            # encode_image is the whole job.
+            self._nan_guard("_nan_guard_image_input", "__call__.image_input").sanitize_(x)
+
             if self.similar_image_filter:
                 x = self.similar_filter(x)
                 if x is None:
@@ -1558,6 +1654,12 @@ class StreamDiffusion:
         # LATENT POSTPROCESSING HOOKS: After diffusion, before VAE decoding
         x_0_pred_out = self._apply_latent_postprocessing_hooks(x_0_pred_out)
 
+        # NaN guard 4: sanitizes in place before both consumers below -- the persistent
+        # _latent_cache (read by latent-feedback processors on the NEXT frame) and
+        # decode_image just below it. Covers anything a latent-postprocessing hook (e.g.
+        # latent_feedback.py) may have injected, in addition to guard 1's UNet coverage.
+        self._nan_guard("_nan_guard_latent_cache", "_latent_cache").sanitize_(x_0_pred_out)
+
         # Store latent result for latent feedback processors (reuse pre-allocated buffer)
         if self._latent_cache is None:
             self._latent_cache = torch.empty_like(x_0_pred_out)
@@ -1572,6 +1674,12 @@ class StreamDiffusion:
 
         # IMAGE POSTPROCESSING HOOKS: After VAE decoding, before final output
         x_output = self._apply_image_postprocessing_hooks(x_output)
+
+        # NaN guard 3: sanitizes in place before the persistent _prev_image_buf (read by
+        # image-feedback processors, e.g. feedback_loop.py, on the NEXT frame) and before
+        # this frame's returned output -- covers anything an image-postprocessing hook may
+        # have injected, in addition to guards 1/2/4's upstream coverage.
+        self._nan_guard("_nan_guard_prev_image", "_prev_image_buf").sanitize_(x_output)
 
         # Copy into pre-allocated skip-frame cache — TRT VAE buffer is reused on next decode call
         if self._prev_image_buf is None:
@@ -1673,6 +1781,9 @@ class StreamDiffusion:
         # LATENT POSTPROCESSING HOOKS: After diffusion, before VAE decoding
         x_0_pred_out = self._apply_latent_postprocessing_hooks(x_0_pred_out)
 
+        # NaN guard 4 (see __call__ for full rationale): same persistent _latent_cache.
+        self._nan_guard("_nan_guard_latent_cache", "_latent_cache").sanitize_(x_0_pred_out)
+
         # Store latent result for latent feedback processors (reuse pre-allocated buffer)
         if self._latent_cache is None:
             self._latent_cache = torch.empty_like(x_0_pred_out)
@@ -1687,6 +1798,9 @@ class StreamDiffusion:
 
         # IMAGE POSTPROCESSING HOOKS: After VAE decoding, before final output
         x_output = self._apply_image_postprocessing_hooks(x_output)
+
+        # NaN guard 3 (see __call__ for full rationale): sanitize final output in place.
+        self._nan_guard("_nan_guard_prev_image", "_prev_image_buf").sanitize_(x_output)
 
         # NOTE: x_output aliases self._image_decode_buf, a persistent buffer reused every
         # call to avoid a per-frame .clone() (see buffer init above). Intentional: callers
@@ -1739,12 +1853,19 @@ class StreamDiffusion:
                 return_dict=False,
             )[0]
 
+        # NaN guard (mirrors guard 1 -- this path doesn't go through unet_step, so
+        # model_pred isn't covered there): sanitize before it feeds the x_0 formula below.
+        self._nan_guard("_nan_guard_model_pred", "unet_step.model_pred").sanitize_(model_pred)
+
         x_0_pred_out = ((x_t_latent - self.beta_prod_t_sqrt * model_pred).float() / self.alpha_prod_t_sqrt.float()).to(
             x_t_latent.dtype
         )
 
         # LATENT POSTPROCESSING HOOKS: After diffusion, before VAE decoding
         x_0_pred_out = self._apply_latent_postprocessing_hooks(x_0_pred_out)
+
+        # NaN guard 4 (see __call__ for full rationale): same persistent _latent_cache.
+        self._nan_guard("_nan_guard_latent_cache", "_latent_cache").sanitize_(x_0_pred_out)
 
         # Store latent result for latent feedback processors (reuse pre-allocated buffer)
         if self._latent_cache is None:
@@ -1756,5 +1877,8 @@ class StreamDiffusion:
 
         # IMAGE POSTPROCESSING HOOKS: After VAE decoding, before final output
         x_output = self._apply_image_postprocessing_hooks(x_output)
+
+        # NaN guard 3 (see __call__ for full rationale): sanitize final output in place.
+        self._nan_guard("_nan_guard_prev_image", "_prev_image_buf").sanitize_(x_output)
 
         return x_output

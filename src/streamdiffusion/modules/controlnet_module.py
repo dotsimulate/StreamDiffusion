@@ -14,6 +14,7 @@ from streamdiffusion.preprocessing.preprocessing_orchestrator import (
     PreprocessingOrchestrator,
 )
 from streamdiffusion.tools.gpu_profiler import profiler
+from streamdiffusion.utils.nan_guard import NanGuard
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,11 @@ class ControlNetModule(OrchestratorUser):
         self._cn_ema_down: Optional[List[torch.Tensor]] = None
         self._cn_ema_mid: Optional[torch.Tensor] = None
         self._cn_ema_shape_key: Optional[tuple] = None
+        # NaN guard 5 (see utils/nan_guard.py): decay < 1.0 makes lerp_ a PERMANENT latch
+        # for a poisoned target -- applied.lerp_(nan_target, decay) is NaN forever after,
+        # never flushed by subsequent good frames. Sanitize the incoming target in place
+        # before it reaches the EMA buffers or the cache. One guard per residual group.
+        self._nan_guard_cn_residuals = NanGuard("controlnet.residuals")
 
         # Persistent multi-ControlNet residual merge buffers (Phase-2 prep). The naive
         # `merged_down[j] = merged_down[j] + ds[j]` allocates a fresh tensor every frame,
@@ -710,6 +716,13 @@ class ControlNetModule(OrchestratorUser):
                     mid_block_additional_residual=self._cn_merged_mid,
                 )
 
+            # NaN guard 5: sanitize the freshly computed residuals in place before they can
+            # reach the persistent cache (below) or the EMA buffers (_apply_residual_decay).
+            # Single choke point for both the single-CN and merged-CN paths above.
+            for _t in _result.down_block_additional_residuals:
+                self._nan_guard_cn_residuals.sanitize_(_t)
+            self._nan_guard_cn_residuals.sanitize_(_result.mid_block_additional_residual)
+
             # Residual cache write: store result for reuse on upcoming intermediate
             # frames. With decay > 0 the EMA needs a target even at interval == 1.
             if self._cn_cache_interval > 1 or decay > 0.0:
@@ -752,6 +765,11 @@ class ControlNetModule(OrchestratorUser):
             for j, t in enumerate(down):
                 self._cn_ema_down[j].lerp_(t, decay)
             self._cn_ema_mid.lerp_(mid, decay)
+        # The EMA itself is recurrent: repair a previous poisoned state or
+        # overflow in interpolation before publishing it to the next UNet step.
+        for applied in self._cn_ema_down:
+            applied.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+        self._cn_ema_mid.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
         return UnetKwargsDelta(
             down_block_additional_residuals=self._cn_ema_down,
             mid_block_additional_residual=self._cn_ema_mid,

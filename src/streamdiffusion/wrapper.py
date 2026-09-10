@@ -1842,27 +1842,37 @@ class StreamDiffusionWrapper:
         )
         return self._cuda_ipc_cn_exporter
 
-    def export_controlnet_preview_ipc(self, tensor: torch.Tensor) -> None:
+    def export_controlnet_preview_ipc(self, tensor: torch.Tensor) -> bool:
         """Export a ControlNet preprocessor output tensor to TD via zero-copy GPU IPC.
 
         The tensor must be in [0, 1] range (CHW or NCHW); it is NOT denormalized.
-        This is a display-only path — no health tracking, no return value.
-        No-op if cuda_ipc_cn_processed_shm_name was not configured.
+        True means published to the ring, not acknowledged by a TD receiver.
+        Barrier skips, failures and unknown legacy outcomes return False.
         """
         if not self._cuda_ipc_cn_processed_shm_name:
-            return
+            return False
         try:
-            from cuda_link import GpuFrame
+            from cuda_link import GpuFrame, FrameOutcome
 
             bgra = self._ipc_pack_unit_rgba(tensor)
             exporter = self._lazy_init_cn_ipc_exporter(bgra.shape[0], bgra.shape[1])
-            exporter.export(
+            outcome = exporter.export(
                 GpuFrame(
                     ptr=bgra.data_ptr(),
                     size=bgra.numel(),
                     producer_stream=torch.cuda.current_stream().cuda_stream,
                 )
             )
+            if outcome == FrameOutcome.FAILED:
+                # FAILED is terminal in the exporter contract. Drop the cached
+                # instance even if close raises so the next frame can reopen it.
+                # Backpressure skips retain the exporter and its receiver state.
+                self._cuda_ipc_cn_exporter = None
+                exporter.close()
+                if not self._cn_ipc_export_warned:
+                    logger.warning("export_controlnet_preview_ipc: exporter failed; retrying on next frame")
+                    self._cn_ipc_export_warned = True
+            return outcome == FrameOutcome.PUBLISHED
         except Exception:
             # First failure is loud (warning + traceback) so a dead preview path is visible in
             # the console rather than only in DEBUG-level logs; repeats fall back to debug so a
@@ -1872,6 +1882,7 @@ class StreamDiffusionWrapper:
                 self._cn_ipc_export_warned = True
             else:
                 logger.debug("export_controlnet_preview_ipc: export failed", exc_info=True)
+            return False
 
     def get_ipc_health_status(self) -> str:
         """Return a short health string for the CUDA-IPC zero-copy output path.

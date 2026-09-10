@@ -4,6 +4,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from streamdiffusion.utils.nan_guard import NanGuard
+
 
 class SimilarImageFilter:
     """Stochastic frame-skip filter (StreamDiffusion §3.3).
@@ -25,6 +27,10 @@ class SimilarImageFilter:
         self._skip_prob_pin: Optional[torch.Tensor] = None  # pinned CPU scalar (lazy init)
         self._skip_evt: Optional[torch.cuda.Event] = None  # marks when the copy_ below has landed
         self._last_skip_prob: float = 0.0  # fallback while that copy is still in flight
+        # NaN guard 8: clamp() below does not filter NaN (NaN < x is always False), so a
+        # NaN mse used to survive into skip_prob and latch the always-skip branch forever
+        # (comment here previously claimed "never garbage" -- see nan_guard.py docstring).
+        self._nan_guard_skip_prob = NanGuard("image_filter.skip_prob")
 
     def __call__(self, x: torch.Tensor) -> Optional[torch.Tensor]:
         # First frame: allocate buffers, always pass through
@@ -44,9 +50,10 @@ class SimilarImageFilter:
         # completion is checked explicitly instead, via _skip_evt (recorded on the
         # producing stream right after the copy_() below) -- .query() is non-blocking, so
         # this adds no host stall. If the copy hasn't landed yet, fall back to the last
-        # value that did; _skip_prob_pin is zero-initialised above and only ever
-        # overwritten with a value clamped to [0, 1] (Step 2 below), so a fallback read is
-        # always a valid, merely stale, probability -- never garbage.
+        # value that did; _skip_prob_pin is zero-initialised above and only ever overwritten
+        # with a value clamped to [0, 1] AND NaN-sanitized (Step 2's NaN guard 8 below) --
+        # clamp() alone does not filter NaN, so a fallback read is always a valid, merely
+        # stale, probability -- never garbage.
         if self._skip_evt is not None and self._skip_evt.query():
             self._last_skip_prob = self._skip_prob_pin.item()
         skip_prob = self._last_skip_prob
@@ -58,6 +65,11 @@ class SimilarImageFilter:
             gpu_skip = torch.zeros(1, device=x.device, dtype=torch.float32)
         else:
             gpu_skip = torch.clamp(1.0 - mse / self._mse_threshold, min=0.0, max=1.0)
+        # NaN guard 8: sanitize in place before the async copy below -- NaN -> 0.0 means
+        # "never skip" (self-healing: keeps processing frames) rather than latching into
+        # the always-skip branch (Step 3's `skip_prob < random.random()` is always False
+        # for NaN). Unconditional, branch-free, no extra sync (mirrors nan_guard.py).
+        self._nan_guard_skip_prob.sanitize_(gpu_skip)
         # Async copy result to pinned CPU buffer for NEXT frame to read
         self._skip_prob_pin.copy_(gpu_skip.view(1), non_blocking=True)
         self._skip_evt.record()  # marks when the copy above has actually landed
