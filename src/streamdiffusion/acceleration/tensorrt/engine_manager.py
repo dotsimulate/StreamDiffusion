@@ -190,6 +190,7 @@ class EngineManager:
         min_batch_size: int,
         mode: str,
         use_tiny_vae: bool,
+        vae_id: Optional[str] = None,
         lora_dict: Optional[Dict[str, float]] = None,
         ipadapter_scale: Optional[float] = None,
         ipadapter_tokens: Optional[int] = None,
@@ -263,6 +264,19 @@ class EngineManager:
 
             # Create prefix (from wrapper.py lines 1005-1013)
             prefix = f"{base_name}--tiny_vae-{use_tiny_vae}--min_batch-{min_batch_size}--max_batch-{max_batch_size}"
+
+            # Fork the VAE engine's cache identity on vae_id so two different custom
+            # VAEs (of the same architecture) never collide on one cached engine
+            # directory. Hashed, not the raw id: vae_id is typically a HF repo id
+            # containing "/", which would otherwise silently create a *nested*
+            # directory via the path join a few lines below (see _lora_signature for
+            # the same idiom). Scoped to VAE_ENCODER/VAE_DECODER only — this is not
+            # cosmetic: EngineType.UNET hashes its *entire* prefix into the directory
+            # name below, so adding a token to the shared prefix here would change
+            # every existing user's UNet engine hash and force a mass rebuild on
+            # upgrade (mirrors why the IP-Adapter/LoRA suffixes below are UNet-only).
+            if vae_id and engine_type in (EngineType.VAE_ENCODER, EngineType.VAE_DECODER):
+                prefix += f"--vae-{hashlib.sha1(vae_id.encode('utf-8')).hexdigest()[:10]}"
 
             if engine_type == EngineType.UNET:
                 # IP-Adapter differentiation: add type and (optionally) tokens. Only UNet
