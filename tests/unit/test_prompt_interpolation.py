@@ -348,6 +348,135 @@ class TestApplyPromptBlendingDispatch:
 
 
 # ---------------------------------------------------------------------------
+# Regression: all-zero (degenerate-sum) weights used to reach an unguarded
+# weights / weights.sum() in _normalize_weights, producing a 0/0 -> NaN
+# embedding that then latches permanently into cross-frame pipeline buffers
+# (x_t_latent_buffer, stock_noise) with no recovery -- the "Normpweights off +
+# both prompts at 0 -> permanently black" bug. Repro: TD's own all-zero guard
+# (StreamDiffusionExt.py Promptblock) only fires when its Normpweights toggle
+# is on, so toggling it off forwards literal 0.0 weights straight to the
+# backend, which had no guard of its own.
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeWeightsDegenerateSum:
+    def setup_method(self):
+        self.upd = _make_updater()
+
+    def test_all_zero_normalize_true_returns_uniform(self):
+        out = self.upd._normalize_weights([0.0, 0.0], normalize=True)
+        assert torch.isfinite(out).all(), "degenerate sum must not divide by zero into NaN"
+        assert torch.allclose(out, torch.tensor([0.5, 0.5]))
+
+    def test_all_zero_normalize_false_returns_uniform(self):
+        """The guard applies regardless of `normalize` -- an all-zero weight list has
+        no useful interpretation either way, and normalize=False would otherwise let
+        a literal-zeros embedding (average) disagree with slerp/cosine's fallback."""
+        out = self.upd._normalize_weights([0.0, 0.0, 0.0], normalize=False)
+        assert torch.isfinite(out).all()
+        assert torch.allclose(out, torch.tensor([1.0 / 3, 1.0 / 3, 1.0 / 3]))
+
+    def test_near_zero_sum_also_treated_as_degenerate(self):
+        out = self.upd._normalize_weights([1e-10, -1e-10], normalize=True)
+        assert torch.isfinite(out).all()
+
+    def test_nonzero_weights_unaffected_normalize_true(self):
+        out = self.upd._normalize_weights([0.7, 0.3], normalize=True)
+        assert torch.allclose(out, torch.tensor([0.7, 0.3]), atol=1e-6)
+
+    def test_nonzero_weights_unaffected_normalize_false(self):
+        out = self.upd._normalize_weights([0.7, 0.3], normalize=False)
+        assert torch.allclose(out, torch.tensor([0.7, 0.3]), atol=1e-6)
+
+    def test_warns_once(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="streamdiffusion.stream_parameter_updater"):
+            self.upd._normalize_weights([0.0, 0.0], normalize=True)
+            self.upd._normalize_weights([0.0, 0.0], normalize=True)
+        degenerate_warnings = [
+            r for r in caplog.records if "degenerate" not in r.message and "all weights are" in r.message
+        ]
+        assert len(degenerate_warnings) == 1, "expected exactly one warning across repeated degenerate calls"
+
+
+class TestApplyPromptBlendingZeroWeights:
+    """Same regression, exercised through the real blend entry point
+    (_apply_prompt_blending) for all three interpolation methods and both
+    normalize settings -- this is where the NaN was actually born and then
+    unconditionally assigned to stream.prompt_embeds (:831)."""
+
+    def setup_method(self):
+        self.upd = _make_updater()
+        e1 = _rand_embed(seed=200)
+        e2 = _rand_embed(seed=201)
+        self.upd._prompt_cache = {"cat": {"embed": e1}, "dog": {"embed": e2}}
+        self.upd._current_negative_prompt = ""
+
+    def _assert_finite_for(self, method: str, normalize: bool):
+        self.upd._current_prompt_list = [("cat", 0.0), ("dog", 0.0)]
+        self.upd.normalize_prompt_weights = normalize
+        self.upd._apply_prompt_blending(method)
+        embeds = self.upd.stream.prompt_embeds
+        assert embeds is not None
+        assert torch.isfinite(embeds).all(), (
+            f"method={method} normalize={normalize}: all-zero prompt weights produced a non-finite embedding"
+        )
+
+    def test_slerp_normalize_true(self):
+        self._assert_finite_for("slerp", True)
+
+    def test_slerp_normalize_false(self):
+        self._assert_finite_for("slerp", False)
+
+    def test_average_normalize_true(self):
+        self._assert_finite_for("average", True)
+
+    def test_average_normalize_false(self):
+        self._assert_finite_for("average", False)
+
+    def test_cosine_weighted_normalize_true(self):
+        self._assert_finite_for("cosine_weighted", True)
+
+    def test_cosine_weighted_normalize_false(self):
+        self._assert_finite_for("cosine_weighted", False)
+
+
+class TestApplySeedBlendingZeroWeights:
+    """Seed path shares _normalize_weights (:1022, :1050) -- a zero-sum seed_list
+    would poison init_noise, the pipeline's only clean recovery source for guard 1
+    (see plan Part 2)."""
+
+    def setup_method(self):
+        self.upd = _make_updater()
+        n1 = _rand_noise(seed=210)
+        n2 = _rand_noise(seed=211)
+        self.upd._seed_cache = {0: {"noise": n1, "seed": 210}, 1: {"noise": n2, "seed": 211}}
+
+    def _assert_finite_for(self, method: str, normalize: bool):
+        self.upd._current_seed_list = [(210, 0.0), (211, 0.0)]
+        self.upd.normalize_seed_weights = normalize
+        self.upd._apply_seed_blending(method)
+        noise = self.upd.stream.init_noise
+        assert noise is not None
+        assert torch.isfinite(noise).all(), (
+            f"method={method} normalize={normalize}: all-zero seed weights produced non-finite init_noise"
+        )
+
+    def test_slerp_normalize_true(self):
+        self._assert_finite_for("slerp", True)
+
+    def test_average_normalize_true(self):
+        self._assert_finite_for("average", True)
+
+    def test_cosine_weighted_normalize_true(self):
+        self._assert_finite_for("cosine_weighted", True)
+
+    def test_average_normalize_false(self):
+        self._assert_finite_for("average", False)
+
+
+# ---------------------------------------------------------------------------
 # _cosine_adjusted_weights — shared reweighting helper (used by both the prompt
 # path via _cosine_weighted_blend and the seed path directly)
 # ---------------------------------------------------------------------------
@@ -433,6 +562,49 @@ class TestMultiSlerpNoise:
         result_with = self.upd._multi_slerp_noise([n1, n2, n_zero], [0.6, 0.4, 0.0])
         result_without = self.upd._multi_slerp_noise([n1, n2], [0.6, 0.4])
         assert torch.allclose(result_with, result_without, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Cold-guard regression: _slerp_noise's sin_theta divisor goes to zero not only
+# at theta~=0 (parallel, already handled) but also at theta~=pi (antiparallel).
+# dot_product is explicitly clamped to exactly -1.0 (:1176), so theta==pi is
+# reachable -- e.g. a seed noise tensor reused with a sign flip upstream -- and
+# the pre-fix code divided by that zero into a NaN that would poison init_noise,
+# the pipeline's only clean recovery source for guard 1.
+# ---------------------------------------------------------------------------
+
+
+class TestSlerpNoiseAntiparallel:
+    def setup_method(self):
+        self.upd = _make_updater()
+
+    def test_exactly_antiparallel_vectors_stay_finite(self):
+        n1 = _rand_noise(seed=95)
+        n2 = -n1  # theta == pi exactly
+        result = self.upd._slerp_noise(n1, n2, 0.5)
+        assert torch.isfinite(result).all(), "antiparallel noise must not divide-by-zero into NaN"
+
+    def test_exactly_antiparallel_vectors_match_linear_fallback(self):
+        """At theta==pi the fix takes the same linear-fallback branch as theta==0;
+        pin the expected formula so this doesn't silently regress to something
+        merely finite-but-wrong."""
+        n1 = _rand_noise(seed=96)
+        n2 = -n1
+        t = 0.3
+        result = self.upd._slerp_noise(n1, n2, t)
+        expected = (1 - t) * n1 + t * n2
+        assert torch.allclose(result, expected, atol=1e-5)
+
+    def test_nearly_antiparallel_vectors_stay_finite(self):
+        """theta very close to (but not exactly) pi -- sin(theta) is a tiny nonzero
+        denominator pre-fix, which blows up the result rather than NaN-ing it
+        outright; must still land in the linear-fallback branch."""
+        n1 = _rand_noise(seed=97)
+        # Perturb slightly so dot_product clamps to just inside -1.0, not exactly it.
+        n2 = -n1 + 1e-7 * _rand_noise(seed=98)
+        result = self.upd._slerp_noise(n1, n2, 0.5)
+        assert torch.isfinite(result).all()
+        assert result.norm().item() < 1e6, "near-antiparallel slerp should not blow up"
 
 
 # ---------------------------------------------------------------------------
@@ -700,3 +872,60 @@ class TestStickyInterpolationMethods:
         assert fresh._last_seed_interpolation_method == "cosine_weighted"
         assert fresh.stream.prompt_embeds is None
         assert fresh.stream.init_noise is None
+
+
+# ---------------------------------------------------------------------------
+# Part 3 regression: toggling Normpweights/normalize_seed_weights alone (no
+# prompt/seed list edit) used to have zero effect until the next list update,
+# because update_stream_params only re-blended on prompt_list/seed_list or an
+# *_interpolation_method change. This mirrors TestStickyInterpolationMethods'
+# method-only re-blend tests, but for the normalize-flag-only path.
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeFlagOnlyReblendsImmediately:
+    def setup_method(self):
+        self.upd = _make_updater()
+        e1 = _rand_embed(seed=300)
+        e2 = _rand_embed(seed=301)
+        self.upd._prompt_cache = {"cat": {"embed": e1}, "dog": {"embed": e2}}
+        self.upd._current_prompt_list = [("cat", 0.5), ("dog", 0.5)]
+        self.upd._current_negative_prompt = ""
+
+        n1 = _rand_noise(seed=310)
+        n2 = _rand_noise(seed=311)
+        self.upd._seed_cache = {0: {"noise": n1, "seed": 310}, 1: {"noise": n2, "seed": 311}}
+        self.upd._current_seed_list = [(310, 0.5), (311, 0.5)]
+
+    def test_normalize_prompt_weights_only_reblends_immediately(self):
+        assert self.upd.stream.prompt_embeds is None  # nothing blended yet
+        self.upd.update_stream_params(normalize_prompt_weights=False)
+        assert self.upd.normalize_prompt_weights is False
+        assert self.upd.stream.prompt_embeds is not None, (
+            "a normalize_prompt_weights-only change must re-blend the cached prompts "
+            "immediately, not wait for the next prompt_list update"
+        )
+
+    def test_normalize_seed_weights_only_reblends_immediately(self):
+        assert self.upd.stream.init_noise is None
+        self.upd.update_stream_params(normalize_seed_weights=False)
+        assert self.upd.normalize_seed_weights is False
+        assert self.upd.stream.init_noise is not None, (
+            "a normalize_seed_weights-only change must re-blend the cached seed noise "
+            "immediately, not wait for the next seed_list update"
+        )
+
+    def test_normalize_prompt_weights_flag_actually_changes_output(self):
+        """Not just 'it re-blended' -- confirm the flag is wired through to the
+        blend math (Totalpweights-equivalent: un-normalized weights amplify)."""
+        self.upd._current_prompt_list = [("cat", 2.0), ("dog", 2.0)]
+        self.upd.update_stream_params(normalize_prompt_weights=True)
+        normalized_embeds = self.upd.stream.prompt_embeds.clone()
+
+        self.upd.update_stream_params(normalize_prompt_weights=False)
+        unnormalized_embeds = self.upd.stream.prompt_embeds.clone()
+
+        assert not torch.allclose(normalized_embeds, unnormalized_embeds), (
+            "toggling normalize_prompt_weights with an identical prompt_list produced "
+            "identical output -- the flag isn't reaching the blend"
+        )
