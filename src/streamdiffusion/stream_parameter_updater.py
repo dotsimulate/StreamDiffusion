@@ -94,6 +94,17 @@ class StreamParameterUpdater(OrchestratorUser):
         # ceiling. A set-time check only — a later live guidance change can move
         # the ceiling without re-triggering it.
         self._warned_delta_above_ceiling: bool = False
+        # Warn-once flag for a degenerate (all-zero-sum) weight list reaching
+        # _normalize_weights — e.g. every prompt/seed weight dragged to 0 with
+        # normalize_prompt_weights/normalize_seed_weights False (bypassing TD's
+        # own all-zero guard, which only fires when its normalize toggle is on).
+        # This path takes live per-frame weight updates, so warn once, not every frame.
+        self._warned_degenerate_weights: bool = False
+        # Warn-once flags for cold-path NaN guards (see utils/nan_guard.py docstring for
+        # the family of hot-path guards this mirrors) — these are param-update-only sites,
+        # not per-frame, so a plain validate-and-reject on the host is fine, no sync concern.
+        self._warned_nonfinite_prompt_embeds: bool = False
+        self._warned_nonfinite_init_noise: bool = False
 
     def get_cache_info(self) -> Dict:
         """Get cache statistics for monitoring performance."""
@@ -247,9 +258,29 @@ class StreamParameterUpdater(OrchestratorUser):
         (a 0-dim CPU operand is treated as a wrapped scalar there), so building on
         device was a pure creation-sync + readback with no benefit — and float32 is
         more precise than the model's fp16 for the normalization divide.
+
+        A degenerate (near-zero) weight sum has no useful interpretation under either
+        setting of `normalize` — with normalize=True it's an unguarded 0/0 -> NaN that
+        latches permanently into cross-frame pipeline buffers (x_t_latent_buffer,
+        stock_noise) with no recovery; with normalize=False the "average" caller would
+        silently emit an all-zero embedding while "slerp"/"cosine_weighted" fall back
+        to embeddings[0], i.e. the three methods would disagree. So this is handled
+        before the normalize branch, unconditionally: fall back to uniform weights
+        (sum == 1), matching TD's own all-zero guard (StreamDiffusionExt.py Promptblock).
         """
         weights_tensor = torch.tensor(weights, dtype=torch.float32)
-        if normalize:
+        if weights_tensor.numel() and float(weights_tensor.sum().abs()) <= 1e-8:
+            if not self._warned_degenerate_weights:
+                logger.warning(
+                    "_normalize_weights: all weights are ~0 (%r) - falling back to "
+                    "uniform weights (1/%d each) instead of dividing by zero "
+                    "(warning shown once)",
+                    weights,
+                    weights_tensor.numel(),
+                )
+                self._warned_degenerate_weights = True
+            weights_tensor = torch.full_like(weights_tensor, 1.0 / weights_tensor.numel())
+        elif normalize:
             weights_tensor = weights_tensor / weights_tensor.sum()
         return weights_tensor
 
@@ -477,9 +508,11 @@ class StreamParameterUpdater(OrchestratorUser):
                     negative_prompt=negative_prompt or self._current_negative_prompt,
                     prompt_interpolation_method=self._last_prompt_interpolation_method,
                 )
-            elif prompt_interpolation_method is not None:
-                # Method-only change: re-blend the already-cached embeddings so the
-                # switch lands on the next frame instead of waiting for a prompt edit.
+            elif prompt_interpolation_method is not None or normalize_prompt_weights is not None:
+                # Method-only or normalize-flag-only change: re-blend the already-cached
+                # embeddings so the switch lands on the next frame instead of waiting for a
+                # prompt edit (Part 3 — previously toggling Normpweights with no prompt edit
+                # had no effect until the next prompt_list update).
                 self._apply_prompt_blending(self._last_prompt_interpolation_method)
 
             # Handle seed blending if seed_list is provided
@@ -487,8 +520,9 @@ class StreamParameterUpdater(OrchestratorUser):
                 self._update_blended_seeds(
                     seed_list=seed_list, interpolation_method=self._last_seed_interpolation_method
                 )
-            elif seed_interpolation_method is not None:
-                # Method-only change: re-blend the already-cached seed noise immediately.
+            elif seed_interpolation_method is not None or normalize_seed_weights is not None:
+                # Method-only or normalize-flag-only change: re-blend the already-cached seed
+                # noise immediately (mirrors the prompt-side trigger above).
                 self._apply_seed_blending(self._last_seed_interpolation_method)
 
             # Handle ControlNet configuration updates
@@ -741,13 +775,15 @@ class StreamParameterUpdater(OrchestratorUser):
 
         # Apply interpolation
         if prompt_interpolation_method == "slerp":
+            # TD can send final weights whose sum is not one. Use relative
+            # weights and the existing magnitude rule for every prompt count;
+            # treating the raw second weight as t made a zero-weight third
+            # prompt change the blend when backend normalization was disabled.
             if len(embeddings) == 2:
-                # Original 2-way slerp path — identical output to before.
-                embed1, embed2 = embeddings[0], embeddings[1]
-                t = weights[1].item()  # Use second weight as interpolation factor
-                combined_embeds = self._slerp(embed1, embed2, t)
+                total_weight = float(weights.sum())
+                t = float(weights[1]) / total_weight
+                combined_embeds = self._slerp(embeddings[0], embeddings[1], t) * max(1.0, total_weight)
             else:
-                # N-way iterative slerp (ported from reference multi_slerp).
                 combined_embeds = self._multi_slerp(embeddings, weights.tolist())
         elif prompt_interpolation_method == "cosine_weighted":
             # Genuine cosine-similarity weighting: emphasise embeddings aligned with the
@@ -827,6 +863,25 @@ class StreamParameterUpdater(OrchestratorUser):
 
             logging.getLogger(__name__).error(f"_apply_prompt_blending: embedding hook failed: {e}")
 
+        # Cold-path NaN guard: validate after the embedding hooks (any of which could
+        # inject non-finite values, e.g. an IP-Adapter or LoRA bug) and before assignment.
+        # This is a param-update, not a per-frame call, so a plain host isfinite() check is
+        # fine -- no hot-path sync concern. On failure, keep whatever embeddings the stream
+        # already had rather than handing the UNet a poisoned prompt_embeds.
+        embeds_finite = torch.isfinite(final_prompt_embeds).all() and (
+            final_negative_embeds is None or torch.isfinite(final_negative_embeds).all()
+        )
+        if not embeds_finite:
+            if not self._warned_nonfinite_prompt_embeds:
+                logger.error(
+                    "_apply_prompt_blending: computed prompt embeddings contain NaN/Inf -- "
+                    "keeping previous embeddings; further occurrences logged at DEBUG"
+                )
+                self._warned_nonfinite_prompt_embeds = True
+            else:
+                logger.debug("_apply_prompt_blending: computed prompt embeddings contain NaN/Inf -- keeping previous")
+            return
+
         # Set final embeddings on stream
         self.stream.prompt_embeds = final_prompt_embeds
         if final_negative_embeds is not None:
@@ -847,8 +902,8 @@ class StreamParameterUpdater(OrchestratorUser):
 
         # SLERP on flattened embeddings but preserve original shape
         original_shape = embed1.shape
-        flat1 = embed1.view(-1)
-        flat2 = embed2.view(-1)
+        flat1 = embed1.reshape(-1).float()
+        flat2 = embed2.reshape(-1).float()
 
         # Preserve norms for magnitude interpolation, then normalize for angle calc.
         norm1 = flat1.norm()
@@ -860,8 +915,12 @@ class StreamParameterUpdater(OrchestratorUser):
         dot_product = torch.clamp(torch.dot(flat1_norm, flat2_norm), -1.0, 1.0)
         theta = torch.acos(dot_product)
 
-        # Handle parallel vectors (degenerate SLERP → LERP)
-        if theta.abs() < 1e-6:
+        # Handle parallel AND antiparallel vectors (degenerate SLERP -> LERP).
+        # sin(theta) is the divisor below and is ~0 at both theta~=0 and
+        # theta~=pi; dot_product is clamped to exactly -1.0 above, so theta==pi
+        # is reachable and would otherwise divide into NaN (same guard as
+        # _slerp_noise).
+        if dot_product.abs() >= 0.9995:
             result = (1 - t) * flat1 + t * flat2
         else:
             # SLERP on unit sphere, rescaled to linearly-interpolated magnitude.
@@ -871,7 +930,7 @@ class StreamParameterUpdater(OrchestratorUser):
             unit_result = w1 * flat1_norm + w2 * flat2_norm
             result = unit_result * ((1 - t) * norm1 + t * norm2)
 
-        return result.view(original_shape)
+        return result.view(original_shape).to(embed1.dtype)
 
     def _multi_slerp(self, embeddings: List[torch.Tensor], weights: List[float]) -> torch.Tensor:
         """N-way iterative SLERP over a list of embeddings, ported from the reference fork.
@@ -1063,6 +1122,22 @@ class StreamParameterUpdater(OrchestratorUser):
                 )
             combined_noise = self._linear_blend_noise(noise_tensors, weights)
 
+        # Cold-path NaN guard: init_noise is the pipeline's only clean recovery source (see
+        # guard 1's stock_noise reseed in pipeline.py) -- poisoning it here would remove that
+        # recovery path entirely. Single choke point for all four blend paths above (slerp,
+        # multi_slerp, cosine_weighted, linear). Param-update-only call, not per-frame, so a
+        # plain host isfinite() check is fine.
+        if not torch.isfinite(combined_noise).all():
+            if not self._warned_nonfinite_init_noise:
+                logger.error(
+                    "_apply_seed_blending: computed init_noise contains NaN/Inf -- "
+                    "keeping previous init_noise; further occurrences logged at DEBUG"
+                )
+                self._warned_nonfinite_init_noise = True
+            else:
+                logger.debug("_apply_seed_blending: computed init_noise contains NaN/Inf -- keeping previous")
+            return
+
         # Update stream noise.
         # IMPORTANT: do NOT zero stock_noise here. Resetting it destroys the RCFG residual
         # continuity established over previous frames, causing a cold-restart artifact on every
@@ -1093,8 +1168,8 @@ class StreamParameterUpdater(OrchestratorUser):
 
         # SLERP on flattened noise but preserve original shape
         original_shape = noise1.shape
-        flat1 = noise1.view(-1)
-        flat2 = noise2.view(-1)
+        flat1 = noise1.reshape(-1).float()
+        flat2 = noise2.reshape(-1).float()
 
         # Normalize
         flat1_norm = F.normalize(flat1, dim=0)
@@ -1104,8 +1179,11 @@ class StreamParameterUpdater(OrchestratorUser):
         dot_product = torch.clamp(torch.dot(flat1_norm, flat2_norm), -1.0, 1.0)
         theta = torch.acos(dot_product)
 
-        # Handle parallel vectors
-        if theta.abs() < 1e-6:
+        # Handle parallel AND antiparallel vectors -- both make sin_theta -> 0, which would
+        # otherwise divide-by-zero into NaN below (theta==pi is reachable: dot_product is
+        # clamped to exactly -1.0 for genuinely antiparallel noise, e.g. a seed reused with
+        # a sign flip upstream).
+        if dot_product.abs() >= 0.9995:
             result = (1 - t) * flat1 + t * flat2
         else:
             # SLERP formula
@@ -1114,7 +1192,7 @@ class StreamParameterUpdater(OrchestratorUser):
             w2 = torch.sin(t * theta) / sin_theta
             result = w1 * flat1 + w2 * flat2
 
-        return result.view(original_shape)
+        return result.view(original_shape).to(noise1.dtype)
 
     def _multi_slerp_noise(self, noise_tensors: List[torch.Tensor], weights: List[float]) -> torch.Tensor:
         """N-way spherical fold over seed noise tensors, mirroring ``_multi_slerp``'s

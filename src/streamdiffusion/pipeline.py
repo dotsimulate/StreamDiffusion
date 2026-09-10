@@ -1374,18 +1374,18 @@ class StreamDiffusion:
                 dtype=self.vae.dtype,
                 non_blocking=True,
             )
-            with torch.autocast("cuda", dtype=self.dtype):
+            with torch.autocast("cuda", dtype=self.dtype, enabled=self.vae.dtype != torch.float32):
                 img_latent = retrieve_latents(self.vae.encode(image_tensors), self.generator)
 
-            img_latent = img_latent * self.vae.config.scaling_factor
+            img_latent = (img_latent * self.vae.config.scaling_factor).to(self.dtype)
 
             x_t_latent = self.add_noise(img_latent, self.init_noise[0], 0)
             return x_t_latent
 
     def decode_image(self, x_0_pred_out: torch.Tensor) -> torch.Tensor:
         with profiler.region("decode_image"):
-            scaled_latent = x_0_pred_out / self.vae.config.scaling_factor
-            with torch.autocast("cuda", dtype=self.dtype):
+            scaled_latent = x_0_pred_out.to(self.vae.dtype) / self.vae.config.scaling_factor
+            with torch.autocast("cuda", dtype=self.dtype, enabled=self.vae.dtype != torch.float32):
                 output_latent = self.vae.decode(scaled_latent, return_dict=False)[0]
             return output_latent
 

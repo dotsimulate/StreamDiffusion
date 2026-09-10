@@ -58,17 +58,32 @@ _CRASH_UNET_KWARGS = {
 }
 
 
+_CRASH_VAE_KWARGS = {
+    "engine_type": EngineType.VAE_ENCODER,
+    "model_id_or_path": "stabilityai/sd-turbo",
+    "max_batch_size": 4,
+    "min_batch_size": 1,
+    "mode": "img2img",
+    "use_tiny_vae": True,
+    "builder_optimization_level": 4,
+    "resolution": (512, 512),
+}
+
+
 def _make_engine_manager(engine_dir: str) -> EngineManager:
     """Build an EngineManager without running __init__'s heavy compile-fn imports."""
     em = EngineManager.__new__(EngineManager)
     em.engine_dir = Path(engine_dir)
-    em._configs = {EngineType.UNET: {"filename": "unet.engine"}}
+    em._configs = {
+        EngineType.UNET: {"filename": "unet.engine"},
+        EngineType.VAE_ENCODER: {"filename": "vae_encoder.engine"},
+        EngineType.VAE_DECODER: {"filename": "vae_decoder.engine"},
+    }
     return em
 
 
 class TestUnetEnginePathLength:
     def test_onnx_export_paths_stay_under_max_path(self):
-        """RED today (267 > 260 for .opt.onnx); GREEN once the dir name is hashed."""
         em = _make_engine_manager(_CRASH_ENGINE_DIR)
         engine_path = em.get_engine_path(**_CRASH_UNET_KWARGS)
 
@@ -156,5 +171,74 @@ class TestFp8RecipeTagV4:
 
         path_a = em.get_engine_path(**kwargs)
         path_b = em.get_engine_path(**kwargs)
+
+        assert path_a == path_b
+
+
+class TestVaeEnginePathIdentity:
+    """Custom-VAE fix, Step 5: two different `vae_id`s must never collide on one
+    cached VAE_ENCODER/VAE_DECODER directory, existing users must see no rebuild,
+    and — the one that would be invisible until users reported hour-long rebuilds
+    after upgrading — the UNet directory must be byte-identical whether or not a
+    `vae_id` is passed at all, since the token is scoped to VAE engine types only.
+    """
+
+    def test_distinct_vae_ids_produce_distinct_paths(self):
+        em = _make_engine_manager(_CRASH_ENGINE_DIR)
+        path_a = em.get_engine_path(**_CRASH_VAE_KWARGS, vae_id="stabilityai/sd-vae-ft-mse")
+        path_b = em.get_engine_path(**_CRASH_VAE_KWARGS, vae_id="madebyollin/sdxl-vae-fp16-fix")
+
+        assert path_a != path_b
+        assert path_a.parent != path_b.parent
+
+    def test_no_vae_id_reproduces_the_path_from_before_this_parameter_existed(self):
+        """vae_id defaults to None, so an explicit vae_id=None call and a call that
+        omits the kwarg entirely (how every pre-existing caller invokes this) must
+        land on the identical path - no engine reuse breaks for existing users."""
+        em = _make_engine_manager(_CRASH_ENGINE_DIR)
+        path_omitted = em.get_engine_path(**_CRASH_VAE_KWARGS)
+        path_explicit_none = em.get_engine_path(**_CRASH_VAE_KWARGS, vae_id=None)
+
+        assert path_omitted == path_explicit_none
+        assert "--vae-" not in path_omitted.parent.name
+
+    def test_vae_id_token_present_only_when_given(self):
+        em = _make_engine_manager(_CRASH_ENGINE_DIR)
+        path = em.get_engine_path(**_CRASH_VAE_KWARGS, vae_id="stabilityai/sd-vae-ft-mse")
+
+        assert "--vae-" in path.parent.name
+
+    def test_unet_path_is_identical_with_and_without_vae_id(self):
+        """The no-mass-rebuild guard: vae_id must not perturb the UNet cache key at
+        all, even though get_engine_path accepts it for every engine type."""
+        em = _make_engine_manager(_CRASH_ENGINE_DIR)
+        path_without = em.get_engine_path(**_CRASH_UNET_KWARGS)
+        path_with = em.get_engine_path(**_CRASH_UNET_KWARGS, vae_id="stabilityai/sd-vae-ft-mse")
+
+        assert path_without == path_with
+
+    def test_vae_engine_paths_with_vae_id_stay_under_max_path(self):
+        """Mirrors test_all_new_recipe_flags_stay_under_max_path, but for the VAE
+        branch, which has no hash compaction to fall back on (Step 5's constraint 2:
+        only EngineType.UNET gets the short-hash treatment) - the fixed-width hashed
+        --vae- token is exactly what keeps this bounded regardless of vae_id length."""
+        em = _make_engine_manager(_CRASH_ENGINE_DIR)
+        long_vae_id = "some-org/a-fairly-long-custom-vae-repository-name-for-margin-testing"
+
+        for engine_type in (EngineType.VAE_ENCODER, EngineType.VAE_DECODER):
+            kwargs = dict(_CRASH_VAE_KWARGS, engine_type=engine_type)
+            engine_path = em.get_engine_path(**kwargs, vae_id=long_vae_id)
+            onnx_path = str(engine_path) + ".onnx"
+            opt_onnx_path = str(engine_path) + ".opt.onnx"
+
+            assert len(onnx_path) < 260, f"onnx path is {len(onnx_path)} chars (MAX_PATH=260): {onnx_path}"
+            assert len(opt_onnx_path) < 260, (
+                f"opt.onnx path is {len(opt_onnx_path)} chars (MAX_PATH=260): {opt_onnx_path}"
+            )
+
+    def test_vae_id_path_is_deterministic(self):
+        em = _make_engine_manager(_CRASH_ENGINE_DIR)
+        path_a = em.get_engine_path(**_CRASH_VAE_KWARGS, vae_id="stabilityai/sd-vae-ft-mse")
+        path_b = em.get_engine_path(**_CRASH_VAE_KWARGS, vae_id="stabilityai/sd-vae-ft-mse")
 
         assert path_a == path_b
