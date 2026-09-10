@@ -1,3 +1,4 @@
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -5,7 +6,14 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from diffusers import AutoencoderTiny, AutoPipelineForText2Image, StableDiffusionPipeline, StableDiffusionXLPipeline
+from diffusers import (
+    AutoencoderKL,
+    AutoencoderTiny,
+    AutoPipelineForText2Image,
+    StableDiffusionPipeline,
+    StableDiffusionXLPipeline,
+)
+from diffusers.models.attention_processor import AttnProcessor
 from PIL import Image
 
 from .image_utils import postprocess_image
@@ -36,6 +44,246 @@ def _is_oom_error(exc: BaseException) -> bool:
     return (
         "out of memory" in error_msg or "outofmemory" in error_msg or "oom" in error_msg or "cuda error" in error_msg
     )
+
+
+class VaeResolutionError(RuntimeError):
+    """Raised when a `Customvae`/`vae_id` value cannot be resolved to a usable VAE.
+
+    Always carries the original exception (network failure, missing config.json, ...)
+    as `__cause__`, matching the convention `_load_model` already uses for its
+    HF-download error path (see the `raise RuntimeError(error_msg) from chosen_error`
+    a few hundred lines below)."""
+
+
+_SUPPORTED_VAE_CLASS_NAMES = ("AutoencoderTiny", "AutoencoderKL")
+
+_VAE_HELP = (
+    "Expected a diffusers VAE repo, a model repo with a vae/ subfolder, or a local "
+    "folder/.safetensors file containing config.json with _class_name AutoencoderKL "
+    "or AutoencoderTiny (e.g. stabilityai/sd-vae-ft-mse, madebyollin/taesd). "
+    "Set Custom VAE back to 'auto' to use the default TAESD."
+)
+
+
+def _vae_resolution_error(vae_id: str, reason: str, cause: Optional[BaseException] = None) -> VaeResolutionError:
+    hint = NETWORK_HINT if cause is not None and is_network_error(cause) else ""
+    err = VaeResolutionError(f"Custom VAE '{vae_id}' could not be loaded as a VAE: {reason}.{hint} {_VAE_HELP}")
+    if cause is not None:
+        raise err from cause
+    return err
+
+
+def _load_vae_config(vae_id: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Fetch only `config.json` (never the weights) and return `(config, subfolder)`.
+
+    Tries the repo root first, then a `vae/` subfolder — the latter is what makes a
+    *model* repo id (e.g. "stabilityai/sd-turbo", which has no root config.json) work
+    as a `Customvae` value, matching how `subfolder="vae"` is used everywhere else a
+    VAE is loaded off a base-model repo.
+    """
+    last_error: Optional[BaseException] = None
+    for subfolder in (None, "vae"):
+        try:
+            kwargs = {"subfolder": subfolder} if subfolder else {}
+            cfg = AutoencoderKL.load_config(vae_id, **kwargs)  # ConfigMixin: same for both classes
+            return cfg, subfolder
+        except Exception as e:
+            last_error = e
+            if is_network_error(e):
+                # A timeout/connection failure is not "no config.json here, try
+                # elsewhere" - retrying the vae/ subfolder would just repeat the
+                # same failure. Surface it immediately as the real cause.
+                raise _vae_resolution_error(vae_id, f"network error fetching config.json: {e}", e) from e
+            continue
+    raise _vae_resolution_error(
+        vae_id, f"no config.json found (tried '{vae_id}' and '{vae_id}/vae'): {last_error}", last_error
+    )
+
+
+def _resolve_vae_class(vae_id: str) -> Tuple[type, Dict[str, Any], Optional[str]]:
+    """Return `(vae_class, config, subfolder)` for `vae_id`, dispatching purely on the
+    downloaded config's `_class_name` — never on file size, extension, or a guess.
+    Never falls back to AutoencoderTiny: an unrecognised/unreadable config is a hard
+    error (Step 2 of the plan), not a silent default.
+    """
+    cfg, subfolder = _load_vae_config(vae_id)
+    cls_name = cfg.get("_class_name")
+    if cls_name == "AutoencoderTiny":
+        return AutoencoderTiny, cfg, subfolder
+    if cls_name == "AutoencoderKL":
+        return AutoencoderKL, cfg, subfolder
+    if cls_name is None:
+        raise _vae_resolution_error(vae_id, "config.json has no _class_name and its keys match neither architecture")
+    raise _vae_resolution_error(
+        vae_id,
+        f"config.json declares _class_name '{cls_name}', which this build does not support "
+        f"(supported: {', '.join(_SUPPORTED_VAE_CLASS_NAMES)})",
+    )
+
+
+def _validate_vae_config(vae_id: str, vae_cls: type, cfg: Dict[str, Any], dtype: torch.dtype) -> None:
+    """Cheap, pre-load structural checks that turn a downstream shape crash or a
+    silent quality bug into an actionable Step-7 error at the point `Customvae` is
+    resolved, instead of far away inside the TensorRT model builder or the pipeline.
+    """
+    latent_channels = cfg.get("latent_channels")
+    if latent_channels is not None and latent_channels != 4:
+        raise _vae_resolution_error(
+            vae_id,
+            f"reports latent_channels={latent_channels}; this build only supports 4-channel "
+            f"latents (the TensorRT VAE models and pipeline hardcode 4)",
+        )
+
+    if vae_cls is AutoencoderKL:
+        block_out_channels = cfg.get("block_out_channels")
+        if block_out_channels:
+            scale = 2 ** (len(block_out_channels) - 1)
+            if scale != 8:
+                raise _vae_resolution_error(
+                    vae_id,
+                    f"implies a {scale}x spatial downscale (block_out_channels={block_out_channels}); "
+                    f"this build only supports 8x",
+                )
+        if cfg.get("force_upcast") and dtype == torch.float16:
+            logger.warning(
+                f"Custom VAE '{vae_id}' sets force_upcast=True (numerically unstable in fp16) and the "
+                f"pipeline dtype is float16. Consider an fp16-safe VAE such as stabilityai/sd-vae-ft-mse "
+                f"(SD1.5) or madebyollin/sdxl-vae-fp16-fix (SDXL) if you see NaN/black frames."
+            )
+
+
+def _fork_returns_kvo_tuple() -> bool:
+    """True if the installed diffusers' AttnProcessor2_0.__call__ returns a
+    (hidden_states, kvo_cache) 2-tuple (varshith15/diffusers@3e3b72f's KV-offload
+    fork, pinned at setup.py:54) rather than plain hidden_states.
+
+    UNetMidBlock2D.forward (unet_2d_blocks.py) does not unpack that tuple, so a full
+    AutoencoderKL's mid-block attention crashes with "'tuple' object has no attribute
+    'dim'" under this fork. TAESD has no attention blocks, so it never surfaces there.
+
+    Reflection, not a version-string check, so this self-disarms the moment the pin
+    moves to an upstream diffusers where AttnProcessor2_0 no longer takes kvo_cache -
+    mirrors how Attention.forward itself decides what to pass to its processor
+    (attention_processor.py: inspect.signature(self.processor.__call__).parameters).
+    """
+    try:
+        from diffusers.models.attention_processor import AttnProcessor2_0
+
+        return "kvo_cache" in inspect.signature(AttnProcessor2_0.__call__).parameters
+    except Exception:
+        return False
+
+
+def _harden_vae_attention(vae: Any) -> None:
+    """Swap a full AutoencoderKL's attention processor to the legacy (non-tuple-
+    returning) AttnProcessor when the installed diffusers fork's AttnProcessor2_0
+    would otherwise crash the VAE's mid-block (see _fork_returns_kvo_tuple). No-op
+    for AutoencoderTiny (no attention blocks, no set_attn_processor method at all)
+    and a no-op once/if the fork is fixed upstream."""
+    if not _fork_returns_kvo_tuple():
+        return
+    if not hasattr(vae, "set_attn_processor"):
+        return
+    if not getattr(vae, "attn_processors", None):
+        return
+    vae.set_attn_processor(AttnProcessor())
+
+
+def _load_custom_vae(vae_id: str, *, device: torch.device, dtype: torch.dtype) -> torch.nn.Module:
+    """Load and fully validate a `vae_id` into a ready-to-use VAE module: detect its
+    architecture, structurally validate it, load real weights, swap attention
+    processor if required, and move to device/dtype - raising a VaeResolutionError
+    with the original exception preserved as __cause__ at the first point anything
+    looks wrong, rather than letting a mismatch surface many frames later as a
+    meta-tensor crash or silent noise.
+    """
+    vae_cls, cfg, subfolder = _resolve_vae_class(vae_id)
+    _validate_vae_config(vae_id, vae_cls, cfg, dtype)
+
+    kwargs = {"subfolder": subfolder} if subfolder else {}
+    try:
+        vae = vae_cls.from_pretrained(vae_id, **kwargs)
+    except Exception as e:
+        raise _vae_resolution_error(vae_id, f"from_pretrained failed: {e}", e) from e
+
+    # Meta-tensor guard: diffusers' low_cpu_mem_usage=True default (accelerate
+    # init_empty_weights()) leaves every parameter on the meta device when the
+    # checkpoint's keys don't match the constructed class - which used to surface
+    # far downstream as "NotImplementedError: Cannot copy out of meta tensor" on the
+    # .to() call. Checking parameters directly (not just catching that exception)
+    # also catches a *partial* key mismatch, which would otherwise silently load a
+    # half-initialized module. Do NOT "fix" this with low_cpu_mem_usage=False - that
+    # loads non-strictly and yields a silently random VAE emitting noise, which is
+    # strictly worse than today's loud crash.
+    meta_params = sum(1 for p in vae.parameters() if p.is_meta)
+    if meta_params:
+        raise _vae_resolution_error(
+            vae_id,
+            f"loaded as {vae_cls.__name__}, but {meta_params} parameter(s) stayed on the meta "
+            f"device - the checkpoint's keys do not match the {vae_cls.__name__} skeleton, so "
+            f"'{vae_id}' is almost certainly not a {vae_cls.__name__} (this is the 'Cannot copy "
+            f"out of meta tensor' crash, caught early)",
+        )
+
+    if vae_cls is AutoencoderKL:
+        _harden_vae_attention(vae)
+
+    try:
+        vae = vae.to(device=device, dtype=dtype)
+    except NotImplementedError as e:
+        # Backstop for the same meta-tensor failure mode, in case some future
+        # checkpoint slips past the explicit parameter scan above.
+        raise _vae_resolution_error(vae_id, f"failed moving to device (meta tensor): {e}", e) from e
+
+    return vae
+
+
+def _should_skip_trt_vae(vae_class_name: str, acceleration: str) -> bool:
+    """True when the resolved VAE must stay on PyTorch rather than get a TensorRT
+    engine build (Step 4 of the plan): a full AutoencoderKL's ONNX export/engine has
+    not been validated against this codebase's VAE model wrappers, and — more
+    importantly — its encode is stochastic (latent_dist.sample), which an ONNX trace
+    would silently freeze to whichever of sample()/mode() diffusers happens to pick.
+    TAESD is unaffected either way.
+
+    `SDTD_FULL_VAE_TRT=1` is an escape hatch for measuring the (currently untested,
+    unsupported) TRT-VAE-engine-with-a-full-VAE path without adding a new UI knob.
+    """
+    return (
+        vae_class_name == "AutoencoderKL"
+        and acceleration == "tensorrt"
+        and os.environ.get("SDTD_FULL_VAE_TRT", "") != "1"
+    )
+
+
+def _resolve_vae(
+    vae_id: Optional[str],
+    use_tiny_vae: bool,
+    is_sdxl: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[torch.nn.Module, str, str]:
+    """Resolve the VAE to use for `stream.vae`, replacing the previous hardcoded
+    `AutoencoderTiny.from_pretrained(vae_id)` dispatch (the reported bug: any
+    `vae_id` was force-loaded as AutoencoderTiny regardless of its actual
+    architecture).
+
+    `use_tiny_vae` now only selects the *default* (TAESD) when no `vae_id` is given;
+    an explicit `vae_id` always wins and is auto-detected. This deliberately drops
+    `acceleration` from the decision - the previous `elif acceleration != "tensorrt"`
+    branch both dropped `vae_id` on the floor under TensorRT and skipped the device
+    move, which this function always performs regardless of acceleration backend
+    (the caller decides whether to additionally build TensorRT VAE engines).
+
+    Returns `(vae, class_name, source)` for the Step 6 INFO log line.
+    """
+    if vae_id is not None:
+        vae = _load_custom_vae(vae_id, device=device, dtype=dtype)
+        return vae, type(vae).__name__, f"'{vae_id}' (detected via config.json)"
+
+    taesd_model = "madebyollin/taesdxl" if is_sdxl else "madebyollin/taesd"
+    vae = AutoencoderTiny.from_pretrained(taesd_model).to(device=device, dtype=dtype)
+    return vae, "AutoencoderTiny", f"'{taesd_model}' (default)"
 
 
 def _encode_fp8_calibration_images(ipa: Any, images: List[Any]) -> Tuple[Optional[torch.Tensor], int, int]:
