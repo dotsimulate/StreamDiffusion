@@ -248,11 +248,13 @@ class TestControlNetPreviewTransportDispatch(unittest.TestCase):
         self.assertIsNotNone(mgr.control_processed_memory)
         self.assertEqual(mgr.cpu_calls, ["fake_tensor"])
 
-    def test_controlnet_processed_connected_false_after_ipc_failure(self):
-        """get_stream_state()'s controlnet_processed_connected must stop reporting
-        connected once export_controlnet_preview_ipc() has actually failed -- it should
-        not keep claiming the IPC transport is healthy while every frame is being
-        dropped, even though the just-allocated CPU fallback is now what's connected."""
+    def test_controlnet_processed_connected_tracks_active_transport_after_ipc_failure(self):
+        """get_stream_state()'s controlnet_processed_connected reports whether *some*
+        transport is delivering the preview, not whether IPC specifically is healthy.
+        After export_controlnet_preview_ipc() fails, _cn_preview_ipc_failed flips True but
+        the CPU fallback is allocated in the same call, so the field stays True on the
+        strength of control_processed_memory alone. The IPC-failed flag only stops the
+        stale "IPC is connected" claim from being what keeps it True (next test)."""
         mgr = _make_mgr(
             {
                 "send_controlnet_preview": True,
@@ -271,6 +273,32 @@ class TestControlNetPreviewTransportDispatch(unittest.TestCase):
         self.assertTrue(mgr._cn_preview_ipc_failed)
         self.assertTrue(mgr.controlnet_processed_connected)
         self.assertIsNotNone(mgr.control_processed_memory)
+
+    def test_controlnet_processed_connected_false_when_ipc_fails_and_fallback_unavailable(self):
+        """If IPC fails and the CPU fallback cannot be brought up either (the real
+        SharedMemory allocator raising, swallowed by the dispatch's except), nothing is
+        delivering the preview and the field must be False. Before the fix
+        _cn_preview_via_ipc alone kept it True forever in exactly this state."""
+        mgr = _make_mgr(
+            {
+                "send_controlnet_preview": True,
+                "cuda_ipc_cn_processed_shm_name": "StreamDiffusionTD_640-384_cn_processed_ipc",
+            }
+        )
+        mgr._send_back_processed_controlnet()
+        self.assertTrue(mgr.controlnet_processed_connected)
+
+        def _alloc_fails() -> None:
+            raise OSError("shared memory unavailable")
+
+        mgr._allocate_control_processed_memory = _alloc_fails  # type: ignore[method-assign]
+        mgr.wrapper.ipc_export_result = False
+        mgr._send_back_processed_controlnet()
+
+        self.assertTrue(mgr._cn_preview_ipc_failed)
+        self.assertIsNone(mgr.control_processed_memory)
+        self.assertEqual(mgr.cpu_calls, [])
+        self.assertFalse(mgr.controlnet_processed_connected)
 
 
 if __name__ == "__main__":
