@@ -106,3 +106,63 @@ def test_extract_wrapper_params_t_index_list_not_aliased_to_schema_default():
 def test_extract_prepare_params_minimal_config_byte_identical():
     result = _extract_prepare_params(MINIMAL_CONFIG)
     assert result == EXPECTED_PREPARE_PARAMS
+
+
+def test_controlnet_list_auto_enables_when_flag_is_omitted():
+    config = {
+        **MINIMAL_CONFIG,
+        "controlnets": [{"model_id": "example/controlnet"}],
+    }
+
+    result = _extract_wrapper_params(config)
+
+    assert result["use_controlnet"] is True
+    assert result["controlnet_config"][0]["model_id"] == "example/controlnet"
+
+
+def test_explicit_false_disables_nonempty_controlnet_list():
+    config = {
+        **MINIMAL_CONFIG,
+        "use_controlnet": False,
+        "controlnets": [{"model_id": "example/controlnet"}],
+    }
+
+    result = _extract_wrapper_params(config)
+
+    assert result["use_controlnet"] is False
+    assert "controlnet_config" not in result
+
+
+def test_ipadapter_list_auto_enables_when_flag_is_omitted():
+    config = {
+        **MINIMAL_CONFIG,
+        "ipadapters": [
+            {
+                "ipadapter_model_path": "example/ipadapter",
+                "image_encoder_path": "example/image-encoder",
+            }
+        ],
+    }
+
+    result = _extract_wrapper_params(config)
+
+    assert result["use_ipadapter"] is True
+    assert result["ipadapter_config"][0]["ipadapter_model_path"] == "example/ipadapter"
+
+
+def test_explicit_false_disables_nonempty_ipadapter_list():
+    config = {
+        **MINIMAL_CONFIG,
+        "use_ipadapter": False,
+        "ipadapters": [
+            {
+                "ipadapter_model_path": "example/ipadapter",
+                "image_encoder_path": "example/image-encoder",
+            }
+        ],
+    }
+
+    result = _extract_wrapper_params(config)
+
+    assert result["use_ipadapter"] is False
+    assert "ipadapter_config" not in result

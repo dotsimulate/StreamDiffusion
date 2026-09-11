@@ -22,7 +22,8 @@ from streamdiffusion.utils import diagnostics
 class TestErrorReporterReport:
     def test_writes_report_and_returns_path(self, tmp_path, monkeypatch):
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path))
+        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path / "stale"))
+        monkeypatch.setattr(diagnostics, "__file__", str(tmp_path / "src/streamdiffusion/utils/diagnostics.py"))
         reporter = diagnostics.ErrorReporter()
 
         report_path = reporter.report(RuntimeError("boom"), stage="inference", where="streaming_loop")
@@ -37,7 +38,8 @@ class TestErrorReporterReport:
 
     def test_same_where_and_exception_deduped_to_one_file(self, tmp_path, monkeypatch):
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path))
+        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path / "stale"))
+        monkeypatch.setattr(diagnostics, "__file__", str(tmp_path / "src/streamdiffusion/utils/diagnostics.py"))
         reporter = diagnostics.ErrorReporter()
 
         first = reporter.report(RuntimeError("boom"), stage="inference", where="streaming_loop")
@@ -49,7 +51,8 @@ class TestErrorReporterReport:
 
     def test_different_where_produces_two_files(self, tmp_path, monkeypatch):
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path))
+        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path / "stale"))
+        monkeypatch.setattr(diagnostics, "__file__", str(tmp_path / "src/streamdiffusion/utils/diagnostics.py"))
         reporter = diagnostics.ErrorReporter()
 
         first = reporter.report(RuntimeError("boom"), stage="inference", where="streaming_loop")
@@ -64,7 +67,8 @@ class TestErrorReporterReport:
         """Signature is (where, exception type, truncated message) -- a differently-worded
         exception at the same call site must still get its own report."""
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path))
+        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path / "stale"))
+        monkeypatch.setattr(diagnostics, "__file__", str(tmp_path / "src/streamdiffusion/utils/diagnostics.py"))
         reporter = diagnostics.ErrorReporter()
 
         first = reporter.report(RuntimeError("boom"), stage="inference", where="streaming_loop")
@@ -76,7 +80,8 @@ class TestErrorReporterReport:
 
     def test_max_reports_cap_honoured(self, tmp_path, monkeypatch):
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path))
+        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path / "stale"))
+        monkeypatch.setattr(diagnostics, "__file__", str(tmp_path / "src/streamdiffusion/utils/diagnostics.py"))
         reporter = diagnostics.ErrorReporter(max_reports=2)
 
         results = [reporter.report(RuntimeError(f"boom {i}"), stage="inference", where=f"where_{i}") for i in range(5)]
@@ -133,7 +138,8 @@ class TestErrorReporterReport:
         exactly one report -- the seen-signature check-and-set happens under `self._lock` as
         a single critical section, not as two separate unlocked steps that could race."""
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path))
+        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path / "stale"))
+        monkeypatch.setattr(diagnostics, "__file__", str(tmp_path / "src/streamdiffusion/utils/diagnostics.py"))
         reporter = diagnostics.ErrorReporter()
         results: list = []
         results_lock = threading.Lock()

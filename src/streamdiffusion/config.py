@@ -156,7 +156,7 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
         "fp8_exclude_ipadapter": config.get("fp8_exclude_ipadapter", False),
         "fp8_calibration_style_image": config.get("fp8_calibration_style_image"),
     }
-    if config.get("controlnets"):
+    if config.get("controlnets") and config.get("use_controlnet", True):
         param_map["use_controlnet"] = True
         param_map["controlnet_config"] = _prepare_controlnet_configs(config)
     else:
@@ -164,7 +164,7 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
         param_map["controlnet_config"] = config.get("controlnet_config")
 
     # Set IPAdapter usage if IPAdapters are configured
-    if config.get("ipadapters"):
+    if config.get("ipadapters") and config.get("use_ipadapter", True):
         param_map["use_ipadapter"] = True
         param_map["ipadapter_config"] = _prepare_ipadapter_configs(config)
     else:

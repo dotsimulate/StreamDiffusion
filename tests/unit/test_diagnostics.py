@@ -243,11 +243,12 @@ class TestWriteErrorReport:
         assert report_path is not None
         assert target.exists()
 
-    def test_respects_sdtd_base_folder_path_env_var(self, tmp_path, monkeypatch):
+    def test_ignores_stale_sdtd_base_folder_path_env_var(self, tmp_path, monkeypatch):
         """SDTD_BASE_FOLDER_PATH is pinned at install time (setx, mirroring CUDALINK_*) so the
         out-of-process TD Python can locate error_reports/ without a manual env-var step."""
         monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path))
+        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path / "stale"))
+        monkeypatch.setattr(diagnostics, "__file__", str(tmp_path / "src/streamdiffusion/utils/diagnostics.py"))
         report_path = diagnostics.write_error_report(RuntimeError("boom"), stage="inference")
         assert report_path is not None
         assert report_path.parent == tmp_path / "error_reports"

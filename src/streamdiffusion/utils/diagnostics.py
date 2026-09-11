@@ -26,7 +26,7 @@ import threading
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 # Hardened against branch drift, same rationale as td_manager.py's own guarded import of
 # this pair: reporting.py lives alongside this module but isn't guaranteed present on
@@ -354,10 +354,9 @@ def write_error_report(
             into == STREAM CONFIG == with secret-looking keys recursively redacted (see
             _redact_secrets). Complementary to `wrapper` -- the wrapper only exposes
             resolved runtime attrs, not the original input config.
-        out_dir: Directory to write into. Defaults to $SDTD_BASE_FOLDER_PATH/error_reports,
-            pinned at install time the same way as CUDALINK_*; falls back to
-            <repo root>/error_reports (resolved from this module's own path, reliable
-            under the editable install) when the env var isn't set.
+        out_dir: Explicit report directory. Defaults to the running package's
+            installation root/error_reports. The global last-install environment
+            variable is diagnostic context only and never selects a write target.
 
     Returns:
         Path to the written report, or None if writing failed.
@@ -374,9 +373,7 @@ def write_error_report(
         if out_dir:
             target_dir = Path(out_dir)
         else:
-            base_dir = os.environ.get("SDTD_BASE_FOLDER_PATH")
-            target_dir = Path(base_dir) if base_dir else Path(__file__).resolve().parents[3]
-            target_dir = target_dir / "error_reports"
+            target_dir = Path(__file__).resolve().parents[3] / "error_reports"
         target_dir.mkdir(parents=True, exist_ok=True)
 
         # Microsecond precision (not just seconds) so back-to-back reports in a tight failure
@@ -411,7 +408,8 @@ class ErrorReporter:
     triggered it.
     """
 
-    def __init__(self, *, max_reports: int = 20) -> None:
+    def __init__(self, *, max_reports: int = 20, out_dir: Optional[Union[str, Path]] = None) -> None:
+        self._out_dir = out_dir
         self._max_reports = max_reports
         self._lock = threading.Lock()
         self._seen_sigs: set = set()
@@ -459,7 +457,9 @@ class ErrorReporter:
             if context:
                 merged_context.update(context)
 
-            report_path = write_error_report(exc, stage=stage, wrapper=wrapper, config=config, context=merged_context)
+            report_path = write_error_report(
+                exc, stage=stage, wrapper=wrapper, config=config, context=merged_context, out_dir=self._out_dir
+            )
 
             msg = f"Error [{where}]: {exc}"
             if report_path:
