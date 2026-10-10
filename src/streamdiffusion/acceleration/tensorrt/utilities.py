@@ -45,7 +45,7 @@ from polygraphy.backend.common import bytes_from_path
 from polygraphy.backend.trt import engine_from_bytes
 from polygraphy.backend.trt.util import get_trt_logger
 
-from .models.models import CLIP, VAE, BaseModel, UNet, VAEEncoder
+from .models.models import CLIP, VAE, BaseModel, UNet, VAEEncoder, _onnx_tensor_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -1795,7 +1795,8 @@ def export_onnx(
             onnx_model = onnx.load(onnx_path)
 
             # Check if model is large enough to need external data
-            if onnx_model.ByteSize() > 2147483648:  # 2GB
+            # Not ModelProto.ByteSize(): upb serializes the whole proto (~4.5x transient -> MemoryError).
+            if _onnx_tensor_bytes(onnx_model) > 2147483648:  # 2GB
                 # Create directory for external data
                 onnx_dir = os.path.dirname(onnx_path)
 
