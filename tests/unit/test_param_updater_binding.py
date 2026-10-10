@@ -71,6 +71,7 @@ def _make_updater(**kwargs) -> StreamParameterUpdater:
 @pytest.mark.parametrize(
     "prompt_flag, seed_flag",
     [(True, False), (False, True), (False, False), (True, True)],
+    ids=["prompt_only", "seed_only", "neither", "both"],
 )
 def test_normalize_flags_bind_to_correct_fields(prompt_flag, seed_flag):
     updater = _make_updater(

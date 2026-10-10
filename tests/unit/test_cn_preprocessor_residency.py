@@ -9,6 +9,8 @@ is True. Fails today for hed/scribble/normal; passes after the port."
 Run with: pytest tests/unit/test_cn_preprocessor_residency.py -v
 """
 
+from pathlib import Path
+
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -73,8 +75,7 @@ def test_cn_preprocessor_is_registered(cn_type, preprocessor_name, should_be_gpu
 @pytest.mark.parametrize("cn_type,preprocessor_name,should_be_gpu_native", CN_COUPLED_PREPROCESSORS)
 def test_cn_preprocessor_gpu_native_flag(cn_type, preprocessor_name, should_be_gpu_native):
     """Every CN-coupled preprocessor class must declare gpu_native = True."""
-    if not _is_registered(preprocessor_name):
-        pytest.skip(f"'{preprocessor_name}' not registered (see test above)")
+    assert _is_registered(preprocessor_name), f"'{preprocessor_name}' not registered"
 
     actual = _check_gpu_native(preprocessor_name)
     assert actual == should_be_gpu_native, (
@@ -87,22 +88,22 @@ def test_cn_preprocessor_gpu_native_flag(cn_type, preprocessor_name, should_be_g
     )
 
 
+_SCRIPTS_PATH = Path(__file__).resolve().parents[3] / "Scripts" / "StreamDiffusionTD__Text__model_utils__td.py"
+
+
+@pytest.mark.skipif(
+    not _SCRIPTS_PATH.exists(),
+    reason="model_utils__td.py not found in sibling Scripts directory",
+)
 class TestAutopreprocessResolver:
     """Tests for D9 — registry-driven + heuristic + passthrough fallback."""
 
     def test_registry_lookup_sd15_canny(self):
         """Exact registry match returns the 'preprocessor' field directly."""
-        # Inline import mirrors model_utils__td.py location in the Scripts directory.
         import importlib.util
-        import os
 
-        scripts_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..", "Scripts")
-        spec = importlib.util.spec_from_file_location(
-            "model_utils_td",
-            os.path.join(scripts_dir, "StreamDiffusionTD__Text__model_utils__td.py"),
-        )
-        if spec is None or spec.loader is None:
-            pytest.skip("model_utils__td.py not found — run from repo root")
+        spec = importlib.util.spec_from_file_location("model_utils_td", str(_SCRIPTS_PATH))
+        assert spec is not None and spec.loader is not None
 
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
@@ -113,15 +114,9 @@ class TestAutopreprocessResolver:
 
     def test_registry_lookup_sd15_normalbae(self):
         import importlib.util
-        import os
 
-        scripts_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..", "Scripts")
-        spec = importlib.util.spec_from_file_location(
-            "model_utils_td",
-            os.path.join(scripts_dir, "StreamDiffusionTD__Text__model_utils__td.py"),
-        )
-        if spec is None or spec.loader is None:
-            pytest.skip("model_utils__td.py not found")
+        spec = importlib.util.spec_from_file_location("model_utils_td", str(_SCRIPTS_PATH))
+        assert spec is not None and spec.loader is not None
 
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
@@ -133,15 +128,9 @@ class TestAutopreprocessResolver:
 
     def test_fallback_to_passthrough_for_unknown_model(self):
         import importlib.util
-        import os
 
-        scripts_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..", "Scripts")
-        spec = importlib.util.spec_from_file_location(
-            "model_utils_td",
-            os.path.join(scripts_dir, "StreamDiffusionTD__Text__model_utils__td.py"),
-        )
-        if spec is None or spec.loader is None:
-            pytest.skip("model_utils__td.py not found")
+        spec = importlib.util.spec_from_file_location("model_utils_td", str(_SCRIPTS_PATH))
+        assert spec is not None and spec.loader is not None
 
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)

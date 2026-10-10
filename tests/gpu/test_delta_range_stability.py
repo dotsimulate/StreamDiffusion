@@ -52,19 +52,23 @@ def _run_frames(t_index_list, guidance_scale, delta):
     )
 
     image_tensor = stream.preprocess_image(INPUT_IMAGE)
+    output = None
     for frame in range(N_FRAMES):
         output = stream(image=image_tensor)
         assert torch.isfinite(output).all(), (
             f"non-finite output at frame {frame} (t_index_list={t_index_list}, gamma={guidance_scale}, delta={delta})"
         )
+    return output
 
 
 class TestDeltaMaxStability:
     def test_delta_max_single_step(self):
         # n==1: per-frame reseed path, no recurrence — delta only scales the
         # combine's init_noise subtraction.
-        _run_frames([16], guidance_scale=1.4, delta=5.0)
+        output = _run_frames([16], guidance_scale=1.4, delta=5.0)
+        assert output is not None
 
     def test_delta_max_two_step_recurrence(self):
         # n>1 recurrence at the largest allowed (gamma-1)*delta product.
-        _run_frames([16, 32], guidance_scale=2.0, delta=5.0)
+        output = _run_frames([16, 32], guidance_scale=2.0, delta=5.0)
+        assert output is not None

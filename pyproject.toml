@@ -64,3 +64,52 @@ python-interpreter-path = "venv/Scripts/python.exe"
 baseline = "pyrefly-baseline.json"
 # Warn-severity GPU anti-pattern lints (.item() sync stalls, hard-coded .cuda(), print(tensor)).
 pytorch-efficiency-lints = true
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-ra",
+    "--tb=short",
+    "--strict-markers",
+    "--import-mode=importlib",
+]
+pythonpath = ["src", "tests", "tests/unit"]
+markers = [
+    "unit: fast isolated unit tests (< 1 s)",
+    "integration: integration tests with subsystems or dependencies",
+    "slow: slow-running tests (>= 5 s)",
+    "gpu: tests requiring CUDA GPU device",
+    "quality: golden-file and calibration tests",
+]
+filterwarnings = [
+    "ignore:.*gaussian_filter.*:DeprecationWarning",
+    "ignore:.*torch.jit.script.*:DeprecationWarning",
+    "ignore:.*Importing from timm.*:FutureWarning",
+    "ignore:.*estimate.*deprecated.*:FutureWarning",
+    "ignore:.*Overwriting.*in registry.*:UserWarning",
+    "ignore:.*To copy construct from a tensor.*:UserWarning",
+]
+
+[tool.coverage.run]
+branch = true
+relative_files = true
+source = ["src/streamdiffusion"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 30  # honest baseline from clean run (ratchet upward only)
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
+
+[tool.scan_test_smells]
+baseline = ".smell-baseline.json"

@@ -207,7 +207,7 @@ class TestEmaBufferOwnership:
             fake_ptrs.update(t.data_ptr() for t in down)
             fake_ptrs.add(mid.data_ptr())
         returned_ptrs = set(ptrs[0][0]) | {ptrs[0][1]}
-        assert not (returned_ptrs & fake_ptrs), "EMA buffers must not alias engine outputs"
+        assert returned_ptrs.isdisjoint(fake_ptrs), "EMA buffers must not alias engine outputs"
 
         # Engine outputs unmutated by the EMA math (they are read-only targets).
         for call_idx, (down, mid) in enumerate(cn.returned, start=1):

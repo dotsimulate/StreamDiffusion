@@ -43,7 +43,11 @@ def test_no_resolution_matches_prior_behavior():
     assert "width" not in kwargs
 
 
-@pytest.mark.parametrize("image_height, image_width", [(1024, None), (None, 1024)])
+@pytest.mark.parametrize(
+    "image_height, image_width",
+    [(1024, None), (None, 1024)],
+    ids=["height_only", "width_only"],
+)
 def test_resolution_omitted_when_only_one_given(image_height, image_width):
     """A lone height or width is ambiguous -- mirrors capture_calibration_data's
     existing timesteps/scheduler_ref one-of-two handling. Neither key should
@@ -101,7 +105,11 @@ def test_non_explicit_schedule_uses_num_inference_steps_not_timesteps():
     assert "timesteps" not in kwargs
 
 
-@pytest.mark.parametrize("use_explicit_schedule", [True, False])
+@pytest.mark.parametrize(
+    "use_explicit_schedule",
+    [True, False],
+    ids=["explicit_schedule", "implicit_schedule"],
+)
 def test_resolution_orthogonal_to_schedule_branch(use_explicit_schedule):
     """height/width must thread through regardless of which of the two
     mutually-exclusive schedule branches (timesteps vs num_inference_steps) is

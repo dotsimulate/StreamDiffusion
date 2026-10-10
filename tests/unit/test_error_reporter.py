@@ -28,7 +28,6 @@ class TestErrorReporterReport:
 
         report_path = reporter.report(RuntimeError("boom"), stage="inference", where="streaming_loop")
 
-        assert report_path is not None
         assert report_path.exists()
         assert report_path.parent == tmp_path / "error_reports"
         assert report_path.name.startswith("inference_error_report_")

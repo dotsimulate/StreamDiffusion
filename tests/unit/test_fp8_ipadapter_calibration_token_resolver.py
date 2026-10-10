@@ -143,7 +143,6 @@ class TestResolveFp8IpadapterCalibrationTokens:
         tokens, method = _resolve_fp8_ipadapter_calibration_tokens(ipa, cached_embeddings=None)
 
         assert method == "surrogate"
-        assert tokens is not None
         assert tokens.shape == (1, 4, 2048)
         # LayerNorm's bias on a zeros input is non-degenerate -- this is the
         # whole point of the surrogate (a real, non-zero signal for FP8
@@ -158,7 +157,6 @@ class TestResolveFp8IpadapterCalibrationTokens:
         tokens, method = _resolve_fp8_ipadapter_calibration_tokens(ipa, cached_embeddings=None)
 
         assert method == "surrogate"
-        assert tokens is not None
         assert tokens.shape == (1, 4, 2048)
         assert np.abs(tokens).max() > 0.0
 
@@ -294,7 +292,6 @@ class TestResolveFp8IpadapterCalibrationTokens:
         )
 
         assert method == "image"
-        assert tokens is not None
         assert tokens.shape[0] == 2
         # Batch attempt (all 3, raises) then per-image retries (3 singles,
         # "bad" raises too) -- restore call closes it out at the per-image
