@@ -60,6 +60,14 @@ NETWORK_HINT = (
 )
 
 
+# Appended when a model load dies on host memory / Windows commit limit rather than the network.
+PAGEFILE_HINT = (
+    " Hint: Windows ran out of virtual memory (RAM + paging file) while loading the model weights. "
+    "Set the paging file to 'System managed size' (or at least 32 GB) under System > Advanced > "
+    "Performance > Virtual memory, close other memory-heavy apps, then re-launch."
+)
+
+
 def iter_exception_chain(exc: BaseException) -> Iterator[BaseException]:
     """Yield `exc`, then each `__cause__`/`__context__` ancestor, deepest last.
 
@@ -114,6 +122,25 @@ def is_network_error(exc: BaseException) -> bool:
         if isinstance(ancestor, NETWORK_ERROR_TYPES):
             return True
     return is_xet_download_error(exc)
+
+
+def is_pagefile_error(exc: BaseException) -> bool:
+    """Chain-aware check for host-memory exhaustion while loading weights.
+
+    On Windows safetensors maps the file copy-on-write, so the whole file counts against the
+    commit limit; a small paging file fails with `OSError ... (os error 1455)` and diffusers'
+    text-mode fallback then re-raises a bare `MemoryError` (empty `str()`).
+    """
+    for ancestor in iter_exception_chain(exc):
+        if isinstance(ancestor, MemoryError):
+            return True
+        if isinstance(ancestor, OSError):
+            if getattr(ancestor, "winerror", None) == 1455:
+                return True
+            message = str(ancestor).lower()
+            if "os error 1455" in message or "paging file is too small" in message:
+                return True
+    return False
 
 
 @contextmanager

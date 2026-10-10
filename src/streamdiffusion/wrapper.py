@@ -30,9 +30,32 @@ from .pipeline import StreamDiffusion
 from .tools.gpu_profiler import configure as _configure_profiler
 from .tools.gpu_profiler import profiler
 from .utils.diagnostics import write_error_report as _write_error_report_util
-from .utils.hf_download import NETWORK_HINT, is_network_error
+from .utils.hf_download import NETWORK_HINT, PAGEFILE_HINT, is_network_error, is_pagefile_error
 
 logger = logging.getLogger(__name__)
+
+
+def _from_pretrained_lowmem(loader, path, dtype):
+    """`loader(path)` that prefers the fp16 weight variant and the requested dtype.
+
+    A bare `from_pretrained(path)` picks the fp32 `diffusion_pytorch_model.safetensors`
+    (10.3 GB for SDXL) even when only fp16 is wanted; on Windows that file is mapped
+    copy-on-write and charged in full against RAM + paging file (peak commit 25 GB vs 13.5 GB
+    for the fp16 variant), so small-pagefile hosts died with `OSError 1455` -> `MemoryError`.
+    Falls back to the unqualified load when the repo/dir has no fp16 variant.
+    """
+    if dtype != torch.float16:
+        return loader(path, torch_dtype=dtype)
+    try:
+        return loader(path, torch_dtype=dtype, variant="fp16", use_safetensors=True)
+    except Exception as e:
+        if is_pagefile_error(e):
+            raise
+        text = str(e).lower()
+        if "variant" not in text and ".fp16." not in text:
+            raise
+        logger.info(f"_load_model: no fp16 variant for '{path}' ({e}); retrying without variant")
+        return loader(path, torch_dtype=dtype)
 
 
 def _is_oom_error(exc: BaseException) -> bool:
@@ -2344,7 +2367,11 @@ class StreamDiffusionWrapper:
         for method, method_name in loading_methods:
             try:
                 logger.info(f"_load_model: Attempting to load with {method_name}...")
-                pipe = method(model_id_or_path).to(dtype=self.dtype)
+                if "from_pretrained" in method_name:
+                    pipe = _from_pretrained_lowmem(method, model_id_or_path, self.dtype)
+                else:
+                    pipe = method(model_id_or_path)
+                pipe = pipe.to(dtype=self.dtype)
                 logger.info(f"_load_model: Successfully loaded using {method_name}")
                 loaded_via_single_file = "from_single_file" in method_name
 
@@ -2366,7 +2393,9 @@ class StreamDiffusionWrapper:
                             pipe = StableDiffusionXLPipeline.from_single_file(model_id_or_path).to(dtype=self.dtype)
                             loaded_via_single_file = True
                         else:
-                            pipe = StableDiffusionXLPipeline.from_pretrained(model_id_or_path).to(dtype=self.dtype)
+                            pipe = _from_pretrained_lowmem(
+                                StableDiffusionXLPipeline.from_pretrained, model_id_or_path, self.dtype
+                            ).to(dtype=self.dtype)
                             loaded_via_single_file = False
                         logger.info("_load_model: Successfully loaded using SDXL pipeline on retry")
                     except Exception as retry_error:
@@ -2396,11 +2425,18 @@ class StreamDiffusionWrapper:
                     chosen_name, chosen_error = name, err
                     break
 
-            hint = NETWORK_HINT if is_network_error(chosen_error) else ""
-            attempts_summary = "; ".join(f"{name}: {err}" for name, err in load_errors)
+            if is_network_error(chosen_error):
+                hint = NETWORK_HINT
+            elif any(is_pagefile_error(err) for _, err in load_errors):
+                hint = PAGEFILE_HINT
+            else:
+                hint = ""
+            # type name first: str(MemoryError()) is "", which made the field report blank.
+            attempts_summary = "; ".join(f"{name}: {type(err).__name__}: {err}" for name, err in load_errors)
             error_msg = (
                 f"_load_model: All loading methods failed for model '{model_id_or_path}'. "
-                f"Reporting error from {chosen_name}: {chosen_error}.{hint} All attempts: {attempts_summary}"
+                f"Reporting error from {chosen_name}: {type(chosen_error).__name__}: {chosen_error}.{hint} "
+                f"All attempts: {attempts_summary}"
             )
             logger.error(error_msg, exc_info=chosen_error)
             raise RuntimeError(error_msg) from chosen_error
