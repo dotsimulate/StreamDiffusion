@@ -37,7 +37,7 @@ pytestmark = pytest.mark.skipif(
     reason="acceleration.tensorrt.engine_manager not importable",
 )
 
-_ENGINE_DIR = r"C:\Users\deswh\Documents\sdtd040\StreamDiffusion\engines\td"
+_ENGINE_DIR = "engines/td"
 
 _BASE_KWARGS = {
     "model_id_or_path": "stabilityai/sdxl-turbo",

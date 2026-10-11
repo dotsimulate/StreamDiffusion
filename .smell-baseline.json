@@ -1,6 +1,6 @@
 {
   "counts": {
-    "abs-path": 24,
+    "abs-path": 0,
     "bitwise-assert": 0,
     "commented-test": 0,
     "early-exit": 0,
@@ -12,5 +12,5 @@
     "platform-check": 0,
     "sleep": 0
   },
-  "total": 24
+  "total": 0
 }

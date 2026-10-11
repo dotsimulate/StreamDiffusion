@@ -96,3 +96,61 @@ class TestSimilarImageFilterSkipEvent:
 
         f(_frame(0.09))  # frame 3: Step 1 must observe the landed copy
         assert f._last_skip_prob == pytest.approx(expected)
+
+    def test_set_threshold_updates_threshold_and_mse_threshold(self):
+        f = SimilarImageFilter(threshold=0.98)
+        f.set_threshold(0.95)
+        assert f.threshold == 0.95
+        assert f._mse_threshold == pytest.approx(0.05)
+
+    def test_set_max_skip_frame_updates_max_skip_frame(self):
+        f = SimilarImageFilter(threshold=0.98, max_skip_frame=10)
+        f.set_max_skip_frame(5)
+        assert f.max_skip_frame == 5
+
+    def test_threshold_one_or_greater_never_skips(self):
+        """When threshold >= 1.0, _mse_threshold < 1e-6 triggers 'never skip' mode."""
+        f = SimilarImageFilter(threshold=1.0)
+        x = _frame(0.0)
+        f(x)  # frame 1: allocate
+        torch.cuda.synchronize()
+        out = f(_frame(0.0))  # identical frame
+        torch.cuda.synchronize()
+        assert out is not None
+        assert f._last_skip_prob == 0.0
+
+    def test_max_skip_frame_exceeded_forces_frame_pass_through(self, monkeypatch):
+        """When skip_count exceeds max_skip_frame, the filter must reset skip_count
+        and return the frame even if skip_prob would otherwise skip it."""
+        f = SimilarImageFilter(threshold=0.98, max_skip_frame=2)
+        f(_frame(0.0))  # frame 1: allocate
+
+        monkeypatch.setattr(f._skip_evt, "query", lambda: False)
+        f._last_skip_prob = 1.0
+        monkeypatch.setattr("random.random", lambda: 0.5)
+
+        out2 = f(_frame(0.0))
+        assert out2 is None
+        assert f.skip_count == 1
+
+        out3 = f(_frame(0.0))
+        assert out3 is None
+        assert f.skip_count == 2
+
+        out4 = f(_frame(0.0))
+        assert out4 is None
+        assert f.skip_count == 3
+
+        out5 = f(_frame(0.0))
+        assert torch.is_tensor(out5)
+        assert f.skip_count == 0
+
+    def test_nan_input_does_not_latch_filter_into_skip_state(self):
+        """NaN in input must be sanitized to 0.0 by NanGuard so it does not latch
+        into an infinite skip state."""
+        f = SimilarImageFilter(threshold=0.98)
+        f(_frame(0.0))  # frame 1: allocate
+        nan_frame = torch.full((1, 3, 8, 8), float("nan"), device="cuda")
+        f(nan_frame)
+        torch.cuda.synchronize()
+        assert f._skip_prob_pin.item() == 0.0

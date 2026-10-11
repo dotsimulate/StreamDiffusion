@@ -22,7 +22,7 @@ from onnx import TensorProto, helper, numpy_helper
 from streamdiffusion.acceleration.tensorrt.models import models as models_module
 from streamdiffusion.acceleration.tensorrt.models.models import Optimizer, _onnx_tensor_bytes
 
-TRT_PKG = Path(models_module.__file__).resolve().parents[1]
+SRC_PKG = Path(models_module.__file__).resolve().parents[3]  # .../streamdiffusion
 
 
 def _small_model(weight_mb: float = 1.0) -> onnx.ModelProto:
@@ -106,25 +106,49 @@ class TestOptimizerNeverCallsByteSize:
             assert opt.graph is not None
 
 
+def _is_bytesize_reference(node: ast.AST) -> bool:
+    """Any `x.ByteSize` attribute access (call or bound reference), or a string-keyed lookup of it
+    such as getattr(x, "ByteSize") / hasattr / operator.methodcaller("ByteSize")."""
+    if isinstance(node, ast.Attribute):
+        return node.attr == "ByteSize"
+    if isinstance(node, ast.Call):
+        return any(isinstance(a, ast.Constant) and a.value == "ByteSize" for a in node.args)
+    return False
+
+
 def _bytesize_calls(root: Path):
     for path in sorted(root.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "ByteSize":
+            if _is_bytesize_reference(node):
                 yield f"{path.relative_to(root)}:{node.lineno}"
 
 
-def test_no_bytesize_calls_anywhere_in_tensorrt_package():
-    offenders = list(_bytesize_calls(TRT_PKG))
+def test_no_bytesize_calls_anywhere_in_streamdiffusion_package():
+    offenders = list(_bytesize_calls(SRC_PKG))
     assert not offenders, (
         "ModelProto.ByteSize() serializes the whole proto under protobuf-upb (~4.5x transient, MemoryError "
         f"on SDXL). Use models.models._onnx_tensor_bytes instead: {offenders}"
     )
 
 
-def test_ast_guard_detects_a_planted_call(tmp_path):
-    (tmp_path / "bad.py").write_text("def f(m):\n    return m.ByteSize()\n", encoding="utf-8")
-    assert list(_bytesize_calls(tmp_path)) == ["bad.py:2"]
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def f(m):\n    return m.ByteSize()\n",
+        "def f(m):\n    size = m.ByteSize\n    return size()\n",
+        "def f(m):\n    return getattr(m, 'ByteSize')()\n",
+    ],
+    ids=["call", "bound-reference", "getattr"],
+)
+def test_ast_guard_detects_planted_variants(tmp_path, source):
+    (tmp_path / "bad.py").write_text(source, encoding="utf-8")
+    assert len(list(_bytesize_calls(tmp_path))) == 1
+
+
+def test_ast_guard_ignores_docstring_mentions(tmp_path):
+    (tmp_path / "ok.py").write_text('def f():\n    """ByteSize() is banned."""\n', encoding="utf-8")
+    assert list(_bytesize_calls(tmp_path)) == []
 
 
 @pytest.mark.parametrize("fn", ["_onnx_tensor_bytes"])
