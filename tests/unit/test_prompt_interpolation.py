@@ -955,11 +955,12 @@ class TestNormalizeFlagOnlyReblendsImmediately:
         """Not just 'it re-blended' -- confirm the flag is wired through to the
         blend math (Totalpweights-equivalent: un-normalized weights amplify)."""
         self.upd._current_prompt_list = [("cat", 2.0), ("dog", 2.0)]
-        self.upd.update_stream_params(normalize_prompt_weights=True)
-        normalized_embeds = self.upd.stream.prompt_embeds.clone()
-
+        # The flag defaults to True and only a *change* re-blends, so flip it both ways.
         self.upd.update_stream_params(normalize_prompt_weights=False)
         unnormalized_embeds = self.upd.stream.prompt_embeds.clone()
+
+        self.upd.update_stream_params(normalize_prompt_weights=True)
+        normalized_embeds = self.upd.stream.prompt_embeds.clone()
 
         assert not torch.allclose(normalized_embeds, unnormalized_embeds), (
             "toggling normalize_prompt_weights with an identical prompt_list produced "

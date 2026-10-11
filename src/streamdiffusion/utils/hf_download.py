@@ -31,7 +31,7 @@ from typing import Iterator
 
 import requests
 from huggingface_hub import constants as _hf_constants
-from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
+from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError, LocalEntryNotFoundError
 
 # Substrings seen in the wrapped OSError's own message when Xet fails. Kept as a
 # fallback for cases where the traceback frames aren't available (e.g. the
@@ -122,6 +122,19 @@ def is_network_error(exc: BaseException) -> bool:
         if isinstance(ancestor, NETWORK_ERROR_TYPES):
             return True
     return is_xet_download_error(exc)
+
+
+def is_missing_hub_file(exc: BaseException) -> bool:
+    """True when the chain holds a server-side "file not in this repo" (HTTP 404) error.
+
+    `EntryNotFoundError` subclasses `HfHubHTTPError`, so `is_network_error` also matches it, but
+    the hub answered fine: the file simply does not exist (e.g. a repo with no fp16 variant).
+    `LocalEntryNotFoundError` is excluded: it means "offline and not cached", a real network failure.
+    """
+    return any(
+        isinstance(a, EntryNotFoundError) and not isinstance(a, LocalEntryNotFoundError)
+        for a in iter_exception_chain(exc)
+    )
 
 
 def is_pagefile_error(exc: BaseException) -> bool:

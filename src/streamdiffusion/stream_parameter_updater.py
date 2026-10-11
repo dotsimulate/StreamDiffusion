@@ -150,6 +150,20 @@ class StreamParameterUpdater(OrchestratorUser):
         """Get the current seed weight normalization setting."""
         return self.normalize_seed_weights
 
+    def _set_normalize_flag(self, attr: str, value: Optional[bool], label: str) -> bool:
+        """Store a normalize flag; log and return True only when its value actually changed.
+
+        TD resends the whole prompt block every frame during startup, so an unchanged flag must
+        neither log nor trigger a re-blend. ``None`` means "not provided" and changes nothing.
+        """
+        if value is None:
+            return False
+        changed = value != getattr(self, attr)
+        setattr(self, attr, value)
+        if changed:
+            logger.info(f"update_stream_params: {label} weight normalization set to {value}")
+        return changed
+
     # Deprecated enhancer registration removed; embedding composition is handled via stream.embedding_hooks
 
     def register_embedding_preprocessor(self, preprocessor: Any, style_image_key: str) -> None:
@@ -479,13 +493,11 @@ class StreamParameterUpdater(OrchestratorUser):
             if seed is not None:
                 self._update_seed(seed)
 
-            if normalize_prompt_weights is not None:
-                self.normalize_prompt_weights = normalize_prompt_weights
-                logger.info(f"update_stream_params: Prompt weight normalization set to {normalize_prompt_weights}")
-
-            if normalize_seed_weights is not None:
-                self.normalize_seed_weights = normalize_seed_weights
-                logger.info(f"update_stream_params: Seed weight normalization set to {normalize_seed_weights}")
+            # Log only on change: TD resends the whole prompt block every frame during startup.
+            prompt_norm_changed = self._set_normalize_flag(
+                "normalize_prompt_weights", normalize_prompt_weights, "Prompt"
+            )
+            seed_norm_changed = self._set_normalize_flag("normalize_seed_weights", normalize_seed_weights, "Seed")
 
             # Interpolation methods are sticky: a method-only update must take effect
             # immediately, and a list-only update must not revert to a signature default.
@@ -508,11 +520,12 @@ class StreamParameterUpdater(OrchestratorUser):
                     negative_prompt=negative_prompt or self._current_negative_prompt,
                     prompt_interpolation_method=self._last_prompt_interpolation_method,
                 )
-            elif prompt_interpolation_method is not None or normalize_prompt_weights is not None:
+            elif prompt_interpolation_method is not None or prompt_norm_changed:
                 # Method-only or normalize-flag-only change: re-blend the already-cached
                 # embeddings so the switch lands on the next frame instead of waiting for a
                 # prompt edit (Part 3 — previously toggling Normpweights with no prompt edit
-                # had no effect until the next prompt_list update).
+                # had no effect until the next prompt_list update). An unchanged flag resent
+                # every frame (TD does during startup) must not re-blend.
                 self._apply_prompt_blending(self._last_prompt_interpolation_method)
 
             # Handle seed blending if seed_list is provided
@@ -520,7 +533,7 @@ class StreamParameterUpdater(OrchestratorUser):
                 self._update_blended_seeds(
                     seed_list=seed_list, interpolation_method=self._last_seed_interpolation_method
                 )
-            elif seed_interpolation_method is not None or normalize_seed_weights is not None:
+            elif seed_interpolation_method is not None or seed_norm_changed:
                 # Method-only or normalize-flag-only change: re-blend the already-cached seed
                 # noise immediately (mirrors the prompt-side trigger above).
                 self._apply_seed_blending(self._last_seed_interpolation_method)

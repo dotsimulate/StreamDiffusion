@@ -31,6 +31,7 @@ from unittest.mock import patch
 import pytest
 import requests
 import torch
+from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 
 from streamdiffusion import wrapper as wrapper_module
 from streamdiffusion.wrapper import StreamDiffusionWrapper
@@ -195,7 +196,8 @@ class TestLowMemoryFp16Variant:
 
         assert calls[0]["variant"] == "fp16"
         assert calls[0]["torch_dtype"] == torch.float16
-        assert calls[0]["use_safetensors"] is True
+        # An fp16-only `.bin` repo must still resolve its fp16 variant, so safetensors is not forced.
+        assert "use_safetensors" not in calls[0]
 
     def test_fp32_load_does_not_request_variant(self):
         calls = []
@@ -234,6 +236,94 @@ class TestLowMemoryFp16Variant:
                 w._load_model("stabilityai/sd-turbo", t_index_list=[0])
 
         assert len(calls) == 2 and "variant" not in calls[1]
+
+    def test_network_error_mentioning_fp16_url_is_not_retried(self):
+        """HF network errors carry the `.fp16.` file URL in their text; the missing-variant
+        retry must not mistake them for it and start a second (fp32) download."""
+        calls = []
+        err = requests.exceptions.ReadTimeout(
+            "HTTPSConnectionPool: Read timed out for unet/diffusion_pytorch_model.fp16.safetensors"
+        )
+
+        def fake_auto(path, *args, **kwargs):
+            calls.append(kwargs)
+            raise err
+
+        w = _make_fp16_wrapper_shell()
+        with patch.object(wrapper_module.AutoPipelineForText2Image, "from_pretrained", staticmethod(fake_auto)):
+            with pytest.raises(RuntimeError) as exc_info:
+                w._load_model("stabilityai/sd-turbo", t_index_list=[0])
+
+        assert len(calls) == 1, "a network failure must not trigger the unqualified (fp32) retry"
+        assert exc_info.value.__cause__ is err
+
+    def test_hub_404_for_missing_fp16_file_retries_without_variant(self):
+        """diffusers rewrites the hub's 404 into `EnvironmentError(...) from EntryNotFoundError`;
+        the hub answered fine (file absent), so this is a missing variant, not a network failure."""
+        calls = []
+
+        def loader(path, **kwargs):
+            calls.append(kwargs)
+            if "variant" in kwargs:
+                raise OSError(f"{path} does not appear to have a file named x.fp16.safetensors.") from (
+                    EntryNotFoundError("404 Client Error. Entry Not Found")
+                )
+            return _OkPipe()
+
+        wrapper_module._from_pretrained_lowmem(loader, "org/repo", torch.float16)
+
+        assert len(calls) == 2 and "variant" not in calls[1]
+
+    def test_offline_cache_miss_mentioning_fp16_is_not_retried(self):
+        """LocalEntryNotFoundError (offline + not cached) is a real network failure."""
+        calls = []
+
+        def loader(path, **kwargs):
+            calls.append(kwargs)
+            raise OSError("no file named x.fp16.safetensors") from LocalEntryNotFoundError("offline")
+
+        with pytest.raises(EnvironmentError):
+            wrapper_module._from_pretrained_lowmem(loader, "org/repo", torch.float16)
+
+        assert len(calls) == 1
+
+    def test_local_file_path_skips_variant_attempt(self, tmp_path):
+        ckpt = tmp_path / "model.ckpt"
+        ckpt.write_bytes(b"")
+        calls = []
+
+        def loader(path, **kwargs):
+            calls.append(kwargs)
+            return _OkPipe()
+
+        wrapper_module._from_pretrained_lowmem(loader, str(ckpt), torch.float16)
+
+        assert calls == [{"torch_dtype": torch.float16}]
+
+    def test_xl_inner_retry_also_requests_fp16_variant_and_falls_back(self):
+        """The SDXL pipeline-mismatch retry goes through the same low-memory loader."""
+        xl_calls = []
+
+        def fake_auto(path, *args, **kwargs):
+            return _FakeWrongTypePipe()
+
+        def fake_xl(path, *args, **kwargs):
+            xl_calls.append(kwargs)
+            if "variant" in kwargs:
+                raise ValueError("no such modeling files for `variant=fp16`")
+            return _OkPipe()
+
+        w = _make_fp16_wrapper_shell()
+        with (
+            patch.object(wrapper_module.AutoPipelineForText2Image, "from_pretrained", staticmethod(fake_auto)),
+            patch.object(wrapper_module.StableDiffusionXLPipeline, "from_pretrained", staticmethod(fake_xl)),
+        ):
+            with contextlib.suppress(AttributeError):  # _OkPipe has no .unet; we only assert the loader calls
+                w._load_model("some-xl-model", t_index_list=[0])
+
+        assert len(xl_calls) == 2
+        assert xl_calls[0]["variant"] == "fp16"
+        assert "variant" not in xl_calls[1]
 
     def test_pagefile_error_is_not_retried_and_gets_hint(self):
         calls = []

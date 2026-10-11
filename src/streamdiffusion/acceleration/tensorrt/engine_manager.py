@@ -534,6 +534,12 @@ class EngineManager:
         self, compile_fn, engine_path: Path, model, model_config, batch_size: int, kwargs: Dict
     ) -> None:
         """Execute compilation with common pattern to eliminate duplication."""
+        # Pin the shared TRT timing cache to <engine_dir>/_timing_cache. build_engine's
+        # path-derived fallback assumes engine_path is exactly <root>/<prefix>/<file>, but
+        # the UNet/VAE prefix keeps the "/" of a HF model id, nesting one extra directory
+        # (engines/td/stabilityai/...) and silently splitting the cache from ControlNet's.
+        build_options = dict(kwargs.get("engine_build_options") or {})
+        build_options.setdefault("timing_cache_dir", str(self.engine_dir / "_timing_cache"))
         compile_fn(
             model,
             model_config,
@@ -541,7 +547,7 @@ class EngineManager:
             str(engine_path) + ".opt.onnx",
             str(engine_path),
             opt_batch_size=batch_size,
-            engine_build_options=kwargs.get("engine_build_options", {}),
+            engine_build_options=build_options,
         )
 
     def _prepare_controlnet_models(self, kwargs: Dict):

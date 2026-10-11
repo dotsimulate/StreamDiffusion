@@ -111,6 +111,10 @@ def _extract_wrapper_params(config: Dict[str, Any]) -> Dict[str, Any]:
         # Mirrors _extract_prepare_params's identical lookup below so a build-time
         # config and the first prepare() call agree on the deployment grid.
         "num_inference_steps": config.get("num_inference_steps", DEFAULTS["num_inference_steps"]),
+        # Initial guidance for the wrapper's warm-up prepare(); no default so an absent key is
+        # dropped below and the wrapper keeps its cfg_type default. Hosts that never call
+        # wrapper.prepare() (TouchDesigner) otherwise never see the configured value.
+        "guidance_scale": config.get("guidance_scale"),
         "lora_dict": config.get("lora_dict"),
         "mode": config.get("mode", "img2img"),
         "output_type": config.get("output_type", "pil"),

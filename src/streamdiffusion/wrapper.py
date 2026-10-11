@@ -30,9 +30,37 @@ from .pipeline import StreamDiffusion
 from .tools.gpu_profiler import configure as _configure_profiler
 from .tools.gpu_profiler import profiler
 from .utils.diagnostics import write_error_report as _write_error_report_util
-from .utils.hf_download import NETWORK_HINT, PAGEFILE_HINT, is_network_error, is_pagefile_error
+from .utils.hf_download import (
+    NETWORK_HINT,
+    PAGEFILE_HINT,
+    is_missing_hub_file,
+    is_network_error,
+    is_pagefile_error,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_init_guidance_scale(cfg_type: str, configured: Optional[float]) -> float:
+    """Guidance scale for the wrapper's warm-up ``prepare()``.
+
+    A configured value wins, with two exceptions. ``none`` always returns 1.0 (the pipeline forces
+    it). ``full`` and ``initialize`` raise values <= 1.0 to 1.2: their TRT UNet batch is sized for
+    CFG doubling, which only runs when guidance > 1.0 (the TD fork's OSC-update clamp mirrors this
+    for ``initialize``). A configured 1.0 with ``self`` deliberately leaves RCFG off. Unconfigured
+    keeps the historical 1.1/1.0 cfg_type default.
+    """
+    if cfg_type == "none":
+        return 1.0
+    if configured is None:
+        return 1.1 if cfg_type in ("full", "self", "initialize") else 1.0
+    if cfg_type in ("full", "initialize") and configured <= 1.0:
+        logger.warning(
+            f"StreamDiffusionWrapper: guidance_scale={configured} is not usable with cfg_type="
+            f"'{cfg_type}' (its static batch assumes CFG doubling); using 1.2"
+        )
+        return 1.2
+    return float(configured)
 
 
 def _from_pretrained_lowmem(loader, path, dtype):
@@ -42,20 +70,30 @@ def _from_pretrained_lowmem(loader, path, dtype):
     (10.3 GB for SDXL) even when only fp16 is wanted; on Windows that file is mapped
     copy-on-write and charged in full against RAM + paging file (peak commit 25 GB vs 13.5 GB
     for the fp16 variant), so small-pagefile hosts died with `OSError 1455` -> `MemoryError`.
-    Falls back to the unqualified load when the repo/dir has no fp16 variant.
+    Falls back to the unqualified load when the repo/dir has no fp16 variant (including the hub's
+    404 "no file named ...fp16..." error, which is not a network failure). Pagefile and
+    network failures re-raise instead: a retry would not help the former and would start a
+    second (fp32) download after the latter. A plain file path has no variant to pick, so it
+    skips the variant attempt.
     """
-    if dtype != torch.float16:
+    if dtype != torch.float16 or os.path.isfile(path):
         return loader(path, torch_dtype=dtype)
     try:
-        return loader(path, torch_dtype=dtype, variant="fp16", use_safetensors=True)
+        # No use_safetensors=True: a repo shipping only fp16 `.bin` weights should still
+        # resolve its fp16 variant rather than failing and falling back to fp32.
+        pipe = loader(path, torch_dtype=dtype, variant="fp16")
+        logger.info(f"_load_model: loaded '{path}' with the fp16 weight variant")
+        return pipe
     except Exception as e:
-        if is_pagefile_error(e):
+        if is_pagefile_error(e) or (is_network_error(e) and not is_missing_hub_file(e)):
             raise
         text = str(e).lower()
         if "variant" not in text and ".fp16." not in text:
             raise
         logger.info(f"_load_model: no fp16 variant for '{path}' ({e}); retrying without variant")
-        return loader(path, torch_dtype=dtype)
+        pipe = loader(path, torch_dtype=dtype)
+        logger.info(f"_load_model: loaded '{path}' without a variant (fp16 variant unavailable)")
+        return pipe
 
 
 def _is_oom_error(exc: BaseException) -> bool:
@@ -702,6 +740,10 @@ class StreamDiffusionWrapper:
         # below; set it from config so a non-default deployment step count still
         # calibrates the timestep region inference actually visits.
         num_inference_steps: int = 50,
+        # Initial guidance scale for the warm-up prepare(). None keeps the cfg_type default
+        # (1.1 for full/self/initialize, else 1.0). Needed because hosts that build the wrapper
+        # via create_wrapper_from_config (TouchDesigner) never call wrapper.prepare().
+        guidance_scale: Optional[float] = None,
         static_shapes: bool = False,
         fp8_allow_fp16_fallback: bool = False,
         # Experimental: include attention BMM1/BMM2 in FP8 Q/DQ (modelopt disable_mha_qdq=False).
@@ -1056,11 +1098,16 @@ class StreamDiffusionWrapper:
         if seed < 0:  # Random seed
             seed = int(np.random.default_rng().integers(0, 1000000))
 
+        init_guidance_scale = _resolve_init_guidance_scale(self.stream.cfg_type, guidance_scale)
+        logger.info(
+            f"StreamDiffusionWrapper: initial guidance_scale={init_guidance_scale} "
+            f"({'config' if guidance_scale is not None else 'cfg_type default'}, cfg_type={self.stream.cfg_type})"
+        )
         self.stream.prepare(
             "",
             "",
             num_inference_steps=50,
-            guidance_scale=1.1 if self.stream.cfg_type in ["full", "self", "initialize"] else 1.0,
+            guidance_scale=init_guidance_scale,
             generator=torch.manual_seed(seed),
             seed=seed,
         )
@@ -3339,6 +3386,7 @@ class StreamDiffusionWrapper:
                         "opt_image_width": self.width,
                         "build_dynamic_shape": False,
                         "build_static_batch": self.static_shapes,
+                        "model_id": model_id_or_path,
                     }
                     if self.builder_optimization_level is not None:
                         _unet_build_opts["builder_optimization_level"] = self.builder_optimization_level
