@@ -291,6 +291,16 @@ class TestWriteBuildStatsAppendGlobal:
         assert len(lines) == 1
         assert json.loads(lines[0]) == stats
 
+    def test_log_root_overrides_where_build_log_goes(self, tmp_path):
+        """HF-id engines nest under <root>/<org>/; the log belongs at the real root."""
+        engine_path, engines_root = self._make_engine_path(tmp_path)
+        real_root = engines_root.parent
+
+        _write_build_stats(engine_path, {"engine_dir": "test", "stages": {}}, log_root=real_root)
+
+        assert (real_root / "build_log.jsonl").exists()
+        assert not (engines_root / "build_log.jsonl").exists()
+
     def test_mid_build_flush_then_final_write_appends_exactly_once(self, tmp_path):
         """Simulates the real sequence: a mid-build flush (append_global=False)
         followed by the end-of-build write (append_global=True, the default) --
@@ -425,3 +435,87 @@ class TestFindBestSiblingMhaRatio:
         best = _find_best_sibling_mha_ratio(current_engine_dir, "fp16", window=1)
 
         assert best == 2.0  # only "completed" (the newer build_start) is in the window
+
+    def test_match_skips_sibling_with_different_opt_level(self, tmp_path):
+        """The 3.0-vs-2.0 false alarm: a sibling built at another optimization level
+        is not a comparable baseline."""
+        current_engine_dir, engines_root = self._make_current_and_root(tmp_path)
+        self._write_sibling(
+            engines_root,
+            "sdxl-turbo--optlvl5--res-384x640",
+            {"precision": "fp16", "mha_kernels_per_attn_block": 2.0, "builder_optimization_level": 5},
+        )
+        self._write_sibling(
+            engines_root,
+            "sdxl-turbo--optlvl2--res-384x640",
+            {"precision": "fp16", "mha_kernels_per_attn_block": 3.0, "builder_optimization_level": 2},
+        )
+
+        best = _find_best_sibling_mha_ratio(current_engine_dir, "fp16", match={"builder_optimization_level": 2})
+
+        assert best == 3.0
+
+    def test_match_skips_sibling_with_different_resolution(self, tmp_path):
+        current_engine_dir, engines_root = self._make_current_and_root(tmp_path)
+        self._write_sibling(
+            engines_root,
+            "sdxl-turbo--a--res-512x512",
+            {"precision": "fp16", "mha_kernels_per_attn_block": 2.0, "opt_resolution": [512, 512]},
+        )
+        self._write_sibling(
+            engines_root,
+            "sdxl-turbo--b--res-384x640",
+            {"precision": "fp16", "mha_kernels_per_attn_block": 3.0, "opt_resolution": [384, 640]},
+        )
+
+        best = _find_best_sibling_mha_ratio(current_engine_dir, "fp16", match={"opt_resolution": [384, 640]})
+
+        assert best == 3.0
+
+    def test_match_skips_sibling_lacking_the_key(self, tmp_path):
+        """Pre-existing stats without the key cannot be shown comparable."""
+        current_engine_dir, engines_root = self._make_current_and_root(tmp_path)
+        self._write_sibling(engines_root, "legacy", {"precision": "fp16", "mha_kernels_per_attn_block": 2.0})
+
+        assert (
+            _find_best_sibling_mha_ratio(current_engine_dir, "fp16", match={"builder_optimization_level": 2}) is None
+        )
+
+    def test_match_skips_sibling_of_another_model_id(self, tmp_path):
+        """Two local checkpoints can share a folder-name stem; model_id tells them apart."""
+        current_engine_dir, engines_root = self._make_current_and_root(tmp_path)
+        self._write_sibling(
+            engines_root,
+            "model--x--res-384x640",
+            {"precision": "fp16", "mha_kernels_per_attn_block": 1.0, "model_id": "other/model.safetensors"},
+        )
+        self._write_sibling(
+            engines_root,
+            "model--y--res-384x640",
+            {"precision": "fp16", "mha_kernels_per_attn_block": 3.0, "model_id": "mine/model.safetensors"},
+        )
+
+        best = _find_best_sibling_mha_ratio(current_engine_dir, "fp16", match={"model_id": "mine/model.safetensors"})
+
+        assert best == 3.0
+
+    def test_cross_precision_lookup_honors_match(self, tmp_path):
+        """The gate's other-precision baseline uses the same comparability filter."""
+        current_engine_dir, engines_root = self._make_current_and_root(tmp_path)
+        self._write_sibling(
+            engines_root,
+            "fp8-other-res",
+            {"precision": "fp8", "mha_kernels_per_attn_block": 1.0, "opt_resolution": "512x512"},
+        )
+
+        assert _find_best_sibling_mha_ratio(current_engine_dir, "fp8", match={"opt_resolution": "384x640"}) is None
+        assert _find_best_sibling_mha_ratio(current_engine_dir, "fp8", match={"opt_resolution": "512x512"}) == 1.0
+
+    def test_match_on_model_id_skips_legacy_sibling_without_it(self, tmp_path):
+        current_engine_dir, engines_root = self._make_current_and_root(tmp_path)
+        self._write_sibling(engines_root, "legacy", {"precision": "fp16", "mha_kernels_per_attn_block": 2.0})
+
+        assert (
+            _find_best_sibling_mha_ratio(current_engine_dir, "fp16", match={"model_id": "stabilityai/sdxl-turbo"})
+            is None
+        )

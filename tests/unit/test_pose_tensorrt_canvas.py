@@ -142,7 +142,11 @@ class TestSuccessFallbackReconciliation:
     (np.zeros((target_height, target_width, 3), dtype=np.uint8) in _process_core/
     _process_tensor_core) must agree on shape/dtype for the same target dimensions."""
 
-    @pytest.mark.parametrize("canvas_width,canvas_height", [(384, 384), (512, 512), (640, 384)])
+    @pytest.mark.parametrize(
+        "canvas_width,canvas_height",
+        [(384, 384), (512, 512), (640, 384)],
+        ids=["384x384", "512x512", "640x384"],
+    )
     def test_success_and_fallback_shapes_match(self, canvas_width, canvas_height):
         success_image = show_predictions_from_batch_format(
             _predictions_one_pose(), canvas_width=canvas_width, canvas_height=canvas_height

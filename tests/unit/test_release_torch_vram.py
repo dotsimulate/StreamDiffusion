@@ -55,9 +55,11 @@ def test_ipadapter_ref_without_installed_adapter_is_a_noop():
     ipadapter_ref = types.SimpleNamespace(ipadapter=None)
 
     restore = _release_torch_vram(_fake_builder(), pipe_ref=None, ipadapter_ref=ipadapter_ref)
-    restore()
+    assert callable(restore)
+    assert restore() is None
 
 
 def test_no_ipadapter_ref_is_a_noop():
     restore = _release_torch_vram(_fake_builder(), pipe_ref=None, ipadapter_ref=None)
-    restore()
+    assert callable(restore)
+    assert restore() is None

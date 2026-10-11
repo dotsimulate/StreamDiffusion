@@ -479,7 +479,8 @@ class TestWarmupFaceid:
         class _NoInsightfaceModel:
             pass
 
-        faceid_compat.warmup_faceid(_NoInsightfaceModel())  # must not raise
+        res = faceid_compat.warmup_faceid(_NoInsightfaceModel())  # must not raise
+        assert res is None
 
     def test_detection_failure_does_not_block_recognition_warmup(self, fake_vendor):
         from streamdiffusion.modules import faceid_compat

@@ -91,7 +91,7 @@ class TestGetSdxlTensorrtConfigSmokeTest:
     it directly with a mocked SDXL UNet."""
 
     def test_config_carries_expected_keys(self):
-        config = get_sdxl_tensorrt_config("D:/fake/path.safetensors", _fake_sdxl_unet())
+        config = get_sdxl_tensorrt_config("fake/path.safetensors", _fake_sdxl_unet())
 
         assert config["is_sdxl"] is True
         assert config["has_time_cond"] is False  # time_cond_proj_dim=None in the fixture
@@ -101,7 +101,7 @@ class TestGetSdxlTensorrtConfigSmokeTest:
     def test_config_is_consumable_by_conditioning_handler(self):
         """The whole point of the dict: SDXLConditioningHandler must be able
         to construct from it and produce a conditioning spec."""
-        config = get_sdxl_tensorrt_config("D:/fake/path.safetensors", _fake_sdxl_unet())
+        config = get_sdxl_tensorrt_config("fake/path.safetensors", _fake_sdxl_unet())
 
         handler = SDXLConditioningHandler(config)
         spec = handler.get_conditioning_spec()

@@ -37,7 +37,6 @@ from streamdiffusion.stream_parameter_updater import StreamParameterUpdater
 from streamdiffusion.tools.gpu_profiler import profiler
 from streamdiffusion.utils.nan_guard import NanGuard
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 

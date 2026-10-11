@@ -442,7 +442,8 @@ class TestSpatialScaleValidation:
     def test_tiny_vae_is_not_subject_to_the_spatial_scale_check(self):
         """AutoencoderTiny configs have no block_out_channels - must not raise."""
         cfg = {"_class_name": "AutoencoderTiny", "latent_channels": 4}
-        _validate_vae_config("madebyollin/taesd", wrapper_module.AutoencoderTiny, cfg, torch.float32)
+        res = _validate_vae_config("madebyollin/taesd", wrapper_module.AutoencoderTiny, cfg, torch.float32)
+        assert res is None
 
 
 class TestForceUpcastFp16Warning:
@@ -489,7 +490,9 @@ class TestHardenVaeAttentionGating:
         an AttributeError. Must not raise even when the probe fires."""
         with patch.object(wrapper_module, "_fork_returns_kvo_tuple", lambda: True):
             tiny = _FakeTiny()
-            _harden_vae_attention(tiny)  # must not raise AttributeError
+            res = _harden_vae_attention(tiny)  # must not raise AttributeError
+            assert res is None
+            assert not hasattr(tiny, "set_attn_processor")
 
     def test_probe_true_skips_a_kl_with_no_attention_blocks(self):
         with patch.object(wrapper_module, "_fork_returns_kvo_tuple", lambda: True):

@@ -201,7 +201,7 @@ class TestSafetensorsMetadata:
         assert read_safetensors_metadata(path) == {"modelspec.architecture": "stable-diffusion-xl-turbo-v1"}
 
     def test_read_safetensors_metadata_missing_file_returns_empty_dict(self):
-        assert read_safetensors_metadata("D:/does/not/exist.safetensors") == {}
+        assert read_safetensors_metadata("nonexistent/path/does_not_exist.safetensors") == {}
 
     def test_read_safetensors_metadata_none_path_returns_empty_dict(self):
         assert read_safetensors_metadata(None) == {}
@@ -224,18 +224,18 @@ class TestSafetensorsMetadata:
 
 class TestTurboHintFromModelId:
     def test_turbo_in_basename_is_true(self):
-        assert turbo_hint_from_model_id("D:/models/SDXL-Turbo-merge.safetensors") is True
+        assert turbo_hint_from_model_id("models/SDXL-Turbo-merge.safetensors") is True
 
     def test_turbo_case_insensitive(self):
-        assert turbo_hint_from_model_id("D:/models/sdxl_TURBO_merge.safetensors") is True
+        assert turbo_hint_from_model_id("models/sdxl_TURBO_merge.safetensors") is True
 
     def test_turbo_in_parent_dir_only_is_false(self):
         """Guard case: a base checkpoint staged under a `turbo_tests/` directory
         must not be misread as a Turbo checkpoint from its path alone."""
-        assert turbo_hint_from_model_id("D:/turbo_tests/sdxl_base.safetensors") is False
+        assert turbo_hint_from_model_id("turbo_tests/sdxl_base.safetensors") is False
 
     def test_no_hint_is_false(self):
-        assert turbo_hint_from_model_id("D:/models/sdxl_base.safetensors") is False
+        assert turbo_hint_from_model_id("models/sdxl_base.safetensors") is False
 
     def test_none_is_false(self):
         assert turbo_hint_from_model_id(None) is False

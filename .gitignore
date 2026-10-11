@@ -271,3 +271,10 @@ audit_reports/
 # Quality harness run outputs (generated; goldens/ is committed, outputs/ is not)
 tests/quality/outputs/
 logs/
+
+# LoRA/FaceID validation-script artifacts (engine weights, PNGs, JSON summaries)
+outputs/
+
+# Local tooling artifacts (stale pyrefly baseline copy; Antigravity guardrail hooks/skills)
+.pyrefly-baseline.json
+.agents/

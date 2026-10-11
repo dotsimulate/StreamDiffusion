@@ -31,7 +31,7 @@ from typing import Iterator
 
 import requests
 from huggingface_hub import constants as _hf_constants
-from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
+from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError, LocalEntryNotFoundError
 
 # Substrings seen in the wrapped OSError's own message when Xet fails. Kept as a
 # fallback for cases where the traceback frames aren't available (e.g. the
@@ -57,6 +57,14 @@ NETWORK_HINT = (
     "If this keeps happening, consider `pip install hf_xet` for large-file transfers, set "
     "HF_HUB_DISABLE_XET=1 to fall back to plain HTTPS downloads, and raise HF_HUB_DOWNLOAD_TIMEOUT if "
     "this keeps happening on a slow connection."
+)
+
+
+# Appended when a model load dies on host memory / Windows commit limit rather than the network.
+PAGEFILE_HINT = (
+    " Hint: Windows ran out of virtual memory (RAM + paging file) while loading the model weights. "
+    "Set the paging file to 'System managed size' (or at least 32 GB) under System > Advanced > "
+    "Performance > Virtual memory, close other memory-heavy apps, then re-launch."
 )
 
 
@@ -114,6 +122,38 @@ def is_network_error(exc: BaseException) -> bool:
         if isinstance(ancestor, NETWORK_ERROR_TYPES):
             return True
     return is_xet_download_error(exc)
+
+
+def is_missing_hub_file(exc: BaseException) -> bool:
+    """True when the chain holds a server-side "file not in this repo" (HTTP 404) error.
+
+    `EntryNotFoundError` subclasses `HfHubHTTPError`, so `is_network_error` also matches it, but
+    the hub answered fine: the file simply does not exist (e.g. a repo with no fp16 variant).
+    `LocalEntryNotFoundError` is excluded: it means "offline and not cached", a real network failure.
+    """
+    return any(
+        isinstance(a, EntryNotFoundError) and not isinstance(a, LocalEntryNotFoundError)
+        for a in iter_exception_chain(exc)
+    )
+
+
+def is_pagefile_error(exc: BaseException) -> bool:
+    """Chain-aware check for host-memory exhaustion while loading weights.
+
+    On Windows safetensors maps the file copy-on-write, so the whole file counts against the
+    commit limit; a small paging file fails with `OSError ... (os error 1455)` and diffusers'
+    text-mode fallback then re-raises a bare `MemoryError` (empty `str()`).
+    """
+    for ancestor in iter_exception_chain(exc):
+        if isinstance(ancestor, MemoryError):
+            return True
+        if isinstance(ancestor, OSError):
+            if getattr(ancestor, "winerror", None) == 1455:
+                return True
+            message = str(ancestor).lower()
+            if "os error 1455" in message or "paging file is too small" in message:
+                return True
+    return False
 
 
 @contextmanager

@@ -36,7 +36,7 @@ pytestmark = pytest.mark.skipif(
 
 # Mirrors the crash report: a nested Documents path, matching the real-world depth
 # that pushed the UNet engine path over MAX_PATH.
-_CRASH_ENGINE_DIR = r"C:\Users\deswh\Documents\sdtd040\StreamDiffusion\engines\td"
+_CRASH_ENGINE_DIR = r"C:\Users\deswh\Documents\sdtd040\StreamDiffusion\engines\td"  # smell: ignore[abs-path]
 
 # The exact flag combination from the crash log's UNet directory name.
 _CRASH_UNET_KWARGS = {

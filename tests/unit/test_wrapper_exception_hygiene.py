@@ -52,6 +52,7 @@ class TestIsOomError:
             "generic oom while building engine",
             "CUDA error: an illegal memory access was encountered",
         ],
+        ids=["cuda_oom_substring", "torch_oom_substring", "generic_oom", "illegal_memory_access"],
     )
     def test_string_heuristic_matches_known_oom_substrings(self, message):
         assert _is_oom_error(RuntimeError(message)) is True

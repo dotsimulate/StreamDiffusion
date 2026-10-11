@@ -234,7 +234,9 @@ class TestUnetStepDoesNotRaiseAcrossBackends:
         x_in = _zero_input(stream)
 
         for _ in range(3):
-            StreamDiffusion.predict_x0_batch(stream, x_in)  # must not raise
+            out = StreamDiffusion.predict_x0_batch(stream, x_in)  # must not raise
+            assert out is not None
+            assert torch.isfinite(out).all()
 
 
 class TestNanGuardHealsAcrossBackends:
@@ -338,7 +340,9 @@ class TestKvoCacheBucketedRecoveryDoesNotRaise:
         x_in = _zero_input(stream)
 
         for _ in range(8):
-            StreamDiffusion.predict_x0_batch(stream, x_in)  # must not raise, incl. on the frame-3 NaN
+            out = StreamDiffusion.predict_x0_batch(stream, x_in)  # must not raise, incl. on the frame-3 NaN
+            assert out is not None
+        assert torch.isfinite(out).all()
 
 
 @pytest.mark.parametrize("is_sdxl", [False, True], ids=["sd15", "sdxl-trt"])

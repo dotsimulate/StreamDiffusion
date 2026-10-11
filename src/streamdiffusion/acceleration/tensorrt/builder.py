@@ -54,9 +54,12 @@ def _onnx_cache_valid(path: str) -> bool:
         return False
 
 
-def _write_build_stats(engine_path: str, stats: dict, append_global: bool = True):
+def _write_build_stats(engine_path: str, stats: dict, append_global: bool = True, log_root=None):
     """Write build stats to the per-engine JSON file, and (by default) append to
     the JSON-lines build log at the engines root.
+
+    ``log_root`` overrides where ``build_log.jsonl`` goes (default: the engine dir's parent,
+    which is one level too deep for engines nested under an HF ``<org>/`` folder).
 
     ``append_global=False`` is for a mid-build flush (fp8-round-13 provenance: the
     per-engine file is written once the calibration-capture stage completes, so an
@@ -72,7 +75,7 @@ def _write_build_stats(engine_path: str, stats: dict, append_global: bool = True
             json.dump(stats, f, indent=2)
         if append_global:
             # Also append to the global build log in the engines root
-            engines_root = engine_dir.parent
+            engines_root = Path(log_root) if log_root is not None else engine_dir.parent
             global_log = engines_root / "build_log.jsonl"
             with open(global_log, "a") as f:
                 f.write(json.dumps(stats) + "\n")
@@ -349,7 +352,12 @@ def _count_attn_bmm_dq_fed(onnx_path: str) -> Optional[Tuple[int, int]]:
         return None
 
 
-def _find_best_sibling_mha_ratio(engine_dir: str, precision: str, window: int = 5) -> Optional[float]:
+def _find_best_sibling_mha_ratio(
+    engine_dir: str,
+    precision: str,
+    window: int = 5,
+    match: Optional[Dict[str, Any]] = None,
+) -> Optional[float]:
     """Best (lowest) mha_kernels_per_attn_block seen among the `window` most recent
     sibling engine dirs' build_stats.json files at the same precision -- the
     same-precision regression baseline for the inspector block's warning gate
@@ -381,6 +389,13 @@ def _find_best_sibling_mha_ratio(engine_dir: str, precision: str, window: int = 
     incomparable graph revisions/resolutions/opt levels is fragile regardless of which
     direction counts as "best".
 
+    ``match`` narrows the candidates to genuinely comparable builds: every ``key: value``
+    must equal the sibling's ``build_stats.json`` entry (the gate passes ``model_id``,
+    ``opt_resolution`` and ``builder_optimization_level``, so another model, resolution or opt
+    level under the same parent never sets the baseline). A sibling that lacks a required key
+    (e.g. a build from before ``model_id`` was recorded) cannot be shown comparable and is
+    skipped. Without ``match`` the behavior is unchanged.
+
     Skips sibling files with no ``precision`` key (e.g. VAE engine dirs, which never
     run this inspector) or no ``mha_kernels_per_attn_block`` key (e.g. builds from
     before this round, or ``use_cached_attn=False`` builds where the normalized
@@ -402,6 +417,8 @@ def _find_best_sibling_mha_ratio(engine_dir: str, precision: str, window: int = 
             except (json.JSONDecodeError, OSError, UnicodeDecodeError):
                 continue
             if sibling_stats.get("precision") != precision:
+                continue
+            if match and any(sibling_stats.get(k) != v for k, v in match.items()):
                 continue
             ratio = sibling_stats.get("mha_kernels_per_attn_block")
             if ratio is None:
@@ -490,6 +507,8 @@ class EngineBuilder:
         builder_optimization_level: Optional[int] = None,
         is_controlnet: bool = False,
         artifact_prefix: str = "unet",
+        timing_cache_dir: Optional[str] = None,
+        model_id: Optional[str] = None,
     ):
         if opt_batch_size is None:
             raise ValueError("build() requires an explicit opt_batch_size")
@@ -505,6 +524,10 @@ class EngineBuilder:
             "batch_size": opt_batch_size,
             "stages": {},
         }
+        if model_id is not None:
+            # Identity of the source model: the MHA-fusion gate compares only same-model siblings
+            # (the engine dir name alone can't tell two local checkpoints with one stem apart).
+            stats["model_id"] = str(model_id)
 
         # FP8 paths are resolved relative to the engine directory.
         # calib_data.npz: cached activations (survives engine rebuilds).
@@ -813,6 +836,7 @@ class EngineBuilder:
                     build_enable_refit=build_enable_refit,
                     fp8=fp8,
                     builder_optimization_level=builder_optimization_level,
+                    timing_cache_dir=timing_cache_dir,
                 )
                 elapsed = time.perf_counter() - t0
                 stats["stages"]["trt_build"] = {"status": "built", "elapsed_s": round(elapsed, 2)}
@@ -833,6 +857,10 @@ class EngineBuilder:
                     # full rebuild. Sourced from _apply_gpu_profile_to_config's return
                     # value, which already reflects the requested override (if any).
                     stats["builder_optimization_level"] = _tiling_info.get("builder_optimization_level")
+                # Tiling info is absent on some paths; keep the requested level so the sibling
+                # filter can still tell differently-configured builds apart.
+                if stats.get("builder_optimization_level") is None and builder_optimization_level is not None:
+                    stats["builder_optimization_level"] = builder_optimization_level
 
             # --- Engine inspector: Q/DQ + fused-MHA + attn-BMM evidence record (FP8 Round 11) ---
             # Was `if fp8 and os.path.exists(engine_path)` -- FP16 builds never ran this, so
@@ -943,14 +971,26 @@ class EngineBuilder:
                     if _kvo_count > 0:
                         _ratio = _mha_count / _kvo_count
                         stats["mha_kernels_per_attn_block"] = _ratio
-                        _best_same = _find_best_sibling_mha_ratio(engine_dir_early, stats["precision"])
+                        # Only compare against builds of the same model at the same
+                        # resolution and opt level (the 3.0-vs-2.0 "regression" seen at
+                        # optlvl 2 was a comparison against a differently-configured sibling).
+                        _comparable = {
+                            k: stats[k]
+                            for k in ("model_id", "opt_resolution", "builder_optimization_level")
+                            if stats.get(k) is not None
+                        }
+                        _best_same = _find_best_sibling_mha_ratio(
+                            engine_dir_early, stats["precision"], match=_comparable
+                        )
                         if _best_same is not None and _ratio > _best_same:
                             _build_logger.warning(
                                 f"[BUILD] MHA fusion regression vs best (lowest) same-precision sibling: "
                                 f"{_ratio:.3f} kernels/block (this build) > {_best_same:.3f} (best sibling)."
                             )
                         _other_precision = "fp16" if fp8 else "fp8"
-                        _best_other = _find_best_sibling_mha_ratio(engine_dir_early, _other_precision)
+                        _best_other = _find_best_sibling_mha_ratio(
+                            engine_dir_early, _other_precision, match=_comparable
+                        )
                         if _best_other is not None:
                             _build_logger.info(
                                 f"[BUILD] MHA fusion, cross-precision: {_ratio:.3f} kernels/block "
@@ -988,4 +1028,6 @@ class EngineBuilder:
             stats["engine_size_mb"] = round(os.path.getsize(engine_path) / (1024 * 1024), 1)
 
         _build_logger.info(f"[BUILD] {engine_filename} complete: {total_elapsed:.1f}s total")
-        _write_build_stats(engine_path, stats)
+        # timing_cache_dir is <engines root>/_timing_cache, so its parent is the real root even
+        # when the engine dir is nested under an HF org folder.
+        _write_build_stats(engine_path, stats, log_root=Path(timing_cache_dir).parent if timing_cache_dir else None)

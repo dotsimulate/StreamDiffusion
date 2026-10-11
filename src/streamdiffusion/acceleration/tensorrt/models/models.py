@@ -19,6 +19,7 @@
 
 import logging
 
+import onnx
 import onnx_graphsurgeon as gs
 import torch
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
@@ -26,6 +27,49 @@ from onnx import shape_inference
 from polygraphy.backend.onnx.loader import fold_constants
 
 logger = logging.getLogger(__name__)
+
+_ONNX_2GB = 2147483648
+
+
+def _tensor_proto_bytes(t) -> int:
+    """Payload size of one TensorProto without serializing it."""
+    if t.data_location == onnx.TensorProto.EXTERNAL:
+        for entry in t.external_data:
+            if entry.key == "length":
+                return int(entry.value)
+    if t.raw_data:
+        return len(t.raw_data)
+    # Typed-field storage (float_data, int64_data, ...): count elements * element size.
+    numel = 1
+    for d in t.dims:
+        numel *= d
+    try:
+        itemsize = onnx.helper.tensor_dtype_to_np_dtype(t.data_type).itemsize
+    except Exception:
+        itemsize = 4
+    return numel * itemsize
+
+
+def _graph_tensor_bytes(graph) -> int:
+    total = sum(_tensor_proto_bytes(t) for t in graph.initializer)
+    for node in graph.node:
+        for attr in node.attribute:
+            if attr.type == onnx.AttributeProto.TENSOR:
+                total += _tensor_proto_bytes(attr.t)
+            elif attr.type == onnx.AttributeProto.GRAPH:
+                total += _graph_tensor_bytes(attr.g)
+    return total
+
+
+def _onnx_tensor_bytes(model) -> int:
+    """Approximate ModelProto size (weights dominate) WITHOUT calling ModelProto.ByteSize().
+
+    protobuf's upb backend implements ByteSize() by serializing the whole message, so on a
+    ~5 GB SDXL UNet it transiently allocates ~4.5x the proto size (~23 GB) and raises
+    MemoryError on 32-64 GB hosts. Summing tensor payloads is allocation-free and within
+    node/shape overhead (well under 1%) of the true size -- plenty for the >2GB gate.
+    """
+    return _graph_tensor_bytes(model.graph)
 
 
 class Optimizer:
@@ -71,7 +115,9 @@ class Optimizer:
             )
         onnx_graph = gs.export_onnx(self.graph)
         is_fp8 = any(n.op in ("QuantizeLinear", "DequantizeLinear") for n in self.graph.nodes)
-        is_large = onnx_graph.ByteSize() > 2147483648
+        # _onnx_tensor_bytes, not ModelProto.ByteSize(): upb serializes the whole proto to measure
+        # it (~23 GB transient on a 5 GB SDXL UNet -> MemoryError on 32-64 GB hosts).
+        is_large = _onnx_tensor_bytes(onnx_graph) > _ONNX_2GB
         onnx_graph = fold_constants(
             onnx_graph,
             allow_onnxruntime_shape_inference=not (is_fp8 or is_large),
@@ -82,10 +128,9 @@ class Optimizer:
 
     def infer_shapes(self, return_onnx=False):
         onnx_graph = gs.export_onnx(self.graph)
-        if onnx_graph.ByteSize() > 2147483648:
-            print(
-                f"[WARN] Model size ({onnx_graph.ByteSize() / (1024**3):.2f} GB) exceeds 2GB - this is normal for SDXL models"
-            )
+        model_bytes = _onnx_tensor_bytes(onnx_graph)  # never ModelProto.ByteSize() -- see helper
+        if model_bytes > _ONNX_2GB:
+            print(f"[WARN] Model size ({model_bytes / (1024**3):.2f} GB) exceeds 2GB - this is normal for SDXL models")
             print("[INFO] ONNX shape inference will be skipped for large models to avoid memory issues")
             # For large models like SDXL, skip shape inference to avoid memory/size issues
             # The model will still work with TensorRT's own shape inference during engine building

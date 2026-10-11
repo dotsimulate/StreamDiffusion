@@ -31,7 +31,7 @@ class TestFormatReportText:
             "versions": {"torch": "2.8.0", "numpy": "1.26.4"},
             "config": {"width": 512, "height": 512, "where": "streaming_loop"},
             "stream_config": {"prompt": "a photo of a cat", "num_inference_steps": 4},
-            "env": {"SDTD_BASE_FOLDER_PATH": "D:/repo"},
+            "env": {"SDTD_BASE_FOLDER_PATH": "repo_root"},
             "log_tail": ["INFO some log line", "ERROR another line"],
         }
         text = diagnostics.format_report_text(diag)
@@ -48,7 +48,7 @@ class TestFormatReportText:
         assert "torch: 2.8.0" in text
         assert "width: 512" in text
         assert "prompt: a photo of a cat" in text  # stream_config, rendered via yaml.safe_dump
-        assert "SDTD_BASE_FOLDER_PATH=D:/repo" in text
+        assert "SDTD_BASE_FOLDER_PATH=repo_root" in text
         assert "ERROR another line" in text
 
     def test_empty_sections_render_as_none_not_crash(self):
@@ -178,23 +178,23 @@ class TestCollectDiagnostics:
         # see cuda_link_bootstrap.py's layered lookup); CUDALINK_DOORBELL is still a live,
         # installer-persisted var, so it exercises the same CUDALINK_ prefix allowlist path.
         monkeypatch.setenv("CUDALINK_DOORBELL", "1")
-        monkeypatch.setenv("HF_HOME", "C:/hf")
+        monkeypatch.setenv("HF_HOME", "hf_home")
         monkeypatch.setenv("SECRET_TOKEN", "should-not-appear")
         diag = diagnostics.collect_diagnostics()
         assert diag["env"].get("CUDALINK_DOORBELL") == "1"
-        assert diag["env"].get("HF_HOME") == "C:/hf"
+        assert diag["env"].get("HF_HOME") == "hf_home"
         assert "SECRET_TOKEN" not in diag["env"]
 
     def test_env_denylist_blocks_secret_named_vars_even_if_prefix_allowlisted(self, monkeypatch):
         """A prefix match alone isn't enough -- HF_TOKEN matches the HF_ allowlist prefix but
         must never be dumped, since its name also matches the TOKEN denylist substring."""
         monkeypatch.setenv("HF_TOKEN", "should-not-appear")
-        monkeypatch.setenv("HF_HOME", "C:/hf")
-        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", "D:/repo")
+        monkeypatch.setenv("HF_HOME", "hf_home")
+        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", "repo_root")
         diag = diagnostics.collect_diagnostics()
         assert "HF_TOKEN" not in diag["env"]
-        assert diag["env"].get("HF_HOME") == "C:/hf"
-        assert diag["env"].get("SDTD_BASE_FOLDER_PATH") == "D:/repo"
+        assert diag["env"].get("HF_HOME") == "hf_home"
+        assert diag["env"].get("SDTD_BASE_FOLDER_PATH") == "repo_root"
 
     def test_env_denylist_blocks_auth_and_session_vars(self, monkeypatch):
         """Denylist substrings extend beyond TOKEN/KEY/SECRET to AUTH/SESSION/COOKIE, since a
@@ -202,12 +202,12 @@ class TestCollectDiagnostics:
         monkeypatch.setenv("HF_AUTH", "should-not-appear")
         monkeypatch.setenv("SD_SESSION", "should-not-appear")
         monkeypatch.setenv("SD_COOKIE", "should-not-appear")
-        monkeypatch.setenv("HF_HOME", "C:/hf")
+        monkeypatch.setenv("HF_HOME", "hf_home")
         diag = diagnostics.collect_diagnostics()
         assert "HF_AUTH" not in diag["env"]
         assert "SD_SESSION" not in diag["env"]
         assert "SD_COOKIE" not in diag["env"]
-        assert diag["env"].get("HF_HOME") == "C:/hf"
+        assert diag["env"].get("HF_HOME") == "hf_home"
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +227,7 @@ class TestWriteErrorReport:
         except ValueError as exc:
             report_path = diagnostics.write_error_report(exc, stage="inference", out_dir=tmp_path)
 
-        assert report_path is not None
+        assert isinstance(report_path, Path)
         assert report_path.exists()
         assert report_path.parent == tmp_path
         assert report_path.name.startswith("inference_error_report_")
@@ -253,7 +253,7 @@ class TestWriteErrorReport:
         monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path / "stale"))
         monkeypatch.setattr(diagnostics, "__file__", str(tmp_path / "src/streamdiffusion/utils/diagnostics.py"))
         report_path = diagnostics.write_error_report(RuntimeError("boom"), stage="inference")
-        assert report_path is not None
+        assert isinstance(report_path, Path)
         assert report_path.parent == tmp_path / "error_reports"
 
     def test_falls_back_to_module_relative_repo_root_when_env_var_unset(self, tmp_path, monkeypatch):
@@ -265,7 +265,7 @@ class TestWriteErrorReport:
         fake_file = tmp_path / "src" / "streamdiffusion" / "utils" / "diagnostics.py"
         monkeypatch.setattr(diagnostics, "__file__", str(fake_file))
         report_path = diagnostics.write_error_report(RuntimeError("boom"), stage="inference")
-        assert report_path is not None
+        assert isinstance(report_path, Path)
         assert report_path.parent == tmp_path / "error_reports"
 
     def test_stream_config_dumped_when_provided(self, tmp_path, monkeypatch):
@@ -334,7 +334,7 @@ class TestWriteErrorReport:
             raise RuntimeError("format failure")
 
         monkeypatch.setattr(diagnostics, "format_report_text", _boom)
-        result = diagnostics.write_error_report(RuntimeError("boom"), stage="inference", out_dir="C:/wherever")
+        result = diagnostics.write_error_report(RuntimeError("boom"), stage="inference", out_dir="wherever")
         assert result is None
 
     def test_context_where_surfaces_as_summary_context(self, tmp_path, monkeypatch):
@@ -422,7 +422,7 @@ def test_wrapper_write_error_report_forwards_self_and_args(monkeypatch):
     config = {"prompt": "a photo of a cat"}
 
     result = wrapper_module.StreamDiffusionWrapper.write_error_report(
-        fake_self, exc, context=context, config=config, out_dir="C:/reports"
+        fake_self, exc, context=context, config=config, out_dir="reports"
     )
 
     assert result == Path("fake_report.txt")
@@ -431,7 +431,7 @@ def test_wrapper_write_error_report_forwards_self_and_args(monkeypatch):
     assert captured["context"] is context
     assert captured["wrapper"] is fake_self
     assert captured["config"] is config
-    assert captured["out_dir"] == "C:/reports"
+    assert captured["out_dir"] == "reports"
 
 
 def test_wrapper_write_error_report_returns_none_on_util_failure(monkeypatch):
@@ -442,3 +442,71 @@ def test_wrapper_write_error_report_returns_none_on_util_failure(monkeypatch):
     result = wrapper_module.StreamDiffusionWrapper.write_error_report(object(), RuntimeError("boom"))
 
     assert result is None
+
+
+class TestNvidiaSmiDriver:
+    def test_nvidia_smi_driver_unknown_on_exception(self, monkeypatch):
+        import subprocess
+
+        def _fail(*args, **kwargs):
+            raise OSError("no nvidia-smi")
+
+        monkeypatch.setattr(subprocess, "run", _fail)
+        assert diagnostics._nvidia_smi_driver() == "unknown"
+
+    def test_nvidia_smi_driver_returns_driver_string(self, monkeypatch):
+        import subprocess
+        from unittest.mock import MagicMock
+
+        mock_res = MagicMock()
+        mock_res.returncode = 0
+        mock_res.stdout = "550.54.14\n"
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: mock_res)
+        assert diagnostics._nvidia_smi_driver() == "550.54.14"
+
+
+class TestRenderStreamConfig:
+    def test_yaml_dump_failure_falls_back_to_json(self, monkeypatch):
+        import yaml
+
+        def _raise_yaml(*a, **k):
+            raise RuntimeError("yaml fail")
+
+        monkeypatch.setattr(yaml, "safe_dump", _raise_yaml)
+        out = diagnostics._render_stream_config({"key": "val"})
+        assert '"key": "val"' in out
+
+    def test_json_dump_failure_falls_back_to_repr(self, monkeypatch):
+        import json
+
+        import yaml
+
+        def _raise_yaml(*a, **k):
+            raise RuntimeError("yaml fail")
+
+        def _raise_json(*a, **k):
+            raise RuntimeError("json fail")
+
+        monkeypatch.setattr(yaml, "safe_dump", _raise_yaml)
+        monkeypatch.setattr(json, "dumps", _raise_json)
+        obj = {"key": "val"}
+        out = diagnostics._render_stream_config(obj)
+        assert out == repr(obj)
+
+
+class TestTailBufferHandler:
+    def test_tail_buffer_handler_emit_swallows_exception(self):
+        handler = diagnostics._TailBufferHandler()
+        record = logging.LogRecord("test", logging.INFO, "test.py", 1, "msg", (), None)
+
+        def _raise_format(r):
+            raise RuntimeError("format error")
+
+        handler.format = _raise_format
+        before = len(diagnostics._log_tail_buffer)
+        handler.emit(record)
+        assert len(diagnostics._log_tail_buffer) == before
+
+    def test_get_log_tail_swallows_exception(self, monkeypatch):
+        monkeypatch.setattr(diagnostics, "_log_tail_buffer", None)
+        assert diagnostics._get_log_tail() == []

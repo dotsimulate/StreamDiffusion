@@ -345,3 +345,4 @@ def test_fp8_guidance_scale_follows_resolved_verdict():
     (StreamDiffusionTD/td_config.yaml has fp8: false), so this branch is dead
     for the current deployment regardless.
     """
+    pytest.fail("Unreachable: test is decorated with pytest.mark.skip")

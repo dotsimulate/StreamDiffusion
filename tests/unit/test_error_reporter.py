@@ -28,7 +28,6 @@ class TestErrorReporterReport:
 
         report_path = reporter.report(RuntimeError("boom"), stage="inference", where="streaming_loop")
 
-        assert report_path is not None
         assert report_path.exists()
         assert report_path.parent == tmp_path / "error_reports"
         assert report_path.name.startswith("inference_error_report_")
@@ -158,3 +157,22 @@ class TestErrorReporterReport:
         successes = [r for r in results if r is not None]
         assert len(successes) == 1
         assert len(list((tmp_path / "error_reports").glob("*.txt"))) == 1
+
+    def test_report_falls_back_to_logger_when_report_error_is_none(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        monkeypatch.setenv("SDTD_BASE_FOLDER_PATH", str(tmp_path))
+        monkeypatch.setattr(diagnostics, "report_error", None)
+        reporter = diagnostics.ErrorReporter()
+        report_path = reporter.report(RuntimeError("boom"), stage="inference", where="streaming_loop")
+        assert report_path.exists()
+
+    def test_report_handles_outer_exception_gracefully(self, monkeypatch, caplog):
+        def _explode(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(diagnostics, "write_error_report", _explode)
+        reporter = diagnostics.ErrorReporter()
+        with caplog.at_level("ERROR", logger=diagnostics.__name__):
+            result = reporter.report(RuntimeError("boom"), stage="inference", where="streaming_loop")
+        assert result is None
+        assert "error-reporting also failed: disk full" in caplog.text

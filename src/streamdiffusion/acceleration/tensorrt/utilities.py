@@ -45,7 +45,7 @@ from polygraphy.backend.common import bytes_from_path
 from polygraphy.backend.trt import engine_from_bytes
 from polygraphy.backend.trt.util import get_trt_logger
 
-from .models.models import CLIP, VAE, BaseModel, UNet, VAEEncoder
+from .models.models import CLIP, VAE, BaseModel, UNet, VAEEncoder, _onnx_tensor_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -1574,6 +1574,32 @@ def create_models(
     return models
 
 
+def _seed_timing_cache(timing_cache_dir: str, filename: str) -> Optional[str]:
+    """Copy a legacy per-org timing cache into the pinned shared dir when that has none yet.
+
+    UNet engines of HF-id models used to cache at ``<root>/<org>/_timing_cache``; the pinned
+    location is ``<root>/_timing_cache``. Without this, the first build after the move starts
+    cold. Returns the source path when a cache was copied. Never raises: a failed copy just
+    means a cold build.
+    """
+    import shutil
+    from pathlib import Path
+
+    dest = Path(timing_cache_dir) / filename
+    if dest.exists():
+        return None
+    for src in sorted(Path(timing_cache_dir).parent.glob(f"*/_timing_cache/{filename}")):
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+        except OSError as e:
+            logger.warning(f"[TRT Build] Could not seed timing cache from {src}: {e}")
+            return None
+        logger.info(f"[TRT Build] Seeded timing cache from {src}")
+        return str(src)
+    return None
+
+
 def _compute_dynamic_shapes(build_dynamic_shape: bool, build_static_batch: bool, model_data: BaseModel) -> bool:
     """Whether this engine has any symbolic dim (resolution, batch, or the KVO/FI
     cache-frames axis) — the single source of truth `build_engine` passes to
@@ -1609,6 +1635,7 @@ def build_engine(
     build_enable_refit: bool = False,
     fp8: bool = False,
     builder_optimization_level: Optional[int] = None,
+    timing_cache_dir: Optional[str] = None,
 ):
     # --- Step 0: Detect GPU and select hardware-optimal build parameters ---
     gpu_profile = detect_gpu_profile(device=torch.cuda.current_device())
@@ -1655,16 +1682,20 @@ def build_engine(
     # --- Timing cache: shared across ALL engine configs, keyed by TRT version ---
     # Previously stored inside the per-config engine dir (os.path.dirname(engine_path)),
     # so every distinct config (--cachef/--sbatch/--batch/--res variants, LoRA hash, etc.)
-    # started cold and per-config-dir churn silently discarded it. engine_path is always
-    # <engine_root>/<config-prefix>/<file>.engine, so one level above the per-config dir is
-    # exactly EngineManager.engine_dir — living there means the cache survives rebuilds and
-    # is reused across every config on this machine. Keyed by TRT version so a TRT/driver
-    # upgrade starts a fresh cache instead of hitting set_timing_cache's
-    # ignore_mismatch=False guard against a stale cross-version cache.
-    engine_dir = os.path.dirname(engine_path)
-    engine_root = os.path.dirname(engine_dir)
-    timing_cache_dir = os.path.join(engine_root, "_timing_cache")
-    timing_cache_path = os.path.join(timing_cache_dir, f"timing_trt{trt.__version__}.cache")
+    # started cold and per-config-dir churn silently discarded it. EngineManager passes
+    # timing_cache_dir = <engine_dir>/_timing_cache, so the cache survives rebuilds and is
+    # reused across every config on this machine (UNet, VAE and ControlNet alike). Keyed by
+    # TRT version so a TRT/driver upgrade starts a fresh cache instead of hitting
+    # set_timing_cache's ignore_mismatch=False guard against a stale cross-version cache.
+    # Fallback for direct callers: assume engine_path is <root>/<config-prefix>/<file>.engine.
+    # That breaks when the prefix nests a HF model id's "/", hence the explicit argument.
+    if timing_cache_dir is None:
+        engine_dir = os.path.dirname(engine_path)
+        engine_root = os.path.dirname(engine_dir)
+        timing_cache_dir = os.path.join(engine_root, "_timing_cache")
+    _timing_cache_name = f"timing_trt{trt.__version__}.cache"
+    timing_cache_path = os.path.join(timing_cache_dir, _timing_cache_name)
+    _seed_timing_cache(timing_cache_dir, _timing_cache_name)
 
     engine = Engine(engine_path)
     input_profile = model_data.get_input_profile(
@@ -1795,7 +1826,8 @@ def export_onnx(
             onnx_model = onnx.load(onnx_path)
 
             # Check if model is large enough to need external data
-            if onnx_model.ByteSize() > 2147483648:  # 2GB
+            # Not ModelProto.ByteSize(): upb serializes the whole proto (~4.5x transient -> MemoryError).
+            if _onnx_tensor_bytes(onnx_model) > 2147483648:  # 2GB
                 # Create directory for external data
                 onnx_dir = os.path.dirname(onnx_path)
 
