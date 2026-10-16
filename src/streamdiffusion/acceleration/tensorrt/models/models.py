@@ -72,6 +72,32 @@ def _onnx_tensor_bytes(model) -> int:
     return _graph_tensor_bytes(model.graph)
 
 
+# Constants above this size become graph inputs while a >2GB graph is constant-folded (see
+# Optimizer._fold_constants_without_weights). Polygraphy warns about folded outputs above 1 MiB.
+_SKELETON_CONSTANT_BYTES = 1 << 20
+
+
+def _constant_nbytes(tensor) -> int:
+    """Size of a gs.Constant's values without loading them (LazyValues knows its size)."""
+    return int(getattr(tensor._values, "nbytes", 0))
+
+
+def _graph_constant_bytes(graph) -> int:
+    """Total size of a gs graph's constants without exporting it (an export copies every weight).
+
+    Same quantity as _onnx_tensor_bytes on the exported model: initializers plus tensor attributes
+    of nodes (Constant nodes), recursing into subgraphs.
+    """
+    total = sum(_constant_nbytes(t) for t in graph.tensors().values() if isinstance(t, gs.Constant))
+    for node in graph.nodes:
+        for value in node.attrs.values():
+            if isinstance(value, gs.Constant):
+                total += _constant_nbytes(value)
+            elif isinstance(value, gs.Graph):
+                total += _graph_constant_bytes(value)
+    return total
+
+
 class Optimizer:
     def __init__(self, onnx_graph, verbose=False):
         self.graph = gs.import_onnx(onnx_graph)
@@ -113,30 +139,69 @@ class Optimizer:
                 "Optimizer.fold_constants: input ONNX graph has 0 nodes -- the source ONNX is "
                 "empty or corrupt. Delete the cached .onnx file for this engine and rebuild."
             )
-        onnx_graph = gs.export_onnx(self.graph)
         is_fp8 = any(n.op in ("QuantizeLinear", "DequantizeLinear") for n in self.graph.nodes)
-        # _onnx_tensor_bytes, not ModelProto.ByteSize(): upb serializes the whole proto to measure
-        # it (~23 GB transient on a 5 GB SDXL UNet -> MemoryError on 32-64 GB hosts).
-        is_large = _onnx_tensor_bytes(onnx_graph) > _ONNX_2GB
+        if _graph_constant_bytes(self.graph) > _ONNX_2GB:
+            self._fold_constants_without_weights()
+            if return_onnx:
+                return gs.export_onnx(self.graph)
+            return None
+        onnx_graph = gs.export_onnx(self.graph)
         onnx_graph = fold_constants(
             onnx_graph,
-            allow_onnxruntime_shape_inference=not (is_fp8 or is_large),
+            allow_onnxruntime_shape_inference=not is_fp8,
         )
         self.graph = gs.import_onnx(onnx_graph)
         if return_onnx:
             return onnx_graph
 
+    def _fold_constants_without_weights(self):
+        """Constant folding for a >2GB graph (SDXL UNet / ControlNet) on a skeleton without its weights.
+
+        Polygraphy round-trips the whole ModelProto through export, ONNX Runtime and shape inference
+        on every pass (4 passes on the SDXL UNet). With ~5 GB of weights inside, that held ~53 GB of
+        commit on Windows and got the backend killed on 31 GB Linux machines (room note 158). The
+        folds on these graphs never need the weight values: they are shape computations and small
+        constants (no folded output over 1 MiB). So every constant over 1 MiB is turned into a graph
+        input with the same name, dtype and shape, the skeleton is folded, and the original values
+        (still lazily backed by the source model, no copy) are put back. A fold that would have
+        needed one of those values is simply not done; TensorRT folds it at build time.
+        """
+        weights = {}
+        for name, tensor in self.graph.tensors().items():
+            if isinstance(tensor, gs.Constant) and _constant_nbytes(tensor) > _SKELETON_CONSTANT_BYTES:
+                weights[name] = (tensor._values, tensor.data_location, tensor._export_dtype)
+                shape, dtype = list(tensor.shape), tensor.export_dtype
+                tensor.to_variable(dtype=dtype, shape=shape)
+                tensor.type = "tensor_type"  # Constant.to_variable doesn't set it; Variable() does
+                self.graph.inputs.append(tensor)
+        n_inputs = len(self.graph.inputs) - len(weights)
+        skeleton = fold_constants(gs.export_onnx(self.graph), allow_onnxruntime_shape_inference=False)
+        graph = gs.import_onnx(skeleton)
+        del skeleton
+        if [t.name for t in graph.inputs[n_inputs:]] != list(weights):
+            raise RuntimeError("Optimizer: constant folding changed the graph inputs; cannot restore the weights")
+        graph.inputs = graph.inputs[:n_inputs]
+        tensors = graph.tensors()
+        for name, (values, data_location, export_dtype) in weights.items():
+            tensor = tensors[name]
+            tensor.to_constant(values, export_dtype=export_dtype)
+            tensor.data_location = data_location  # Variable.to_constant() doesn't take it
+        self.graph = graph
+
     def infer_shapes(self, return_onnx=False):
-        onnx_graph = gs.export_onnx(self.graph)
-        model_bytes = _onnx_tensor_bytes(onnx_graph)  # never ModelProto.ByteSize() -- see helper
+        # Sized from the graph itself: exporting first copied every weight (~9 GB of commit on the
+        # SDXL UNet) only to find out that shape inference is skipped (room note 158).
+        model_bytes = _graph_constant_bytes(self.graph)
         if model_bytes > _ONNX_2GB:
             print(f"[WARN] Model size ({model_bytes / (1024**3):.2f} GB) exceeds 2GB - this is normal for SDXL models")
             print("[INFO] ONNX shape inference will be skipped for large models to avoid memory issues")
             # For large models like SDXL, skip shape inference to avoid memory/size issues
             # The model will still work with TensorRT's own shape inference during engine building
-        else:
-            onnx_graph = shape_inference.infer_shapes(onnx_graph)
+            if return_onnx:
+                return gs.export_onnx(self.graph)
+            return None
 
+        onnx_graph = shape_inference.infer_shapes(gs.export_onnx(self.graph))
         self.graph = gs.import_onnx(onnx_graph)
         if return_onnx:
             return onnx_graph
