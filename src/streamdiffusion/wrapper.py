@@ -3620,6 +3620,13 @@ class StreamDiffusionWrapper:
                             logger.info("Loading PyTorch UNet as fallback...")
                             # Keep the original UNet from the pipe
                             if hasattr(stream, "pipe") and hasattr(stream.pipe, "unet"):
+                                _first_param = next(stream.pipe.unet.parameters(), None)
+                                if _first_param is not None and _first_param.is_meta:
+                                    # builder._release_module_weights freed them after the ONNX export.
+                                    raise RuntimeError(
+                                        "PyTorch UNet weights were released after the ONNX export; "
+                                        "restart the stream to reload the model"
+                                    )
                                 stream.unet = stream.pipe.unet
                                 logger.info("PyTorch UNet fallback successful")
                                 # The set_adapters() call above this TRT attempt used

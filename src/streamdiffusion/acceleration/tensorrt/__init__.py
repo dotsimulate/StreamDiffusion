@@ -182,6 +182,7 @@ def compile_unet(
         fp8_use_feature_injection=fp8_use_feature_injection,
         fp8_use_controlnet=fp8_use_controlnet,
         fp8_num_ip_layers=fp8_num_ip_layers,
+        release_network_weights=not fp8,
         **build_options,
     )
 
