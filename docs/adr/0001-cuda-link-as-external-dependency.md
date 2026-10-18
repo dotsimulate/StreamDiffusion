@@ -52,11 +52,12 @@ no longer needed either.
   3.10 the README/CI currently document — TouchDesigner embeds cp311, and cuda-link's TD-side
   consumption via `CUDALinkBootstrap` library mode requires the installed package to match TD's
   interpreter. The stale 3.10 references are a separate, pre-existing doc/CI inaccuracy
-  (`README.md:91`'s `conda create ... python=3.10`, `README.md:196`'s "demo expects Python
+  (`README.md:91`'s `conda create ... python=3.10`, `README.md:187`'s "demo expects Python
   3.10", and `.github/workflows/release.yml:17`'s `python-version: '3.10'`).
-  **Known gap from this hard-pin:** `setup.py:134`'s `python_requires=">=3.10.0"` still nominally
-  permits a 3.10 install, but a 3.10 interpreter cannot install a `cp311`-tagged wheel — pip
-  will refuse it. Tightening `python_requires` to `>=3.11.0` is the correct follow-up, but is
+  **Known gap from this hard-pin:** `setup.py:140`'s `python_requires=">=3.10.0"` still nominally
+  permits a 3.10 install. The pin's environment marker (`python_version == "3.11"`) makes pip
+  skip `cuda-link` there, so on 3.10 `pip install .[cuda_ipc]` succeeds without it and IPC
+  fails only at runtime, not at install time. Tightening `python_requires` to `>=3.11.0` is the correct follow-up, but is
   deliberately deferred: `.github/workflows/release.yml` still builds on Python 3.10, so bumping
   `python_requires` here would need a coordinated CI change, not a silent `setup.py` edit.
 - **1.10.x history and the CUDA 719 incident (2026-06-10):** cuda-link 1.10.0 introduced
