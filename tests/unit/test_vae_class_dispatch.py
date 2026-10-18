@@ -352,7 +352,9 @@ class TestTrtSkippedForFullVae:
         monkeypatch.setenv("SDTD_FULL_VAE_TRT", "true")
         assert _should_skip_trt_vae("AutoencoderKL", "tensorrt") is True
 
-    @pytest.mark.parametrize("env_value", [None, "", "0", "1", "true"])
+    @pytest.mark.parametrize(
+        "env_value", [None, "", "0", "1", "true"], ids=["unset", "empty", "zero", "one", "true"]
+    )
     @pytest.mark.parametrize(
         ("vae_class_name", "acceleration", "expected"),
         [
@@ -361,6 +363,7 @@ class TestTrtSkippedForFullVae:
             ("AutoencoderKL", "xformers", False),
             ("AutoencoderTiny", "none", False),
         ],
+        ids=["kl-trt", "tiny-trt", "kl-xformers", "tiny-none"],
     )
     def test_decision_ignores_full_vae_trt_env(self, monkeypatch, env_value, vae_class_name, acceleration, expected):
         """SDTD_FULL_VAE_TRT, off (unset/empty/"0") or on ("1"/"true"), never changes
