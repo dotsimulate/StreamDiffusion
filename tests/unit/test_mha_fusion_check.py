@@ -40,10 +40,15 @@ class _Log:
         self.warnings.append(msg)
 
 
-def _save_graph(path, with_softmax):
+def _save_graph(path, with_softmax=False, op_type=None):
     x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
     y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
-    op = helper.make_node("Softmax", ["x"], ["y"], axis=-1) if with_softmax else helper.make_node("Relu", ["x"], ["y"])
+    if op_type:
+        op = helper.make_node(op_type, ["x"], ["y"])
+    elif with_softmax:
+        op = helper.make_node("Softmax", ["x"], ["y"], axis=-1)
+    else:
+        op = helper.make_node("Relu", ["x"], ["y"])
     onnx.save(helper.make_model(helper.make_graph([op], "g", [x], [y])), str(path))
     return str(path)
 
@@ -75,6 +80,10 @@ class TestCheckMhaFusion:
 class TestCountAttentionOps:
     def test_counts_softmax_nodes(self, tmp_path):
         assert _count_attention_ops(_save_graph(tmp_path / "a.onnx", with_softmax=True)) == 1
+
+    def test_counts_fused_attention_nodes(self, tmp_path):
+        # Graph-only count; the node needn't be a valid op for this opset.
+        assert _count_attention_ops(_save_graph(tmp_path / "c.onnx", op_type="MultiHeadAttention")) == 1
 
     def test_zero_without_softmax(self, tmp_path):
         assert _count_attention_ops(_save_graph(tmp_path / "b.onnx", with_softmax=False)) == 0

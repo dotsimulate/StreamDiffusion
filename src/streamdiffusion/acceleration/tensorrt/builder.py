@@ -307,11 +307,14 @@ _MYL_PARTITION_RE = re.compile(r"_myl(\d+)_")
 # Fused-MHA kernels in the engine inspector's layer names. Pattern is empirical --
 # FLUX uses "_gemm_mha_v2"; SDXL on Ada may differ.
 _MHA_NAME_RE = re.compile(r"mha|fmha|MultiHead|FlashAttn", re.IGNORECASE)
+# ONNX node types that mark attention (decomposed Softmax or a fused node).
+_ATTENTION_OP_TYPES = {"Softmax", "Attention", "MultiHeadAttention"}
 
 
 def _count_attention_ops(onnx_path: str) -> Optional[int]:
-    """Count Softmax nodes in the ONNX graph: every attention block has one, and a
-    model with none (TAESD) has nothing for TRT to fuse into an MHA kernel.
+    """Count attention nodes in the ONNX graph: Softmax (one per decomposed attention
+    block) plus fused Attention/MultiHeadAttention nodes. A model with none (TAESD)
+    has nothing for TRT to fuse into an MHA kernel.
 
     The engine's own layer names can't tell: a fused UNet hides its Softmax inside
     Myelin kernels too. Graph-only load, as in _count_attn_bmm_dq_fed. Returns None
@@ -321,7 +324,7 @@ def _count_attention_ops(onnx_path: str) -> Optional[int]:
         return None
     try:
         model = onnx.load(onnx_path, load_external_data=False)
-        return sum(1 for node in model.graph.node if node.op_type == "Softmax")
+        return sum(1 for node in model.graph.node if node.op_type in _ATTENTION_OP_TYPES)
     except Exception:
         return None
 
