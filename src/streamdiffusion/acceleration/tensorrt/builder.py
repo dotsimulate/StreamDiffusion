@@ -304,6 +304,51 @@ def _cleanup_intermediates(engine_dir: str, fp8_ok: bool):
 # importable without pulling in fp8_quantize.py's modelopt-adjacent dependencies.
 _ATTN_BMM_NAME_RE = re.compile(r"/attn[12]/MatMul(_\d+)?$")
 _MYL_PARTITION_RE = re.compile(r"_myl(\d+)_")
+# Fused-MHA kernels in the engine inspector's layer names. Pattern is empirical --
+# FLUX uses "_gemm_mha_v2"; SDXL on Ada may differ.
+_MHA_NAME_RE = re.compile(r"mha|fmha|MultiHead|FlashAttn", re.IGNORECASE)
+# ONNX node types that mark attention (decomposed Softmax or a fused node).
+_ATTENTION_OP_TYPES = {"Softmax", "Attention", "MultiHeadAttention"}
+
+
+def _count_attention_ops(onnx_path: str) -> Optional[int]:
+    """Count attention nodes in the ONNX graph: Softmax (one per decomposed attention
+    block) plus fused Attention/MultiHeadAttention nodes. A model with none (TAESD)
+    has nothing for TRT to fuse into an MHA kernel.
+
+    The engine's own layer names can't tell: a fused UNet hides its Softmax inside
+    Myelin kernels too. Graph-only load, as in _count_attn_bmm_dq_fed. Returns None
+    if the graph is missing or fails to parse.
+    """
+    if not onnx_path or not os.path.exists(onnx_path):
+        return None
+    try:
+        model = onnx.load(onnx_path, load_external_data=False)
+        return sum(1 for node in model.graph.node if node.op_type in _ATTENTION_OP_TYPES)
+    except Exception:
+        return None
+
+
+def _check_mha_fusion(layer_names: List[str], precision: str, log, attention_ops: Optional[int] = None) -> List[str]:
+    """Count the fused-MHA kernels among an engine's layer names and log the verdict.
+
+    The first build logs sample names so the regex can be confirmed or tightened.
+    ``attention_ops`` is the graph's Softmax count (_count_attention_ops): 0 means the
+    model has no attention to fuse (TAESD), so no kernels is not a warning; None
+    (unknown) keeps the warning. Returns the MHA-matching layer names.
+    """
+    mha_names = [n for n in layer_names if _MHA_NAME_RE.search(n)]
+    log.info(f"[BUILD] {precision} engine fused MHA layers: {len(mha_names)} / {len(layer_names)} total")
+    if not mha_names and attention_ops == 0:
+        log.info("[BUILD] No attention ops in the ONNX graph -- fused-MHA check not applicable.")
+    elif not mha_names and layer_names:
+        log.warning(
+            "[BUILD] No fused MHA layers detected — attention may be running decomposed "
+            "(slower). Sample layer names (first 5): " + str(layer_names[:5])
+        )
+    else:
+        log.info(f"[BUILD] Sample fused-MHA layer names: {mha_names[:3]}")
+    return mha_names
 
 
 def _count_attn_bmm_dq_fed(onnx_path: str) -> Optional[Tuple[int, int]]:
@@ -918,29 +963,19 @@ class EngineBuilder:
                             )
 
                     # Fused-MHA check: count attention layers TRT fused into a single kernel.
-                    # Pattern is empirical — FLUX uses "_gemm_mha_v2"; SDXL on Ada may differ.
-                    # First build logs sample names so the regex can be confirmed or tightened.
-                    _MHA_RE = re.compile(r"mha|fmha|MultiHead|FlashAttn", re.IGNORECASE)
                     try:
                         _layers = _json.loads(_info).get("Layers", [])
                     except Exception:
                         _layers = []
-                    _total = len(_layers)
-                    _mha_names = [_l.get("Name", "") for _l in _layers if _MHA_RE.search(_l.get("Name", ""))]
+                    _layer_names = [_l.get("Name", "") for _l in _layers]
+                    _attention_ops = _count_attention_ops(_trt_onnx_path)
+                    stats["onnx_attention_ops"] = _attention_ops
+                    _mha_names = _check_mha_fusion(
+                        _layer_names, stats["precision"], _build_logger, attention_ops=_attention_ops
+                    )
                     _mha_count = len(_mha_names)
                     stats["mha_fused_kernels"] = _mha_count
-                    stats["total_engine_layers"] = _total
-                    _build_logger.info(
-                        f"[BUILD] {stats['precision']} engine fused MHA layers: {_mha_count} / {_total} total"
-                    )
-                    if _mha_count == 0 and _total > 0:
-                        _build_logger.warning(
-                            "[BUILD] No fused MHA layers detected — attention may be running decomposed "
-                            "(slower). Sample layer names (first 5): "
-                            + str([_l.get("Name", "") for _l in _layers[:5]])
-                        )
-                    else:
-                        _build_logger.info(f"[BUILD] Sample fused-MHA layer names: {_mha_names[:3]}")
+                    stats["total_engine_layers"] = len(_layer_names)
 
                     # Myelin partitions: distinct _myl<N>_ groups among the MHA-matching layer
                     # names -- a stronger fusion signal than the raw count alone (FP8 Round 11:
