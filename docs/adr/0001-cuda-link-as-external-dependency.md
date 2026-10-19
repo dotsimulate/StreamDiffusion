@@ -12,9 +12,9 @@ relative-import patches re-applied on every re-vendor) and the dependency seam w
 dishonest — `wrapper.py` hard-imported `cuda_link` while `setup.py` never declared it.
 
 We now **depend solely on the pip-installed `cuda-link`** (declared in `setup.py` as a direct
-wheel-URL pin — `cuda-link @ https://github.com/forkni/cuda-link/releases/download/v1.13.0/cuda_link-1.13.0-cp311-cp311-win_amd64.whl`
+wheel-URL pin — `cuda-link @ https://github.com/forkni/cuda-link/releases/download/v1.14.0/cuda_link-1.14.0-cp311-cp311-win_amd64.whl`
 — exposed via the `cuda_ipc` optional extra). The TouchDesigner side consumes the same installed package through
-`CUDALinkBootstrap`'s **library mode** (since cuda-link 1.13.0 a layered resolver: the
+`CUDALinkBootstrap`'s **library mode** (in the pinned cuda-link 1.14.0, a layered resolver: the
 Base Folder passed by `StreamDiffusionExt._prepare_cuda_link`, then `<project.folder>`, then
 `CUDALINK_LIB_PATH`, then `sys.path` — it injects the matching venv onto TD's `sys.path` and
 aliases the 14 bare module names used by TD DATs), so the TD DAT mirror inside the repo is
@@ -37,9 +37,9 @@ no longer needed either.
 - IPC is an **optional feature**: `pip install -e .[cuda_ipc]`. The `wrapper.py` imports
   are lazy/in-method so the core package installs and runs without cuda-link.
 - The `github.com/forkni/cuda-link` release **must publish the exact wheel asset** the pin names
-  or clean installs fail. Current pin in `setup.py`: **`v1.13.0`**'s
-  `cuda_link-1.13.0-cp311-cp311-win_amd64.whl` — verified present in the `v1.13.0` release
-  (published 2026-09-26) via `gh release view v1.13.0 --repo forkni/cuda-link --json assets`
+  or clean installs fail. Current pin in `setup.py`: **`v1.14.0`**'s
+  `cuda_link-1.14.0-cp311-cp311-win_amd64.whl` — verified present in the `v1.14.0` release
+  (published 2026-10-19) via `gh release view v1.14.0 --repo forkni/cuda-link --json assets`
   before this pin was pushed.
 - **Pinned to the wheel URL, not the VCS tag.** An earlier draft of this pin used
   `cuda-link @ git+https://github.com/forkni/cuda-link@v1.12.1`, which looks equivalent but
@@ -184,6 +184,30 @@ no longer needed either.
     must be 1.13.0 too** (this pin) and TouchDesigner must be restarted once after upgrading so
     the previously loaded 1.12.2 module is dropped. `wrapper.py`, `td_manager.py` and the IPC
     unit tests are unchanged — the `Exporter`/`Importer`/`FrameSpec` API did not move.
+- **1.14.0 migration (2026-10-19 pin bump; TD-side fixes, no server-side API change):**
+  per the [cuda-link 1.14.0 release notes](https://github.com/forkni/cuda-link/releases/tag/v1.14.0)
+  (`CHANGELOG.md` `[1.14.0]`):
+  - `TDSender` exports float16 source TOPs as float32 (`cudaMemory(pixelFormat='*32float')`,
+    a lossless GPU-side conversion; the shared frame is twice the float16 bytes) instead of
+    rejecting them, sets `FLAGS_BGRA` on 8-bit RGBA frames (TD hands them over in B,G,R,A
+    order; no producer set the flag before), and drops and re-initializes its exporter when
+    `Exporter.open` fails during a resolution or format change instead of raising from the cook
+    callback.
+  - `TDReceiver` refreshes in place: new IPC handles open before the old ones close, the float16
+    staging buffers are rebuilt and the write index resets; a flags-only change counts as a
+    format update, and a sender drop reconnects without the up-to-120-frame backoff.
+  - The activation barrier holds: `increment`/`decrement`/`bump_skip` write only their own
+    fields, `HolderBarrier.acquire` is a no-op while held, and a failed `TDSender.initialize`
+    force-releases the barrier instead of pausing the producer until the 5 s stale timeout.
+  - The native waiter reports CUDA faults: `cudaEventQuery` is tri-state and a new
+    `WaitStatus.CUDA_ERROR` (5) makes the loader raise `RuntimeError`, matching the pure-Python
+    wait path, instead of counting the fault as "not ready" until the timeout. `Exporter` also
+    clears the error a failed CUDA graph launch latched before falling back to the legacy path.
+  - SDTD consequences: the `Exporter`/`ExportPolicy`/`FrameSpec`/`GpuFrame`/`FrameOutcome`
+    names `wrapper.py` imports are unchanged, so no server-side code moves. The bootstrap's
+    strict version stamp still applies: the TD-side mirrors (`MIRROR_VERSION` `1.14.0`) and the
+    venv's wheel (this pin) must match, and TouchDesigner must be restarted once after upgrading
+    so the previously loaded 1.13.0 module is dropped.
 - Library mode no longer depends on an environment variable. Since cuda-link 1.13.0 the
   bootstrap resolves the install from the Base Folder the operator passes in (falling back to
   the project folder, then `CUDALINK_LIB_PATH` for legacy setups, then `sys.path`), injects it
