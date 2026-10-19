@@ -156,3 +156,101 @@ def test_utilities_uses_the_helper(fn):
     from streamdiffusion.acceleration.tensorrt import utilities
 
     assert getattr(utilities, fn) is getattr(models_module, fn)
+
+
+def _foldable_model(weight_elems: int = 300_000, weight_math: bool = False) -> onnx.ModelProto:
+    """y = x * w + n, where n comes from a shape computation on w that constant folding removes:
+    Shape(w) -> Cast -> ReduceSum. Only w's shape is needed by that fold, never its values (the SDXL
+    UNet case). weight_math=True uses x + w * c instead: folding w * c needs w's values."""
+    w = numpy_helper.from_array(np.arange(weight_elems, dtype=np.float32), name="w")
+    c = numpy_helper.from_array(np.array([2.0], dtype=np.float32), name="c")
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [weight_elems])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [weight_elems])
+    head = (
+        [helper.make_node("Mul", ["w", "c"], ["wc"]), helper.make_node("Add", ["x", "wc"], ["s"])]
+        if weight_math
+        else [helper.make_node("Mul", ["x", "w"], ["s"])]
+    )
+    nodes = head + [
+        helper.make_node("Shape", ["w"], ["w_shape"]),
+        helper.make_node("Cast", ["w_shape"], ["w_shape_f"], to=TensorProto.FLOAT),
+        helper.make_node("ReduceSum", ["w_shape_f"], ["n"], keepdims=0),
+        helper.make_node("Add", ["s", "n"], ["y"]),
+    ]
+    graph = helper.make_graph(nodes, "g", [x], [y], initializer=[w, c])
+    return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+
+
+def _graph_signature(model: onnx.ModelProto):
+    g = model.graph
+    nodes = [(n.op_type, tuple(n.input), tuple(n.output)) for n in g.node]
+    inits = {t.name: (t.data_type, tuple(t.dims), numpy_helper.to_array(t).tobytes()) for t in g.initializer}
+    return nodes, inits, [i.name for i in g.input], [o.name for o in g.output]
+
+
+class TestLargeGraphFoldsWithoutWeights:
+    """Room note 158: a >2GB graph is folded on a skeleton whose big constants are graph inputs, so
+    Polygraphy's per-pass export / ONNX Runtime / shape inference never copy the weights."""
+
+    def test_graph_constant_bytes_matches_the_export_based_helper(self):
+        const = numpy_helper.from_array(np.zeros((256,), dtype=np.float32), name="k")
+        model = _foldable_model(1000)
+        model.graph.node.append(helper.make_node("Constant", [], ["unused_k"], value=const))
+        opt = Optimizer(model)
+        assert models_module._graph_constant_bytes(opt.graph) == _onnx_tensor_bytes(models_module.gs.export_onnx(opt.graph))
+
+    def _fold(self, large: bool, weight_math: bool = False):
+        opt = Optimizer(_foldable_model(weight_math=weight_math))
+        opt.cleanup()
+        seen = []
+        real_fold = models_module.fold_constants
+
+        def spy(model, **kw):
+            seen.append(max((numpy_helper.to_array(t).nbytes for t in model.graph.initializer), default=0))
+            return real_fold(model, **kw)
+
+        with (
+            patch.object(models_module, "_ONNX_2GB", 0 if large else models_module._ONNX_2GB),
+            patch.object(models_module, "_SKELETON_CONSTANT_BYTES", 1024),
+            patch.object(models_module, "fold_constants", spy),
+        ):
+            opt.fold_constants()
+        opt.cleanup()
+        return models_module.gs.export_onnx(opt.graph), seen
+
+    def test_skeleton_fold_equals_the_normal_fold(self):
+        normal, _ = self._fold(large=False)
+        skeleton, _ = self._fold(large=True)
+        assert _graph_signature(skeleton) == _graph_signature(normal)
+        assert not any(n.op_type == "Shape" for n in skeleton.graph.node)  # the shape computation was folded
+
+    def test_polygraphy_never_sees_the_big_weight(self):
+        _, seen_normal = self._fold(large=False)
+        _, seen_skeleton = self._fold(large=True)
+        assert seen_normal[0] == 300_000 * 4
+        assert seen_skeleton and max(seen_skeleton) <= 1024
+
+    def test_weights_restored_as_constants_not_inputs(self):
+        model, _ = self._fold(large=True)
+        assert [i.name for i in model.graph.input] == ["x"]
+        w = next(t for t in model.graph.initializer if t.name == "w")
+        assert np.array_equal(numpy_helper.to_array(w), np.arange(300_000, dtype=np.float32))
+
+    def test_infer_shapes_on_a_large_graph_does_not_export(self):
+        opt = Optimizer(_foldable_model())
+
+        def no_export(_g):
+            raise AssertionError("infer_shapes exported a >2GB graph only to skip shape inference")
+
+        with patch.object(models_module, "_ONNX_2GB", 0), patch.object(models_module.gs, "export_onnx", no_export):
+            assert opt.infer_shapes() is None
+        assert opt.graph is not None
+
+    def test_a_fold_that_needs_weight_values_is_left_for_tensorrt(self):
+        """Documented limit: w * c can't be folded without w's values, so the skeleton keeps the Mul
+        (TensorRT folds constant layers at build time). The normal path folds it into a new constant."""
+        normal, _ = self._fold(large=False, weight_math=True)
+        skeleton, _ = self._fold(large=True, weight_math=True)
+        assert not any(n.op_type == "Mul" for n in normal.graph.node)
+        assert any(n.op_type == "Mul" and list(n.input) == ["w", "c"] for n in skeleton.graph.node)
+        assert not any(n.op_type == "Shape" for n in skeleton.graph.node)

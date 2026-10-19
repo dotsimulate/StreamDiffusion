@@ -143,6 +143,22 @@ def _check_fp8_disk_space(onnx_opt_path: str, allow_fallback: bool) -> bool:
     )
 
 
+def _release_module_weights(module: torch.nn.Module) -> None:
+    """Free a module's weights once its ONNX export exists, in place.
+
+    The network handed to EngineBuilder is the pipeline's own UNet (wrapped), so
+    `.to("cpu")` after the export kept a full host copy (~5 GB fp16 SDXL, ~10 GB
+    once the IP-Adapter export wrapper made it fp32) through optimize, the TRT
+    build and the whole session. With acceleration=tensorrt nothing computes with
+    those weights again: the engine replaces stream.unet. Parameters and buffers
+    become meta tensors, so every holder of the same module (pipe.unet, the export
+    wrapper) drops them together; config, attn processors and module structure
+    stay readable. Not for FP8 builds: calibration runs pipe.unet after export.
+    """
+    module.to("meta")
+    _build_logger.info("[BUILD] Released the PyTorch weights after ONNX export (engine replaces them)")
+
+
 _VRAM_RELEASE_ATTRS = ("unet", "vae", "text_encoder", "text_encoder_2")
 
 
@@ -554,6 +570,7 @@ class EngineBuilder:
         artifact_prefix: str = "unet",
         timing_cache_dir: Optional[str] = None,
         model_id: Optional[str] = None,
+        release_network_weights: bool = False,
     ):
         if opt_batch_size is None:
             raise ValueError("build() requires an explicit opt_batch_size")
@@ -607,7 +624,14 @@ class EngineBuilder:
             elapsed = time.perf_counter() - t0
             stats["stages"]["onnx_export"] = {"status": "built", "elapsed_s": round(elapsed, 2)}
             _build_logger.info(f"[BUILD] ONNX export ({engine_filename}): {elapsed:.1f}s")
-            self.network = self.network.to("cpu")
+            if not release_network_weights:
+                self.network = self.network.to("cpu")
+                del self.network
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        if release_network_weights and hasattr(self, "network"):
+            _release_module_weights(self.network)
             del self.network
             gc.collect()
             torch.cuda.empty_cache()
