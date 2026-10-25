@@ -12,9 +12,9 @@ relative-import patches re-applied on every re-vendor) and the dependency seam w
 dishonest — `wrapper.py` hard-imported `cuda_link` while `setup.py` never declared it.
 
 We now **depend solely on the pip-installed `cuda-link`** (declared in `setup.py` as a direct
-wheel-URL pin — `cuda-link @ https://github.com/forkni/cuda-link/releases/download/v1.14.0/cuda_link-1.14.0-cp311-cp311-win_amd64.whl`
+wheel-URL pin — `cuda-link @ https://github.com/forkni/cuda-link/releases/download/v1.14.1/cuda_link-1.14.1-cp311-cp311-win_amd64.whl`
 — exposed via the `cuda_ipc` optional extra). The TouchDesigner side consumes the same installed package through
-`CUDALinkBootstrap`'s **library mode** (in the pinned cuda-link 1.14.0, a layered resolver: the
+`CUDALinkBootstrap`'s **library mode** (in the pinned cuda-link 1.14.1, a layered resolver: the
 Base Folder passed by `StreamDiffusionExt._prepare_cuda_link`, then `<project.folder>`, then
 `CUDALINK_LIB_PATH`, then `sys.path` — it injects the matching venv onto TD's `sys.path` and
 aliases the 14 bare module names used by TD DATs), so the TD DAT mirror inside the repo is
@@ -37,9 +37,9 @@ no longer needed either.
 - IPC is an **optional feature**: `pip install -e .[cuda_ipc]`. The `wrapper.py` imports
   are lazy/in-method so the core package installs and runs without cuda-link.
 - The `github.com/forkni/cuda-link` release **must publish the exact wheel asset** the pin names
-  or clean installs fail. Current pin in `setup.py`: **`v1.14.0`**'s
-  `cuda_link-1.14.0-cp311-cp311-win_amd64.whl` — verified present in the `v1.14.0` release
-  (published 2026-10-19) via `gh release view v1.14.0 --repo forkni/cuda-link --json assets`
+  or clean installs fail. Current pin in `setup.py`: **`v1.14.1`**'s
+  `cuda_link-1.14.1-cp311-cp311-win_amd64.whl` — verified present in the `v1.14.1` release
+  (published 2026-10-24) via `gh release view v1.14.1 --repo forkni/cuda-link --json assets`
   before this pin was pushed.
 - **Pinned to the wheel URL, not the VCS tag.** An earlier draft of this pin used
   `cuda-link @ git+https://github.com/forkni/cuda-link@v1.12.1`, which looks equivalent but
@@ -208,6 +208,23 @@ no longer needed either.
     strict version stamp still applies: the TD-side mirrors (`MIRROR_VERSION` `1.14.0`) and the
     venv's wheel (this pin) must match, and TouchDesigner must be restarted once after upgrading
     so the previously loaded 1.13.0 module is dropped.
+- **1.14.1 migration (2026-10-24 pin bump; bugfix and input validation, no server-side API change):**
+  per the [cuda-link 1.14.1 release notes](https://github.com/forkni/cuda-link/releases/tag/v1.14.1):
+  - Stricter inputs: `FrameSpec` rejects a height or width ≤ 0, and `Exporter` accepts only a
+    true integer `frame.ptr` (`operator.index`), so a float or tensor no longer slips through.
+  - Consumer hardening: an event handle that cannot be opened raises the new
+    `IPCEventOpenError`; a wait timeout rolls the frame cursor back instead of skipping a frame;
+    a reused SHM segment is size-checked first; the activation barrier ignores a segment with a
+    foreign magic or version; `wait_for_doorbell` honours `doorbell=False`.
+  - TD side: the `TDHost` status-tint lifecycle is fixed, the `CUDALINK_TD_PERSIST_STREAM` and
+    `CUDALINK_TD_INIT_PACE` env vars and the `TDSenderConfig` fields `init_pace`,
+    `persist_stream` and `nvml` are removed, the .tox carries a LICENSE DAT and the sources
+    carry SPDX headers.
+  - SDTD consequences: none server-side — `wrapper.py` passes `bgra.data_ptr()` (an `int`) and
+    positive `FrameSpec` dimensions, and nothing outside the legacy `Scripts/` DAT dumps uses
+    the removed config. The strict version stamp still applies: TD-side mirrors
+    (`MIRROR_VERSION` `1.14.1`) and this pin must match, and TouchDesigner must be restarted
+    once after upgrading so the previously loaded 1.14.0 module is dropped.
 - Library mode no longer depends on an environment variable. Since cuda-link 1.13.0 the
   bootstrap resolves the install from the Base Folder the operator passes in (falling back to
   the project folder, then `CUDALINK_LIB_PATH` for legacy setups, then `sys.path`), injects it
