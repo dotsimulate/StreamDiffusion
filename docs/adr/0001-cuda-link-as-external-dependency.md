@@ -211,18 +211,21 @@ no longer needed either.
 - **1.14.1 migration (2026-10-24 pin bump; bugfix and input validation, no server-side API change):**
   per the [cuda-link 1.14.1 release notes](https://github.com/forkni/cuda-link/releases/tag/v1.14.1):
   - Stricter inputs: `FrameSpec` rejects a height or width ≤ 0, and `Exporter` accepts only a
-    true integer `frame.ptr` (`operator.index`), so a float or tensor no longer slips through.
+    true integer `frame.ptr` (`operator.index`): a float, `str` or `ctypes.c_void_p` raises
+    `ValueError` (the last with a "pass .value" hint) instead of being truncated.
   - Consumer hardening: an event handle that cannot be opened raises the new
-    `IPCEventOpenError`; a wait timeout rolls the frame cursor back instead of skipping a frame;
-    a reused SHM segment is size-checked first; the activation barrier ignores a segment with a
-    foreign magic or version; `wait_for_doorbell` honours `doorbell=False`.
+    `IPCEventOpenError`; after a wait timeout the frame cursor rolls back and later calls give
+    the pending frame one non-blocking check, so a stuck producer no longer stalls every
+    `get_frame*()` for `timeout_ms`; a reused SHM segment is size-checked first; the
+    activation barrier ignores a segment with a foreign magic or version;
+    `wait_for_doorbell` honours `doorbell=False`.
   - TD side: the `TDHost` status-tint lifecycle is fixed, the `CUDALINK_TD_PERSIST_STREAM` and
-    `CUDALINK_TD_INIT_PACE` env vars and the `TDSenderConfig` fields `init_pace`,
+    `CUDALINK_TD_INIT_PACE` env vars and the never-read `TDSenderConfig` fields `init_pace`,
     `persist_stream` and `nvml` are removed, the .tox carries a LICENSE DAT and the sources
     carry SPDX headers.
   - SDTD consequences: none server-side — `wrapper.py` passes `bgra.data_ptr()` (an `int`) and
-    positive `FrameSpec` dimensions, and nothing outside the legacy `Scripts/` DAT dumps uses
-    the removed config. The strict version stamp still applies: TD-side mirrors
+    positive `FrameSpec` dimensions, and no tracked file in this repo sets the removed config
+    (the fields were never read). The strict version stamp still applies: TD-side mirrors
     (`MIRROR_VERSION` `1.14.1`) and this pin must match, and TouchDesigner must be restarted
     once after upgrading so the previously loaded 1.14.0 module is dropped.
 - Library mode no longer depends on an environment variable. Since cuda-link 1.13.0 the
