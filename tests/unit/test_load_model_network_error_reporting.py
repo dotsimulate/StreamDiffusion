@@ -366,3 +366,77 @@ class TestLowMemoryFp16Variant:
         except OSError as outer:
             assert is_pagefile_error(outer)
         assert not is_pagefile_error(RuntimeError("unrelated"))
+
+
+# The two field errors (tox 0.4.1, stabilityai/sdxl-turbo): a snapshot missing a component folder,
+# and a cached text_encoder_2/config.json without hidden_size (CLIPTextConfig default 512).
+_MISSING_COMPONENT_ERROR = OSError(
+    "Error no file named config.json found in directory C:\\Users\\u\\.cache\\huggingface\\hub\\"
+    "models--stabilityai--sdxl-turbo\\snapshots\\71153311d3dbb46851df1931d3ca6e939de83304."
+)
+_CONFIG_MISMATCH_ERROR = RuntimeError(
+    "Error(s) in loading state_dict for Embedding:\n\tsize mismatch for weight: copying a param with "
+    "shape torch.Size([77, 1280]) from checkpoint, the shape in current model is torch.Size([77, 512])."
+)
+
+
+class TestCorruptCacheHint:
+    """A bad file in the HF cache is reused without being checked, so the same load error repeats on
+    every launch, online or not. The report must name the cache folder to delete."""
+
+    @pytest.mark.parametrize(
+        "err",
+        [_MISSING_COMPONENT_ERROR, _CONFIG_MISMATCH_ERROR],
+        ids=["missing_component_folder", "config_weights_mismatch"],
+    )
+    def test_repo_id_load_names_cache_folder_to_delete(self, err, tmp_path, monkeypatch):
+        from huggingface_hub import constants as hf_constants
+
+        monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(tmp_path))
+
+        def fake_auto(path, *args, **kwargs):
+            raise err
+
+        w = _make_wrapper_shell()
+        with patch.object(wrapper_module.AutoPipelineForText2Image, "from_pretrained", staticmethod(fake_auto)):
+            with pytest.raises(RuntimeError) as exc_info:
+                w._load_model("stabilityai/sdxl-turbo", t_index_list=[0])
+
+        message = str(exc_info.value)
+        assert str(tmp_path / "models--stabilityai--sdxl-turbo") in message
+        assert "HF_HUB_OFFLINE" in message
+        assert exc_info.value.__cause__ is err
+
+    def test_local_path_gets_generic_hint(self, tmp_path):
+        from streamdiffusion.utils.hf_download import cache_corrupt_hint
+
+        hint = cache_corrupt_hint(str(tmp_path))
+        assert str(tmp_path) in hint
+        assert "models--" not in hint
+
+    def test_network_error_keeps_network_hint(self):
+        def fake_auto(path, *args, **kwargs):
+            raise OSError("no file named config.json found in directory x") from requests.exceptions.ReadTimeout(
+                "timed out"
+            )
+
+        w = _make_wrapper_shell()
+        with patch.object(wrapper_module.AutoPipelineForText2Image, "from_pretrained", staticmethod(fake_auto)):
+            with pytest.raises(RuntimeError) as exc_info:
+                w._load_model("stabilityai/sdxl-turbo", t_index_list=[0])
+
+        assert "huggingface download failure" in str(exc_info.value).lower()
+        assert "models--" not in str(exc_info.value)
+
+    def test_detector_walks_cause_chain_and_ignores_unrelated(self):
+        from streamdiffusion.utils.hf_download import is_corrupt_cache_error
+
+        try:
+            try:
+                raise _CONFIG_MISMATCH_ERROR
+            except RuntimeError as inner:
+                raise OSError("Can't load the model") from inner
+        except OSError as outer:
+            assert is_corrupt_cache_error(outer)
+        assert not is_corrupt_cache_error(RuntimeError("unrelated"))
+        assert not is_corrupt_cache_error(OSError("The paging file is too small (os error 1455)"))

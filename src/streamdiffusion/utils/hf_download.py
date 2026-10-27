@@ -67,6 +67,47 @@ PAGEFILE_HINT = (
     "Performance > Virtual memory, close other memory-heavy apps, then re-launch."
 )
 
+# Messages from loading a model folder whose files are missing or don't match each other: diffusers'
+# `load_sub_model` falling back to the root for a missing component folder, and torch's state_dict
+# load when a config.json disagrees with its weights (e.g. a truncated text_encoder_2/config.json
+# makes CLIPTextConfig fall back to hidden_size=512 -> "[77, 1280] vs [77, 512]").
+_CORRUPT_CACHE_MARKERS = (
+    "size mismatch for",
+    "error(s) in loading state_dict",
+)
+
+
+def is_corrupt_cache_error(exc: BaseException) -> bool:
+    """Chain-aware check for "the model files on disk are incomplete or inconsistent".
+
+    huggingface_hub reuses a file that is already in the snapshot without checking it, so a bad
+    cached file fails the same way on every launch, online or not, until it is deleted.
+    """
+    for ancestor in iter_exception_chain(exc):
+        message = str(ancestor).lower()
+        if any(marker in message for marker in _CORRUPT_CACHE_MARKERS):
+            return True
+        if isinstance(ancestor, OSError) and "no file named" in message and "found in directory" in message:
+            return True
+    return False
+
+
+def cache_corrupt_hint(model_id_or_path: str) -> str:
+    """Hint for `is_corrupt_cache_error`, naming the HF cache folder to delete for a bare repo id."""
+    if os.path.exists(model_id_or_path) or model_id_or_path.endswith((".safetensors", ".ckpt")):
+        return (
+            f" Hint: the model files at '{model_id_or_path}' look incomplete or don't match each other "
+            "(a missing component folder or config.json, or a config that doesn't fit its weights). "
+            "Re-download or re-copy the model, then re-launch."
+        )
+    repo_dir = os.path.join(_hf_constants.HF_HUB_CACHE, "models--" + model_id_or_path.replace("/", "--"))
+    return (
+        f" Hint: the cached download of '{model_id_or_path}' looks incomplete or corrupt (a missing "
+        "component folder or config.json, or a config that doesn't fit its weights). Cached files are "
+        f"reused without being checked, so this repeats on every launch. Delete '{repo_dir}', make sure "
+        "HF_HUB_OFFLINE is not set to 1, and re-launch while online to download it again."
+    )
+
 
 def iter_exception_chain(exc: BaseException) -> Iterator[BaseException]:
     """Yield `exc`, then each `__cause__`/`__context__` ancestor, deepest last.

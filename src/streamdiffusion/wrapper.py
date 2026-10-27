@@ -33,6 +33,8 @@ from .utils.diagnostics import write_error_report as _write_error_report_util
 from .utils.hf_download import (
     NETWORK_HINT,
     PAGEFILE_HINT,
+    cache_corrupt_hint,
+    is_corrupt_cache_error,
     is_missing_hub_file,
     is_network_error,
     is_pagefile_error,
@@ -2476,6 +2478,8 @@ class StreamDiffusionWrapper:
                 hint = NETWORK_HINT
             elif any(is_pagefile_error(err) for _, err in load_errors):
                 hint = PAGEFILE_HINT
+            elif any(is_corrupt_cache_error(err) for _, err in load_errors):
+                hint = cache_corrupt_hint(model_id_or_path)
             else:
                 hint = ""
             # type name first: str(MemoryError()) is "", which made the field report blank.
