@@ -174,9 +174,9 @@ class TestCollectDiagnostics:
         assert diag["config"]["where"] == "streaming_loop"
 
     def test_env_allowlist_only(self, monkeypatch):
-        # CUDALINK_LIB_PATH is retired (cuda_link resolution no longer uses an env var --
-        # see cuda_link_bootstrap.py's layered lookup); CUDALINK_DOORBELL is still a live,
-        # installer-persisted var, so it exercises the same CUDALINK_ prefix allowlist path.
+        # Any CUDALINK_-prefixed name exercises the prefix allowlist. CUDALINK_DOORBELL is no
+        # longer read by cuda-link 2.0.0, but a value left in a user's environment is still
+        # reported, which is what the allowlist is for.
         monkeypatch.setenv("CUDALINK_DOORBELL", "1")
         monkeypatch.setenv("HF_HOME", "hf_home")
         monkeypatch.setenv("SECRET_TOKEN", "should-not-appear")
