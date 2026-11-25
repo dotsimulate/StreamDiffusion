@@ -12,9 +12,9 @@ relative-import patches re-applied on every re-vendor) and the dependency seam w
 dishonest — `wrapper.py` hard-imported `cuda_link` while `setup.py` never declared it.
 
 We now **depend solely on the pip-installed `cuda-link`** (declared in `setup.py` as a direct
-wheel-URL pin — `cuda-link @ https://github.com/forkni/cuda-link/releases/download/v1.14.1/cuda_link-1.14.1-cp311-cp311-win_amd64.whl`
+wheel-URL pin — `cuda-link @ https://github.com/forkni/cuda-link/releases/download/v2.0.0/cuda_link-2.0.0-cp311-cp311-win_amd64.whl`
 — exposed via the `cuda_ipc` optional extra). The TouchDesigner side consumes the same installed package through
-`CUDALinkBootstrap`'s **library mode** (in the pinned cuda-link 1.14.1, a layered resolver: the
+`CUDALinkBootstrap`'s **library mode** (in the pinned cuda-link 2.0.0, a layered resolver: the
 Base Folder passed by `StreamDiffusionExt._prepare_cuda_link`, then `<project.folder>`, then
 `CUDALINK_LIB_PATH`, then `sys.path` — it injects the matching venv onto TD's `sys.path` and
 aliases the 14 bare module names used by TD DATs), so the TD DAT mirror inside the repo is
@@ -37,9 +37,9 @@ no longer needed either.
 - IPC is an **optional feature**: `pip install -e .[cuda_ipc]`. The `wrapper.py` imports
   are lazy/in-method so the core package installs and runs without cuda-link.
 - The `github.com/forkni/cuda-link` release **must publish the exact wheel asset** the pin names
-  or clean installs fail. Current pin in `setup.py`: **`v1.14.1`**'s
-  `cuda_link-1.14.1-cp311-cp311-win_amd64.whl` — verified present in the `v1.14.1` release
-  (published 2026-10-24) via `gh release view v1.14.1 --repo forkni/cuda-link --json assets`
+  or clean installs fail. Current pin in `setup.py`: **`v2.0.0`**'s
+  `cuda_link-2.0.0-cp311-cp311-win_amd64.whl` — verified present in the `v2.0.0` release
+  (published 2026-11-22) via `gh release view v2.0.0 --repo forkni/cuda-link --json assets`
   before this pin was pushed.
 - **Pinned to the wheel URL, not the VCS tag.** An earlier draft of this pin used
   `cuda-link @ git+https://github.com/forkni/cuda-link@v1.12.1`, which looks equivalent but
@@ -228,15 +228,31 @@ no longer needed either.
     (the fields were never read). The strict version stamp still applies: TD-side mirrors
     (`MIRROR_VERSION` `1.14.1`) and this pin must match, and TouchDesigner must be restarted
     once after upgrading so the previously loaded 1.14.0 module is dropped.
+- **2.0.0 migration (2026-11-23 pin bump; protocol v0.6, breaking across peers):**
+  per the [cuda-link 2.0.0 release notes](https://github.com/forkni/cuda-link/releases/tag/v2.0.0):
+  - Protocol v0.6 (per-slot meta: `producer_frame`, `stream_id`, `host_timestamp`). A 1.x peer
+    cannot talk to a 2.x peer ("sender uses protocol v0.5"), so the venv wheel, the four TD
+    COMPs (`shmem`, `shmem_out`, `shmem_out_cn`, `shmem_in_cn_processed`) and this pin move
+    together.
+  - `CUDALINK_DOORBELL`, `CUDALINK_USE_GRAPHS` and `CUDALINK_TD_USE_GRAPHS` are removed: the
+    doorbell is always on and a value left in the environment has no effect. The installer's
+    `phase4c_cuda_link_env` step is removed with it.
+  - `CUDALINK_WAIT_SPIN_US` default 200 -> 500 µs (`ImportPolicy.wait_spin_us`).
+  - The `.tox` is library mode only: it ships no mirror DATs, so without a matching install
+    the COMP cannot fall back to them.
+  - SDTD consequences: none server-side. The `Exporter`/`ExportPolicy`/`FrameSpec`/`GpuFrame`/
+    `FrameOutcome` names `wrapper.py` uses and the `Importer`/`ImportSpec`/`ImportOutcome`
+    names `td_manager.py` uses are unchanged. The strict version stamp still applies
+    (`MIRROR_VERSION` `2.0.0`), and TouchDesigner must be restarted once so the loaded 1.14.1
+    module is dropped (the operator's one-click CUDA-Link update does this).
 - Library mode no longer depends on an environment variable. Since cuda-link 1.13.0 the
   bootstrap resolves the install from the Base Folder the operator passes in (falling back to
   the project folder, then `CUDALINK_LIB_PATH` for legacy setups, then `sys.path`), injects it
   onto `sys.path` and registers the 14 bare-name DAT aliases; without any matching install it
-  stays in degraded mode with an actionable `last_error`. The installer's
-  `phase4c_cuda_link_env` step therefore persists only `CUDALINK_DOORBELL=1` (`setx`);
-  `CUDALINK_LIB_PATH` is retired. TouchDesigner must be restarted once for the doorbell variable
-  to be visible, and whenever a *newer* `cuda_link` is installed into a venv a running TD
-  process already imported from.
+  stays in degraded mode with an actionable `last_error`. `CUDALINK_LIB_PATH` is retired, and
+  since 2.0.0 the installer persists no cuda-link variable at all (`CUDALINK_DOORBELL` is
+  gone). TouchDesigner must be restarted whenever a *newer* `cuda_link` is installed into a
+  venv a running TD process already imported from.
 - Do **not** re-suggest re-vendoring in future architecture reviews — this is a deliberate
   reversal of the previous approach, made after confirming that the mirror trees had zero
   runtime consumers in the Python import graph.
