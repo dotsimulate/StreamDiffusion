@@ -29,6 +29,7 @@ import pytest
 import torch
 from PIL import Image
 
+from streamdiffusion._ipc_export import PackRing
 from streamdiffusion.preprocessing.preprocessing_orchestrator import PreprocessingOrchestrator
 from streamdiffusion.wrapper import StreamDiffusionWrapper
 
@@ -49,8 +50,12 @@ def _make_wrapper_shell():
     w = object.__new__(StreamDiffusionWrapper)
     w._output_pin_buf = None
     w._d2h_event = None
-    w._ipc_pack_buf = None
-    w._ipc_pack_unit_buf = None
+    w._ipc_pack_ring = PackRing()
+    w._ipc_pack_unit_ring = PackRing()
+    w._cuda_ipc_exporter = None
+    w._cuda_ipc_cn_exporter = None
+    w._cuda_ipc_num_slots = 2
+    w._cuda_ipc_async = False
     return w
 
 

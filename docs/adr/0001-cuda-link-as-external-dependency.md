@@ -251,6 +251,20 @@ no longer needed either.
   latched CUDA error instead of failing each later export, and a second sender on a held name is
   refused (`SenderConflictError`). `Exporter.recover()`, `slot_copy_done()` and `drain()` are new;
   no name SDTD imports changed. The strict version stamp moves with it (`MIRROR_VERSION` `2.2.0`).
+- **SDTD uses the 2.2.0 Exporter API (`src/streamdiffusion/_ipc_export.py`):**
+  - *Failure recovery.* After `FrameOutcome.FAILED`, the main output and the ControlNet preview
+    call `Exporter.recover()` and follow the 2.2.0 `.tox` Sender policy (`ExportRecovery`): `0`
+    keeps the exporter; a permanent CUDA error (700, 702, 710, 714-719) closes it and stops
+    exporting until `cleanup_cuda_ipc()` (restart TouchDesigner); any other code retries once per
+    second, and after 3 failures opens a new exporter, one time for each fault. Before, the
+    main output only counted failures (with `debug_mode`), and the preview closed and reopened
+    on each failure.
+  - *Async source buffers.* Blocking export stays the default (one persistent BGRA buffer per
+    exporter). With `CUDALINK_EXPORT_SYNC=0`, `PackRing` keeps one buffer per ring slot (slot =
+    `write_idx % num_slots`, as the 2.2.0 Sender does) and rewrites a buffer only after
+    `slot_copy_done()` reports its copy complete (else `drain()`). This closes the source-buffer
+    lifetime race that made async export unsafe for SDTD. `cleanup_cuda_ipc()` drains before
+    `close()`.
 - Library mode no longer depends on an environment variable. Since cuda-link 1.13.0 the
   bootstrap resolves the install from the Base Folder the operator passes in (falling back to
   the project folder, then `CUDALINK_LIB_PATH` for legacy setups, then `sys.path`), injects it
