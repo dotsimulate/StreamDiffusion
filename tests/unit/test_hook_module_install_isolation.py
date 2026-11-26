@@ -19,7 +19,7 @@ from streamdiffusion.preprocessing.processors import (
     _preprocessor_registry,
     register_preprocessor,
 )
-from streamdiffusion.wrapper import _install_hook_module
+from streamdiffusion.wrapper import _IMAGE_HOOKS, _install_hook_module, _install_hook_stages
 
 
 class FeedbackLoopPreprocessor(PipelineAwareProcessor):
@@ -87,3 +87,18 @@ def test_absent_or_disabled_stage_installs_nothing(stream, cfg):
     assert _install_hook_module(stream, ImagePreprocessingModule, cfg, "_image_preprocessing_module") is None
     assert not hasattr(stream, "_image_preprocessing_module")
     assert stream.image_preprocessing_hooks == []
+
+
+def test_failed_module_import_disables_only_its_own_stage(stream, fake_feedback_loop, caplog):
+    with caplog.at_level(logging.ERROR, logger="streamdiffusion.wrapper"):
+        _install_hook_stages(
+            stream,
+            (
+                (_cfg(fake_feedback_loop), _IMAGE_HOOKS, "ImagePreprocessingModule", "_image_preprocessing_module"),
+                (_cfg("x"), "streamdiffusion.no_such_hook_module", "LatentPreprocessingModule", "_latent_pre"),
+            ),
+        )
+
+    assert [type(p).__name__ for p in stream._image_preprocessing_module.processors] == ["FeedbackLoopPreprocessor"]
+    assert not hasattr(stream, "_latent_pre")
+    assert "Failed to install LatentPreprocessingModule" in caplog.text

@@ -1,3 +1,4 @@
+import importlib
 import inspect
 import math
 import logging
@@ -655,6 +656,27 @@ def _install_hook_module(stream: Any, module_cls: type, hook_config: Optional[Di
             )
     setattr(stream, attr_name, module)
     return module
+
+
+_IMAGE_HOOKS = "streamdiffusion.modules.image_processing_module"
+_LATENT_HOOKS = "streamdiffusion.modules.latent_processing_module"
+
+
+def _install_hook_stages(stream: Any, stages) -> None:
+    """Install the FX stages given as (hook_config, module_path, class_name, attr_name).
+
+    Each stage imports its own module class, as before per-processor install: a module that
+    fails to import disables only its own stages, with an error, and the pipeline still loads.
+    """
+    for hook_config, module_path, class_name, attr_name in stages:
+        if not hook_config or not hook_config.get("enabled", True):
+            continue
+        try:
+            module_cls = getattr(importlib.import_module(module_path), class_name)
+        except Exception as e:
+            logger.error(f"Failed to install {class_name}: {e}")
+            continue
+        _install_hook_module(stream, module_cls, hook_config, attr_name)
 
 
 class StreamDiffusionWrapper:
@@ -3956,34 +3978,30 @@ class StreamDiffusionWrapper:
         # Install pipeline hook modules (Phase 4: Configuration Integration).
         # Each processor installs on its own (see _install_hook_module): one FX that fails
         # to load no longer drops the other FX of the same stage.
-        hook_configs = (
-            image_preprocessing_config,
-            image_postprocessing_config,
-            latent_preprocessing_config,
-            latent_postprocessing_config,
+        _install_hook_stages(
+            stream,
+            (
+                (image_preprocessing_config, _IMAGE_HOOKS, "ImagePreprocessingModule", "_image_preprocessing_module"),
+                (
+                    image_postprocessing_config,
+                    _IMAGE_HOOKS,
+                    "ImagePostprocessingModule",
+                    "_image_postprocessing_module",
+                ),
+                (
+                    latent_preprocessing_config,
+                    _LATENT_HOOKS,
+                    "LatentPreprocessingModule",
+                    "_latent_preprocessing_module",
+                ),
+                (
+                    latent_postprocessing_config,
+                    _LATENT_HOOKS,
+                    "LatentPostprocessingModule",
+                    "_latent_postprocessing_module",
+                ),
+            ),
         )
-        if any(c and c.get("enabled", True) for c in hook_configs):
-            try:
-                from streamdiffusion.modules.image_processing_module import (
-                    ImagePostprocessingModule,
-                    ImagePreprocessingModule,
-                )
-                from streamdiffusion.modules.latent_processing_module import (
-                    LatentPostprocessingModule,
-                    LatentPreprocessingModule,
-                )
-            except Exception as e:
-                # As before this change: a broken hook-module import disables the FX stages
-                # with an error; it does not stop the pipeline from loading.
-                logger.error(f"Failed to import pipeline hook modules, FX disabled: {e}")
-            else:
-                for hook_config, module_cls, attr_name in (
-                    (image_preprocessing_config, ImagePreprocessingModule, "_image_preprocessing_module"),
-                    (image_postprocessing_config, ImagePostprocessingModule, "_image_postprocessing_module"),
-                    (latent_preprocessing_config, LatentPreprocessingModule, "_latent_preprocessing_module"),
-                    (latent_postprocessing_config, LatentPostprocessingModule, "_latent_postprocessing_module"),
-                ):
-                    _install_hook_module(stream, module_cls, hook_config, attr_name)
 
         # L2 cache persistence: pin hot UNet attention weights in GPU L2 cache.
         # Gated by config l2_persist (self.l2_persist) > SDTD_L2_PERSIST env (read at call
