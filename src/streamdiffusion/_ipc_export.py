@@ -167,7 +167,7 @@ class ExportRecovery:
         if self._reopened:
             self.stopped = True
             logger.error(
-                "%s: CUDA IPC export fault: CUDA error %d after a new stream, toggle Active or restart TouchDesigner",
+                "%s: CUDA IPC export fault: CUDA error %d after a new stream, restart the stream or TouchDesigner",
                 self.label,
                 code,
             )

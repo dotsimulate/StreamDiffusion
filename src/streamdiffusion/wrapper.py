@@ -1873,10 +1873,27 @@ class StreamDiffusionWrapper:
             except Exception:
                 logger.debug("_close_cn_ipc_exporter: close() failed", exc_info=True)
 
+    @staticmethod
+    def _exporter_size_differs(exporter, height: int, width: int) -> bool:
+        """True when ``exporter`` was opened for another frame size than height x width BGRA.
+
+        export() returns FAILED on a size mismatch, and Exporter.recover() then reports no
+        CUDA error, so ExportRecovery would keep the stale exporter for good. The caller
+        closes it and opens one for the new size instead.
+        """
+        data_size = getattr(exporter, "data_size", None)
+        return isinstance(data_size, int) and data_size != height * width * 4
+
     def _lazy_init_ipc_exporter(self, height: int, width: int):
-        """Initialize Exporter on first frame (lazy to defer CUDA IPC SHM creation)."""
+        """Initialize Exporter on first frame (lazy to defer CUDA IPC SHM creation).
+
+        Also reopens it when the frame size changes.
+        """
         if self._cuda_ipc_exporter is not None:
-            return self._cuda_ipc_exporter
+            if not self._exporter_size_differs(self._cuda_ipc_exporter, height, width):
+                return self._cuda_ipc_exporter
+            logger.info("CUDA IPC output: frame size changed to %dx%d, opening a new stream", width, height)
+            self._close_ipc_exporter()
         from cuda_link import Exporter, FrameSpec
 
         policy = self._ipc_export_policy()
@@ -1921,9 +1938,15 @@ class StreamDiffusionWrapper:
             return buf
 
     def _lazy_init_cn_ipc_exporter(self, height: int, width: int):
-        """Initialize the CN-preview Exporter on first frame (lazy, mirrors _lazy_init_ipc_exporter)."""
+        """Initialize the CN-preview Exporter on first frame (lazy, mirrors _lazy_init_ipc_exporter).
+
+        Also reopens it when the preview size changes (for example another preprocessor).
+        """
         if self._cuda_ipc_cn_exporter is not None:
-            return self._cuda_ipc_cn_exporter
+            if not self._exporter_size_differs(self._cuda_ipc_cn_exporter, height, width):
+                return self._cuda_ipc_cn_exporter
+            logger.info("ControlNet preview IPC: frame size changed to %dx%d, opening a new stream", width, height)
+            self._close_cn_ipc_exporter()
         from cuda_link import Exporter, FrameSpec
 
         policy = self._ipc_export_policy()
@@ -1989,6 +2012,8 @@ class StreamDiffusionWrapper:
         Designed for the 1 Hz status loop — reads only Python counters and one private attr;
         no GPU calls, no locks.  Returns one of:
           'disabled'           – use_cuda_ipc_output is off
+          'STOPPED(CUDA error N)'    – main output exports stopped until a new stream
+          'cn-STOPPED(CUDA error N)' – ControlNet preview exports stopped until a new stream
           'not-init'           – exporter not yet constructed (first frame not processed)
           'FAILED(N)'          – N consecutive per-frame export failures
           'barrier-skip(N)'    – activation-barrier skips (normal during startup settle)
@@ -1999,6 +2024,8 @@ class StreamDiffusionWrapper:
             return "disabled"
         if self._ipc_recovery.stopped:
             return f"STOPPED(CUDA error {self._ipc_recovery.last_error})"
+        if self._cn_ipc_recovery.stopped:
+            return f"cn-STOPPED(CUDA error {self._cn_ipc_recovery.last_error})"
         exporter = self._cuda_ipc_exporter
         if exporter is None:
             return "not-init"

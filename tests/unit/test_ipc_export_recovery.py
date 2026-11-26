@@ -324,3 +324,57 @@ def test_cleanup_drains_async_exporters_and_resets_recovery(stub_cuda_link, no_c
     assert cn.drains == 1 and cn.closed
     assert w._cuda_ipc_cn_exporter is None
     assert w._ipc_recovery.ready()
+
+
+def test_cn_stopped_is_reported_in_health_status(stub_cuda_link, no_cuda_stream):
+    clock = FakeClock()
+    w = _wrapper_shell(lambda: FakeExporter(outcomes=["FAILED"], recover_codes=[700]), clock)
+    w.export_controlnet_preview_ipc(None)
+    assert w._cn_ipc_recovery.stopped
+    assert w.get_ipc_health_status() == "cn-STOPPED(CUDA error 700)"
+
+
+def test_lazy_init_reopens_exporter_when_frame_size_changes(stub_cuda_link, monkeypatch):
+    from streamdiffusion.wrapper import StreamDiffusionWrapper
+
+    opened = []
+
+    class FrameSpec:
+        def __init__(self, shm_name, height, width, channels, dtype, num_slots):
+            self.height, self.width = height, width
+
+    class Exporter:
+        @staticmethod
+        def open(spec, policy=None):
+            exp = FakeExporter()
+            exp.data_size = spec.height * spec.width * 4
+            opened.append(exp)
+            return exp
+
+    class ExportPolicy:
+        export_sync = True
+
+        @classmethod
+        def from_env(cls):
+            return cls()
+
+    stub_cuda_link.Exporter = Exporter
+    stub_cuda_link.FrameSpec = FrameSpec
+    stub_cuda_link.ExportPolicy = ExportPolicy
+    monkeypatch.setenv("CUDALINK_EXPORT_SYNC", "1")
+
+    w = object.__new__(StreamDiffusionWrapper)
+    w._cuda_ipc_shm_name = "out"
+    w._cuda_ipc_cn_processed_shm_name = "cn"
+    w._cuda_ipc_num_slots = 2
+    w._cuda_ipc_exporter = None
+    w._cuda_ipc_cn_exporter = None
+
+    for init in (w._lazy_init_ipc_exporter, w._lazy_init_cn_ipc_exporter):
+        opened.clear()
+        first = init(512, 512)
+        assert init(512, 512) is first  # same size: cached
+        second = init(512, 768)  # e.g. another ControlNet preprocessor output size
+        assert first.closed and second is not first
+        assert second.data_size == 512 * 768 * 4
+        assert len(opened) == 2
