@@ -17,6 +17,7 @@ from diffusers import (
 from diffusers.models.attention_processor import AttnProcessor
 from PIL import Image
 
+from ._ipc_export import ExportRecovery, PackRing, RecoveryAction
 from .image_utils import postprocess_image
 from .model_detection import detect_model, resolve_is_turbo, turbo_hint_from_model_id
 from .param_schema import (
@@ -998,15 +999,19 @@ class StreamDiffusionWrapper:
         self._output_pin_buf: Optional[torch.Tensor] = None  # pinned CPU buffer for async D2H output
         self._output_gpu_buf: Optional[torch.Tensor] = None  # persistent GPU fp32 staging (avoids per-frame alloc)
         self._d2h_event: Optional[torch.cuda.Event] = None  # event for fine-grained D2H sync
-        self._ipc_pack_buf: Optional[torch.Tensor] = None  # persistent GPU BGRA buffer for _ipc_pack_rgba (5f)
-        # persistent GPU BGRA buffer for _ipc_pack_unit_rgba (5f)
-        self._ipc_pack_unit_buf: Optional[torch.Tensor] = None
+        # Persistent GPU BGRA source buffers (5f) for _ipc_pack_rgba / _ipc_pack_unit_rgba:
+        # one buffer with blocking export, one per ring slot with async export (_ipc_export.PackRing).
+        self._ipc_pack_ring = PackRing()
+        self._ipc_pack_unit_ring = PackRing()
         self.use_cuda_ipc_output = use_cuda_ipc_output
         self._cuda_ipc_shm_name = cuda_ipc_shm_name
         self._cuda_ipc_num_slots = cuda_ipc_num_slots
+        self._cuda_ipc_async = False  # set from ExportPolicy at exporter open (CUDALINK_EXPORT_SYNC=0)
         self._cuda_ipc_exporter = None  # lazy-init on first frame via _lazy_init_ipc_exporter
+        self._ipc_recovery = ExportRecovery("CUDA IPC output")
         self._cuda_ipc_cn_processed_shm_name = cuda_ipc_cn_processed_shm_name
         self._cuda_ipc_cn_exporter = None  # lazy-init on first CN frame via _lazy_init_cn_ipc_exporter
+        self._cn_ipc_recovery = ExportRecovery("ControlNet preview IPC")
         self._cn_ipc_export_warned = False  # emit one logger.warning for export_controlnet_preview_ipc, debug after
         self._controlnet_preview_passthrough = controlnet_preview_passthrough
         self.debug_mode = debug_mode
@@ -1711,6 +1716,9 @@ class StreamDiffusionWrapper:
         if self.use_cuda_ipc_output and self._cuda_ipc_shm_name:
             from cuda_link import FrameOutcome, GpuFrame
 
+            if not self._ipc_recovery.ready():
+                # After a CUDA fault: wait for the next retry, or stopped until a new stream.
+                return None
             bgra = self._ipc_pack_rgba(image_tensor)
             exporter = self._lazy_init_ipc_exporter(bgra.shape[0], bgra.shape[1])
             # Pass the producer stream so the Exporter issues a GPU-side stream_wait_event
@@ -1727,6 +1735,11 @@ class StreamDiffusionWrapper:
                     producer_stream=torch.cuda.current_stream().cuda_stream,
                 )
             )
+            if outcome == FrameOutcome.PUBLISHED:
+                self._ipc_recovery.published()
+            elif outcome == FrameOutcome.FAILED:
+                if self._ipc_recovery.failed(exporter) is RecoveryAction.CLOSE:
+                    self._close_ipc_exporter()
             if self.debug_mode:
                 # Health tracking — diagnostic only; gated behind debug_mode (par.Debugmode in TD UI).
                 # Reads private attr defensively; safe if vendored exporter.py is re-synced.
@@ -1802,13 +1815,12 @@ class StreamDiffusionWrapper:
     def _ipc_pack_rgba(self, image_tensor: torch.Tensor) -> torch.Tensor:
         """Convert pipeline output to HWC uint8 BGRA on GPU for cuda-link wire contract.
 
-        Writes into a persistent HWC×4 GPU buffer (realloc'd only on shape/device change)
-        instead of allocating a fresh alpha channel + concatenated tensor every frame (5f).
-        SAFE ONLY because the IPC exporter is forced to blocking export (see
-        _lazy_init_ipc_exporter / ADR-0001): the frame must be fully copied out via cuda-link
-        before this buffer is overwritten next call. Async export (CUDALINK_EXPORT_SYNC=0)
-        would race against this reused buffer and needs double-buffering first — not
-        implemented.
+        Writes into a persistent HWC×4 GPU buffer from _ipc_pack_ring (realloc'd only on
+        shape/device change) instead of allocating a fresh alpha channel + concatenated tensor
+        every frame (5f). Blocking export (the default) copies the buffer out before export()
+        returns, so one buffer is reused. Async export (CUDALINK_EXPORT_SYNC=0) gets one buffer
+        per ring slot, and a buffer is rewritten only after the copy from it completed
+        (PackRing / ADR-0001 source-buffer lifetime).
         """
         with profiler.region("glue.ipc_pack_rgba"):
             denorm = self._denormalize_on_gpu(image_tensor)  # NCHW [0,1]
@@ -1816,35 +1828,76 @@ class StreamDiffusionWrapper:
                 denorm = denorm[0]  # CHW [0,1]
             rgb_u8 = (denorm * 255).clamp(0, 255).to(torch.uint8)  # CHW uint8
             rgb_hwc = rgb_u8.permute(1, 2, 0).contiguous()  # HWC RGB
-            h, w = rgb_hwc.shape[0], rgb_hwc.shape[1]
-            if (
-                self._ipc_pack_buf is None
-                or self._ipc_pack_buf.shape[0] != h
-                or self._ipc_pack_buf.shape[1] != w
-                or self._ipc_pack_buf.device != rgb_hwc.device
-            ):
-                self._ipc_pack_buf = torch.empty((h, w, 4), dtype=torch.uint8, device=rgb_hwc.device)
-                self._ipc_pack_buf[..., 3] = 255  # constant alpha, set once at (re)allocation
-            self._pack_bgra(rgb_hwc, self._ipc_pack_buf)
-            return self._ipc_pack_buf
+            buf = self._ipc_pack_ring.acquire(
+                rgb_hwc.shape[0],
+                rgb_hwc.shape[1],
+                rgb_hwc.device,
+                exporter=self._cuda_ipc_exporter,
+                num_slots=self._cuda_ipc_num_slots,
+                async_export=self._cuda_ipc_async,
+            )
+            self._pack_bgra(rgb_hwc, buf)
+            return buf
 
-    def _lazy_init_ipc_exporter(self, height: int, width: int):
-        """Initialize Exporter on first frame (lazy to defer CUDA IPC SHM creation)."""
-        if self._cuda_ipc_exporter is not None:
-            return self._cuda_ipc_exporter
+    def _ipc_export_policy(self):
+        """ExportPolicy for both IPC exporters: blocking unless CUDALINK_EXPORT_SYNC is set.
+
+        Blocking is the default because it is the measured fast path for one producer. With
+        CUDALINK_EXPORT_SYNC=0 the copy is only queued, and PackRing keeps one source buffer
+        per ring slot until that copy has read it (ADR-0001 source-buffer lifetime).
+        """
         from dataclasses import replace as _dc_replace
 
-        from cuda_link import Exporter, ExportPolicy, FrameSpec
+        from cuda_link import ExportPolicy
 
-        # SD source buffers (_ipc_pack_rgba output) are a persistent GPU buffer reused every
-        # frame (5f), not a fresh allocation. Async export would read a buffer that's already
-        # been overwritten by the next frame → torn frames (ADR-0001 source-buffer lifetime
-        # race). Force blocking unless the user explicitly opted into async with
-        # CUDALINK_EXPORT_SYNC=0.
         policy = ExportPolicy.from_env()
         if os.environ.get("CUDALINK_EXPORT_SYNC") is None:
             policy = _dc_replace(policy, export_sync=True)
+        return policy
 
+    def _close_ipc_exporter(self) -> None:
+        """Close and drop the main IPC exporter; the next frame reopens it unless recovery stopped."""
+        exporter, self._cuda_ipc_exporter = self._cuda_ipc_exporter, None
+        if exporter is not None:
+            try:
+                exporter.close()
+            except Exception:
+                logger.debug("_close_ipc_exporter: close() failed", exc_info=True)
+
+    def _close_cn_ipc_exporter(self) -> None:
+        """Close and drop the CN-preview IPC exporter; the next frame reopens it unless recovery stopped."""
+        exporter, self._cuda_ipc_cn_exporter = self._cuda_ipc_cn_exporter, None
+        if exporter is not None:
+            try:
+                exporter.close()
+            except Exception:
+                logger.debug("_close_cn_ipc_exporter: close() failed", exc_info=True)
+
+    @staticmethod
+    def _exporter_size_differs(exporter, height: int, width: int) -> bool:
+        """True when ``exporter`` was opened for another frame size than height x width BGRA.
+
+        export() returns FAILED on a size mismatch, and Exporter.recover() then reports no
+        CUDA error, so ExportRecovery would keep the stale exporter for good. The caller
+        closes it and opens one for the new size instead.
+        """
+        data_size = getattr(exporter, "data_size", None)
+        return isinstance(data_size, int) and data_size != height * width * 4
+
+    def _lazy_init_ipc_exporter(self, height: int, width: int):
+        """Initialize Exporter on first frame (lazy to defer CUDA IPC SHM creation).
+
+        Also reopens it when the frame size changes.
+        """
+        if self._cuda_ipc_exporter is not None:
+            if not self._exporter_size_differs(self._cuda_ipc_exporter, height, width):
+                return self._cuda_ipc_exporter
+            logger.info("CUDA IPC output: frame size changed to %dx%d, opening a new stream", width, height)
+            self._close_ipc_exporter()
+        from cuda_link import Exporter, FrameSpec
+
+        policy = self._ipc_export_policy()
+        self._cuda_ipc_async = not policy.export_sync
         self._cuda_ipc_exporter = Exporter.open(
             FrameSpec(
                 shm_name=self._cuda_ipc_shm_name,
@@ -1864,9 +1917,8 @@ class StreamDiffusionWrapper:
         Like _ipc_pack_rgba but skips _denormalize_on_gpu — the ControlNet preprocessor
         output is already in [0, 1] (not the diffusion [-1, 1] range).
 
-        Writes into a persistent HWC×4 GPU buffer (5f), same rationale/caveat as
-        _ipc_pack_rgba: SAFE ONLY while the CN-preview exporter stays forced-blocking
-        (see _lazy_init_cn_ipc_exporter / ADR-0001).
+        Writes into a persistent HWC×4 GPU buffer from _ipc_pack_unit_ring (5f), with the same
+        blocking/async buffer rules as _ipc_pack_rgba.
         """
         with profiler.region("glue.ipc_pack_unit_rgba"):
             t = image_tensor
@@ -1874,33 +1926,31 @@ class StreamDiffusionWrapper:
                 t = t[0]  # NCHW → CHW [0,1]
             rgb_u8 = (t * 255).clamp(0, 255).to(torch.uint8)  # CHW uint8
             rgb_hwc = rgb_u8.permute(1, 2, 0).contiguous()  # HWC RGB
-            h, w = rgb_hwc.shape[0], rgb_hwc.shape[1]
-            if (
-                self._ipc_pack_unit_buf is None
-                or self._ipc_pack_unit_buf.shape[0] != h
-                or self._ipc_pack_unit_buf.shape[1] != w
-                or self._ipc_pack_unit_buf.device != rgb_hwc.device
-            ):
-                self._ipc_pack_unit_buf = torch.empty((h, w, 4), dtype=torch.uint8, device=rgb_hwc.device)
-                self._ipc_pack_unit_buf[..., 3] = 255  # constant alpha, set once at (re)allocation
-            self._pack_bgra(rgb_hwc, self._ipc_pack_unit_buf)
-            return self._ipc_pack_unit_buf
+            buf = self._ipc_pack_unit_ring.acquire(
+                rgb_hwc.shape[0],
+                rgb_hwc.shape[1],
+                rgb_hwc.device,
+                exporter=self._cuda_ipc_cn_exporter,
+                num_slots=self._cuda_ipc_num_slots,
+                async_export=self._cuda_ipc_async,
+            )
+            self._pack_bgra(rgb_hwc, buf)
+            return buf
 
     def _lazy_init_cn_ipc_exporter(self, height: int, width: int):
-        """Initialize the CN-preview Exporter on first frame (lazy, mirrors _lazy_init_ipc_exporter)."""
+        """Initialize the CN-preview Exporter on first frame (lazy, mirrors _lazy_init_ipc_exporter).
+
+        Also reopens it when the preview size changes (for example another preprocessor).
+        """
         if self._cuda_ipc_cn_exporter is not None:
-            return self._cuda_ipc_cn_exporter
-        from dataclasses import replace as _dc_replace
+            if not self._exporter_size_differs(self._cuda_ipc_cn_exporter, height, width):
+                return self._cuda_ipc_cn_exporter
+            logger.info("ControlNet preview IPC: frame size changed to %dx%d, opening a new stream", width, height)
+            self._close_cn_ipc_exporter()
+        from cuda_link import Exporter, FrameSpec
 
-        from cuda_link import Exporter, ExportPolicy, FrameSpec
-
-        # Same source-buffer lifetime race as _lazy_init_ipc_exporter: _ipc_pack_unit_rgba
-        # returns a persistent GPU buffer (5f) reused every frame, overwritten on the next call.
-        # Force blocking unless CUDALINK_EXPORT_SYNC=0 explicitly opts into async.
-        policy = ExportPolicy.from_env()
-        if os.environ.get("CUDALINK_EXPORT_SYNC") is None:
-            policy = _dc_replace(policy, export_sync=True)
-
+        policy = self._ipc_export_policy()
+        self._cuda_ipc_async = not policy.export_sync
         self._cuda_ipc_cn_exporter = Exporter.open(
             FrameSpec(
                 shm_name=self._cuda_ipc_cn_processed_shm_name,
@@ -1926,6 +1976,8 @@ class StreamDiffusionWrapper:
         try:
             from cuda_link import GpuFrame, FrameOutcome
 
+            if not self._cn_ipc_recovery.ready():
+                return False
             bgra = self._ipc_pack_unit_rgba(tensor)
             exporter = self._lazy_init_cn_ipc_exporter(bgra.shape[0], bgra.shape[1])
             outcome = exporter.export(
@@ -1935,15 +1987,13 @@ class StreamDiffusionWrapper:
                     producer_stream=torch.cuda.current_stream().cuda_stream,
                 )
             )
-            if outcome == FrameOutcome.FAILED:
-                # FAILED is terminal in the exporter contract. Drop the cached
-                # instance even if close raises so the next frame can reopen it.
-                # Backpressure skips retain the exporter and its receiver state.
-                self._cuda_ipc_cn_exporter = None
-                exporter.close()
-                if not self._cn_ipc_export_warned:
-                    logger.warning("export_controlnet_preview_ipc: exporter failed; retrying on next frame")
-                    self._cn_ipc_export_warned = True
+            if outcome == FrameOutcome.PUBLISHED:
+                self._cn_ipc_recovery.published()
+            elif outcome == FrameOutcome.FAILED:
+                # Exporter.recover() (cuda-link 2.2.0) decides: keep the exporter, retry later,
+                # open a new one, or stop. Backpressure skips keep the exporter and its receiver state.
+                if self._cn_ipc_recovery.failed(exporter) is RecoveryAction.CLOSE:
+                    self._close_cn_ipc_exporter()
             return outcome == FrameOutcome.PUBLISHED
         except Exception:
             # First failure is loud (warning + traceback) so a dead preview path is visible in
@@ -1962,6 +2012,8 @@ class StreamDiffusionWrapper:
         Designed for the 1 Hz status loop — reads only Python counters and one private attr;
         no GPU calls, no locks.  Returns one of:
           'disabled'           – use_cuda_ipc_output is off
+          'STOPPED(CUDA error N)'    – main output exports stopped until a new stream
+          'cn-STOPPED(CUDA error N)' – ControlNet preview exports stopped until a new stream
           'not-init'           – exporter not yet constructed (first frame not processed)
           'FAILED(N)'          – N consecutive per-frame export failures
           'barrier-skip(N)'    – activation-barrier skips (normal during startup settle)
@@ -1970,6 +2022,10 @@ class StreamDiffusionWrapper:
         """
         if not (self.use_cuda_ipc_output and self._cuda_ipc_shm_name):
             return "disabled"
+        if self._ipc_recovery.stopped:
+            return f"STOPPED(CUDA error {self._ipc_recovery.last_error})"
+        if self._cn_ipc_recovery.stopped:
+            return f"cn-STOPPED(CUDA error {self._cn_ipc_recovery.last_error})"
         exporter = self._cuda_ipc_exporter
         if exporter is None:
             return "not-init"
@@ -1984,19 +2040,21 @@ class StreamDiffusionWrapper:
         return "ok"
 
     def cleanup_cuda_ipc(self) -> None:
-        """Tear down the CUDA IPC exporters and release their SHM + GPU resources."""
-        if self._cuda_ipc_exporter is not None:
-            try:
-                self._cuda_ipc_exporter.close()
-            except Exception:
-                logger.debug("cleanup_cuda_ipc: _cuda_ipc_exporter.close() failed", exc_info=True)
-            self._cuda_ipc_exporter = None
-        if self._cuda_ipc_cn_exporter is not None:
-            try:
-                self._cuda_ipc_cn_exporter.close()
-            except Exception:
-                logger.debug("cleanup_cuda_ipc: _cuda_ipc_cn_exporter.close() failed", exc_info=True)
-            self._cuda_ipc_cn_exporter = None
+        """Tear down the CUDA IPC exporters and release their SHM + GPU resources.
+
+        With async export, drain() first so that no queued copy still reads a source buffer.
+        Recovery state is reset: the next stream starts fresh, also after a permanent fault.
+        """
+        for exporter in (self._cuda_ipc_exporter, self._cuda_ipc_cn_exporter):
+            if exporter is not None and self._cuda_ipc_async:
+                try:
+                    exporter.drain()
+                except Exception:
+                    logger.debug("cleanup_cuda_ipc: drain() failed", exc_info=True)
+        self._close_ipc_exporter()
+        self._close_cn_ipc_exporter()
+        self._ipc_recovery.reset()
+        self._cn_ipc_recovery.reset()
 
     def write_error_report(
         self,
@@ -4244,8 +4302,8 @@ class StreamDiffusionWrapper:
         self._output_pin_buf = None
         self._output_gpu_buf = None
         self._d2h_event = None
-        self._ipc_pack_buf = None
-        self._ipc_pack_unit_buf = None
+        self._ipc_pack_ring.clear()
+        self._ipc_pack_unit_ring.clear()
         self._nsfw_prob_pin = None
         self._pending_frame = None
 
