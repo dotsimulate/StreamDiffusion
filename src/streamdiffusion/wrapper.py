@@ -1,3 +1,4 @@
+import importlib
 import inspect
 import math
 import logging
@@ -622,6 +623,61 @@ torch.set_grad_enabled(False)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
+
+
+def _install_hook_module(stream: Any, module_cls: type, hook_config: Optional[Dict[str, Any]], attr_name: str):
+    """Install one pipeline hook module (FX stage) on ``stream`` and add its processors.
+
+    Each processor is added on its own: a processor that fails (an FX name that is not
+    registered, or a custom processor file that did not import) is logged with its name
+    and skipped, and the other processors of the stage still run. Before this, one failure
+    aborted the whole stage, so every FX of that stage was missing and the TD OSC handler
+    logged "Processor '<name>' ... not found in any module" for the healthy ones too.
+
+    Returns the installed module, or None when the stage is disabled or cannot install.
+    """
+    if not hook_config or not hook_config.get("enabled", True):
+        return None
+    label = module_cls.__name__
+    try:
+        module = module_cls()
+        module.install(stream)
+    except Exception as e:
+        logger.error(f"Failed to install {label}: {e}")
+        return None
+    for proc_config in hook_config.get("processors", []):
+        try:
+            module.add_processor(proc_config)
+        except Exception as e:
+            proc_type = proc_config.get("type") if isinstance(proc_config, dict) else proc_config
+            logger.error(
+                f"{label}: could not add processor {proc_type!r}, skipping it: {e}. "
+                "A custom FX must exist as <StreamDiffusion>/custom_processors/<collection>/<name>.py, "
+                "be listed in that folder's processors.yaml and import without errors."
+            )
+    setattr(stream, attr_name, module)
+    return module
+
+
+_IMAGE_HOOKS = "streamdiffusion.modules.image_processing_module"
+_LATENT_HOOKS = "streamdiffusion.modules.latent_processing_module"
+
+
+def _install_hook_stages(stream: Any, stages) -> None:
+    """Install the FX stages given as (hook_config, module_path, class_name, attr_name).
+
+    Each stage imports its own module class, as before per-processor install: a module that
+    fails to import disables only its own stages, with an error, and the pipeline still loads.
+    """
+    for hook_config, module_path, class_name, attr_name in stages:
+        if not hook_config or not hook_config.get("enabled", True):
+            continue
+        try:
+            module_cls = getattr(importlib.import_module(module_path), class_name)
+        except Exception as e:
+            logger.error(f"Failed to install {class_name}: {e}")
+            continue
+        _install_hook_module(stream, module_cls, hook_config, attr_name)
 
 
 class StreamDiffusionWrapper:
@@ -3977,54 +4033,33 @@ class StreamDiffusionWrapper:
         # Note: LoRA weights stay live/unfused (see the load-time adapter-activation
         # block) — weight is a runtime tensor (lora_scale), not baked into UNet weights.
 
-        # Install pipeline hook modules (Phase 4: Configuration Integration)
-        if image_preprocessing_config and image_preprocessing_config.get("enabled", True):
-            try:
-                from streamdiffusion.modules.image_processing_module import ImagePreprocessingModule
-
-                img_pre_module = ImagePreprocessingModule()
-                img_pre_module.install(stream)
-                for proc_config in image_preprocessing_config.get("processors", []):
-                    img_pre_module.add_processor(proc_config)
-                stream._image_preprocessing_module = img_pre_module
-            except Exception as e:
-                logger.error(f"Failed to install ImagePreprocessingModule: {e}")
-
-        if image_postprocessing_config and image_postprocessing_config.get("enabled", True):
-            try:
-                from streamdiffusion.modules.image_processing_module import ImagePostprocessingModule
-
-                img_post_module = ImagePostprocessingModule()
-                img_post_module.install(stream)
-                for proc_config in image_postprocessing_config.get("processors", []):
-                    img_post_module.add_processor(proc_config)
-                stream._image_postprocessing_module = img_post_module
-            except Exception as e:
-                logger.error(f"Failed to install ImagePostprocessingModule: {e}")
-
-        if latent_preprocessing_config and latent_preprocessing_config.get("enabled", True):
-            try:
-                from streamdiffusion.modules.latent_processing_module import LatentPreprocessingModule
-
-                latent_pre_module = LatentPreprocessingModule()
-                latent_pre_module.install(stream)
-                for proc_config in latent_preprocessing_config.get("processors", []):
-                    latent_pre_module.add_processor(proc_config)
-                stream._latent_preprocessing_module = latent_pre_module
-            except Exception as e:
-                logger.error(f"Failed to install LatentPreprocessingModule: {e}")
-
-        if latent_postprocessing_config and latent_postprocessing_config.get("enabled", True):
-            try:
-                from streamdiffusion.modules.latent_processing_module import LatentPostprocessingModule
-
-                latent_post_module = LatentPostprocessingModule()
-                latent_post_module.install(stream)
-                for proc_config in latent_postprocessing_config.get("processors", []):
-                    latent_post_module.add_processor(proc_config)
-                stream._latent_postprocessing_module = latent_post_module
-            except Exception as e:
-                logger.error(f"Failed to install LatentPostprocessingModule: {e}")
+        # Install pipeline hook modules (Phase 4: Configuration Integration).
+        # Each processor installs on its own (see _install_hook_module): one FX that fails
+        # to load no longer drops the other FX of the same stage.
+        _install_hook_stages(
+            stream,
+            (
+                (image_preprocessing_config, _IMAGE_HOOKS, "ImagePreprocessingModule", "_image_preprocessing_module"),
+                (
+                    image_postprocessing_config,
+                    _IMAGE_HOOKS,
+                    "ImagePostprocessingModule",
+                    "_image_postprocessing_module",
+                ),
+                (
+                    latent_preprocessing_config,
+                    _LATENT_HOOKS,
+                    "LatentPreprocessingModule",
+                    "_latent_preprocessing_module",
+                ),
+                (
+                    latent_postprocessing_config,
+                    _LATENT_HOOKS,
+                    "LatentPostprocessingModule",
+                    "_latent_postprocessing_module",
+                ),
+            ),
+        )
 
         # L2 cache persistence: pin hot UNet attention weights in GPU L2 cache.
         # Gated by config l2_persist (self.l2_persist) > SDTD_L2_PERSIST env (read at call
